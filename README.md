@@ -1,4 +1,5 @@
-# TurboKV
+<div align="center">
+  <img src="docs/logo.png" alt="HanshiroDB Logo" width="800"/>
 
 **A fast, embedded key-value store in Rust**
 
@@ -6,6 +7,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
+</div>
 ---
 
 TurboKV is a high-performance, embedded key-value database written in Rust. It provides a clean API with configurable durability guarantees.
