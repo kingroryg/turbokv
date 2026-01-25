@@ -1,0 +1,2 @@
+type-complexity-threshold = 250
+cognitive-complexity-threshold = 30

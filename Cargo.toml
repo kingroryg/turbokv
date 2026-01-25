@@ -1,71 +1,89 @@
-[workspace]
-members = [
-    "hanshiro-core",
-    "hanshiro-storage",
-    "hanshiro-index",
-    "hanshiro-ingest",
-    "hanshiro-api",
-    "hanshiro-cli",
-]
-resolver = "2"
-
-[workspace.package]
-version = "0.1.0"
+[package]
+name = "turbokv"
+version = "0.2.0"
 authors = ["Sarthak Munshi <s@hanshiro.dev>"]
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0"
-repository = "https://github.com/hanshiro-dev/hanshirodb"
+repository = "https://github.com/hanshiro-dev/turbokv"
+description = "A fast, embedded key-value store with BTreeMap-like API"
+keywords = ["database", "kv", "lsm", "storage", "embedded"]
+categories = ["database-implementations", "data-structures"]
 
-[workspace.dependencies]
-# Core dependencies
-tokio = { version = "1.40", features = ["full"] }
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["fs", "io-util", "sync", "rt-multi-thread", "macros", "time"] }
 async-trait = "0.1"
+
+# Error handling
 thiserror = "2.0"
 anyhow = "1.0"
+
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# Storage dependencies
-rocksdb = "0.24"
-bytes = "1.7"
+serde_bytes = "0.11"
 bincode = "1.3"
-crc32fast = "1.4"
-blake3 = "1.5"
+rmp-serde = "1.3"
+rkyv = { version = "0.7", features = ["validation", "strict"] }
+
+# Bytes and I/O
+bytes = "1.7"
+byteorder = "1.5"
 memmap2 = "0.9"
 
-# Index dependencies
-roaring = "0.10"
-dashmap = "6.0"
+# Cryptography
+blake3 = "1.5"
+crc32fast = "1.4"
+hex = "0.4"
+
+# Concurrent data structures
 crossbeam-skiplist = "0.1"
+dashmap = "6.0"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+parking_lot = "0.12"
 
-# Vector processing
-candle-core = "0.8"
-candle-nn = "0.8"
-candle-transformers = "0.8"
-ndarray = "0.16"
-faiss = "0.12"
+# Compression
+zstd = "0.13"
+snap = "1.1"
 
-# API dependencies
-tonic = "0.12"
-tonic-reflection = "0.12"
-prost = "0.13"
-tower = "0.4"
-hyper = "1.4"
+# Utilities
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+rayon = "1.10"
+libc = "0.2"
+lru = "0.12"
+num_cpus = "1.16"
+gxhash = "3"
+uuid = { version = "1.8", features = ["v4"] }
 
-# CLI dependencies
-clap = { version = "4.5", features = ["derive", "env"] }
-indicatif = "0.17"
-console = "0.15"
-
-# Testing & Benchmarking
-criterion = { version = "0.5", features = ["html_reports"] }
-proptest = "1.5"
+[dev-dependencies]
 tempfile = "3.10"
-fake = "2.10"
+proptest = "1.5"
 quickcheck = "1.0"
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+fjall = "2"
+rocksdb = "0.22"
+tokio = { version = "1.40", features = ["full", "test-util"] }
+
+[lints.rust]
+unsafe_code = "warn"
+missing_docs = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+derivable_impls = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+uninlined_format_args = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
 
 [profile.release]
 opt-level = 3
@@ -77,3 +95,7 @@ strip = true
 [profile.bench]
 inherits = "release"
 debug = true
+
+[[bench]]
+name = "kv_benchmarks"
+harness = false
