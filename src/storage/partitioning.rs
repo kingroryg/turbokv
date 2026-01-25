@@ -316,7 +316,7 @@ impl PartitionManager {
     pub fn partitions_to_delete(&self) -> Result<Vec<PartitionId>> {
         let cutoff = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs()
             - self.retention.retention_period.as_secs();
 
@@ -420,7 +420,7 @@ impl PartitionManager {
     pub fn pre_create_partitions(&self, count: usize) -> Result<usize> {
         let now_secs = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let window_secs = self.window.duration_secs();

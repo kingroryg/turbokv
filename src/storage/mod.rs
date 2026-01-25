@@ -26,10 +26,12 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+pub mod buffer_pool;
 pub mod cache;
 pub mod cached_time;
 pub mod compaction;
 pub mod db;
+pub mod direct_io;
 pub mod engine;
 pub mod fd;
 pub mod manifest;
@@ -61,3 +63,12 @@ pub use cache::{BlockCache, CacheKey, CacheStats};
 
 // FD management exports
 pub use fd::{FdConfig, FdMonitor, FdStats, SSTablePool};
+
+// Buffer pool exports (optimization for high-throughput writes)
+pub use buffer_pool::{BufferPool, PooledBuffer};
+
+// Direct I/O exports (bypass OS cache)
+pub use direct_io::{DirectIoConfig, AlignedBuffer, DirectIoWriter};
+
+// Prefix bloom filter exports
+pub use sstable::bloom::PrefixBloomFilter;

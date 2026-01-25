@@ -181,7 +181,7 @@ impl SSTableWriter {
             max_key: self.max_key.unwrap_or_default().to_vec(),
             creation_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             level: 0,
         })

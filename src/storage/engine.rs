@@ -830,44 +830,167 @@ impl Engine {
             sstables: self.sstables.clone(),
             manifest: self.manifest.clone(),
             next_sstable_id: self.next_sstable_id.clone(),
-            sstable_pool: self.sstable_pool.clone(),
             compactor: self.compactor.clone(),
             config: self.config.clone(),
         }
     }
+}
 
-    /// Background flush
-    #[allow(dead_code)]
+/// Clone of engine state for background tasks
+struct BackgroundEngine {
+    memtable_manager: Arc<MemTableManager>,
+    sstables: Arc<RwLock<Vec<SSTableInfo>>>,
+    manifest: Arc<Mutex<Manifest>>,
+    next_sstable_id: Arc<std::sync::atomic::AtomicU64>,
+    compactor: Arc<Compactor>,
+    config: StorageConfig,
+    wal: Option<Arc<WriteAheadLog>>,
+}
+
+impl BackgroundEngine {
     async fn background_flush(&self) -> Result<()> {
         while let Some(memtable) = self.memtable_manager.get_immutable_for_flush() {
             self.flush_memtable_to_sstable(&memtable).await?;
         }
         Ok(())
     }
-}
-
-/// Clone of engine state for background tasks
-#[allow(dead_code)]
-struct BackgroundEngine {
-    wal: Option<Arc<WriteAheadLog>>,
-    memtable_manager: Arc<MemTableManager>,
-    sstables: Arc<RwLock<Vec<SSTableInfo>>>,
-    manifest: Arc<Mutex<Manifest>>,
-    next_sstable_id: Arc<std::sync::atomic::AtomicU64>,
-    sstable_pool: Arc<SSTablePool>,
-    compactor: Arc<Compactor>,
-    config: StorageConfig,
-}
-
-impl BackgroundEngine {
-    async fn background_flush(&self) -> Result<()> {
-        // Similar to Engine::background_flush
-        Ok(())
-    }
 
     async fn compact(&self) -> Result<CompactionResult> {
-        // Similar to Engine::compact
-        Ok(CompactionResult::default())
+        let sstables = self.sstables.read().await;
+        let manifest_entries: Vec<SSTableManifestEntry> = sstables
+            .iter()
+            .map(|sst| SSTableManifestEntry {
+                id: sst.id,
+                level: sst.level,
+                path: sst.path.clone(),
+                size: sst.file_size,
+                entry_count: sst.entry_count,
+                min_key: sst.min_key.clone(),
+                max_key: sst.max_key.clone(),
+                min_sequence: 0,
+                max_sequence: 0,
+                creation_time: sst.creation_time,
+            })
+            .collect();
+
+        if let Some(job) = self.compactor.pick_compaction(&manifest_entries) {
+            drop(sstables);
+            self.run_compaction(job).await?;
+
+            Ok(CompactionResult {
+                files_compacted: 1,
+                bytes_reclaimed: 0,
+                duration_ms: 0,
+            })
+        } else {
+            Ok(CompactionResult::default())
+        }
+    }
+
+    async fn flush_memtable_to_sstable(
+        &self,
+        memtable: &super::memtable::MemTable,
+    ) -> Result<SSTableInfo> {
+        let id = self
+            .next_sstable_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = self
+            .config
+            .data_dir
+            .join("sstables")
+            .join("L0")
+            .join(format!("{:010}.sst", id));
+
+        let entries = memtable.get_all_kv();
+
+        let mut writer =
+            SSTableWriter::new(&path, self.config.sstable_config.clone()).map_err(|e| {
+                StorageError::SSTable(format!("Failed to create SSTable writer: {}", e))
+            })?;
+
+        for (key, value) in &entries {
+            writer
+                .add(&key, value.as_deref())
+                .map_err(|e| StorageError::SSTable(format!("Failed to write entry: {}", e)))?;
+        }
+
+        let info = writer
+            .finish()
+            .map_err(|e| StorageError::SSTable(format!("Failed to finish SSTable: {}", e)))?;
+
+        {
+            let mut manifest = self.manifest.lock();
+            manifest.sstables.push(SSTableManifestEntry {
+                id,
+                path: info.path.clone(),
+                size: info.file_size,
+                entry_count: info.entry_count,
+                min_key: info.min_key.clone(),
+                max_key: info.max_key.clone(),
+                min_sequence: 0,
+                max_sequence: self.memtable_manager.current_sequence(),
+                creation_time: info.creation_time,
+                level: 0,
+            });
+            manifest.wal_checkpoint = if let Some(ref wal) = self.wal {
+                wal.current_sequence()
+            } else {
+                0
+            };
+            manifest
+                .save(&self.config.data_dir)
+                .map_err(|e| StorageError::Manifest(e.to_string()))?;
+        }
+
+        self.sstables.write().await.push(info.clone());
+        info!("Background flushed memtable to SSTable: {:?}", path);
+
+        Ok(info)
+    }
+
+    async fn run_compaction(&self, job: super::compaction::CompactionJob) -> Result<()> {
+        let input_paths: Vec<PathBuf> = job.input_sstables.iter().map(|s| s.path.clone()).collect();
+        let input_ids: Vec<u64> = job.input_sstables.iter().map(|s| s.id).collect();
+
+        let result = self
+            .compactor
+            .execute(job)
+            .map_err(|e| StorageError::Compaction(e.to_string()))?;
+
+        let mut sstables = self.sstables.write().await;
+        sstables.retain(|sst| !input_ids.contains(&sst.id));
+
+        if let Some(ref output) = result.output_sstable {
+            sstables.push(SSTableInfo {
+                id: output.id,
+                level: output.level,
+                path: output.path.clone(),
+                file_size: output.size,
+                entry_count: output.entry_count,
+                min_key: output.min_key.clone(),
+                max_key: output.max_key.clone(),
+                creation_time: output.creation_time,
+            });
+        }
+
+        {
+            let mut manifest = self.manifest.lock();
+            manifest.sstables.retain(|e| !input_ids.contains(&e.id));
+
+            if let Some(ref output) = result.output_sstable {
+                manifest.sstables.push(output.clone());
+            }
+
+            manifest
+                .save(&self.config.data_dir)
+                .map_err(|e| StorageError::Manifest(e.to_string()))?;
+        }
+
+        self.compactor
+            .cleanup_inputs(&input_paths)
+            .map_err(|e| StorageError::Compaction(e.to_string()))?;
+
+        Ok(())
     }
 }
 

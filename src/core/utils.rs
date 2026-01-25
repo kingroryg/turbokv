@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn generate_timestamp_id() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
+        .unwrap_or_default()
         .as_nanos() as u64
 }
 

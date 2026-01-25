@@ -40,7 +40,7 @@
 //! │  └──────────────────────────────────────────────────────┘   │
 //! └─────────────────────────────────────────────────────────────┘
 
-mod bloom;
+pub mod bloom;
 mod builder;
 mod compression;
 mod iterator;
@@ -48,7 +48,7 @@ mod reader;
 mod types;
 mod writer;
 
-pub use bloom::BloomFilter;
+pub use bloom::{BloomFilter, PrefixBloomFilter};
 pub use builder::{BlockBuilder, IndexBuilder};
 pub use compression::{compress_block, decompress_block, CompressionType};
 pub use iterator::SSTableIterator;

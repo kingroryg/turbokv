@@ -48,7 +48,7 @@ pub(crate) fn create_file(wal_dir: &Path, sequence: u64, config: &WalConfig) -> 
     writer.write_u64::<LittleEndian>(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs(),
     )?;
     writer.write_u64::<LittleEndian>(sequence)?; // First sequence

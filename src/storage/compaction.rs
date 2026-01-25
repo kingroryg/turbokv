@@ -216,7 +216,7 @@ impl Compactor {
             max_sequence: job.input_sstables.iter().map(|s| s.max_sequence).max().unwrap_or(0),
             creation_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         };
 
@@ -264,7 +264,7 @@ impl Compactor {
         let id = self.next_sstable_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         self.data_dir
             .join("sstables")

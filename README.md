@@ -1,131 +1,211 @@
-<div align="center">
-  <img src="docs/logo.png" alt="HanshiroDB Logo" width="800"/>
-  
-  **High-Velocity, Tamper-Proof Vector Database for SecOps**
-  
-  [![Build Status](https://github.com/hanshiro-dev/hanshirodb/workflows/CI/badge.svg)](https://github.com/hanshiro-dev/hanshirodb/actions)
-  [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-  [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
-</div>
+# TurboKV
+
+**A fast, embedded key-value store in Rust**
+
+[![Build Status](https://github.com/hanshiro-dev/turbokv/workflows/CI/badge.svg)](https://github.com/hanshiro-dev/turbokv/actions)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
 ---
 
-HanshiroDB is a specialized vector database built from the ground up for security operations. Unlike traditional vector databases optimized for recommendation systems, HanshiroDB is engineered for:
+TurboKV is a high-performance, embedded key-value database written in Rust. It provides a clean API with configurable durability guarantees.
 
-- **Massive Write Throughput**: 980,000+ events per second
-- **Tamper-Proof Storage**: Merkle chaining ensures data integrity
-- **Auto-Correlation**: Automatically links logs ↔ malware samples
-- **Vector Similarity**: Find similar threats using embeddings
-- **Polymorphic Storage**: Logs, code artifacts, and indexes in one DB
+## Features
+
+- **Simple API**: Familiar `get`, `insert`, `remove`, `range` operations
+- **Configurable Durability**: Choose between fast, durable, or tamper-proof modes
+- **LSM-Tree Architecture**: Optimized for write-heavy workloads
+- **Async/Await**: Built on Tokio for modern async Rust
+- **Batch Operations**: Atomic write batches for transactional writes
+- **Range Scans**: Efficient prefix and range queries
+- **Block Cache**: Configurable caching for read performance
+- **Bloom Filters**: Fast negative lookups
+- **Compression**: LZ4, Snappy, and Zstd support
 
 ## Quick Start
 
-### Installation
+Add TurboKV to your `Cargo.toml`:
 
-```bash
-git clone https://github.com/hanshirodb/hanshirodb
-cd hanshirodb
-cargo build --release
+```toml
+[dependencies]
+turbokv = "0.2"
+tokio = { version = "1", features = ["full"] }
 ```
 
-### Embedded Mode (Local)
+### Basic Usage
 
 ```rust
-use hanshiro_api::{HanshiroClient, EventBuilder};
-use hanshiro_core::{EventType, IngestionFormat};
+use turbokv::{Db, DbOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open local database
-    let db = HanshiroClient::open("./data").await?;
+    // Open database with default options (durable mode)
+    let db = Db::open("./my_data").await?;
 
-    // Ingest a security event
-    let event = EventBuilder::new(EventType::ProcessStart)
-        .source("endpoint-01", "crowdstrike", IngestionFormat::Raw)
-        .source_ip("10.0.1.50")
-        .raw_data(r#"{"process":"suspicious.exe","parent":"explorer.exe"}"#)
-        .metadata("severity", "critical")
-        .metadata("technique", "T1059.001")
-        .vector(embedding)  // From your ML model
-        .build();
+    // Insert key-value pairs
+    db.insert(b"hello", b"world").await?;
+    db.insert(b"user:1", b"alice").await?;
 
-    let id = db.ingest_event(event).await?;
+    // Get values
+    if let Some(value) = db.get(b"hello").await? {
+        println!("Got: {}", String::from_utf8_lossy(&value));
+    }
 
-    // Find similar events by vector
-    let similar = db.find_similar(&query_vector, 10).await?;
+    // Delete keys
+    db.remove(b"hello").await?;
 
-    // Auto-correlate logs with malware samples
-    let correlations = db.correlate_all().await?;
+    // Range scan
+    for (key, value) in db.range(b"user:", b"user:~").await? {
+        println!("{}: {}",
+            String::from_utf8_lossy(&key),
+            String::from_utf8_lossy(&value)
+        );
+    }
+
+    // Prefix scan
+    let users = db.scan_prefix(b"user:").await?;
 
     Ok(())
 }
 ```
 
-### Server Mode (Remote)
+### Batch Writes
 
-Start the server:
-```bash
-cargo run --bin hanshiro-server -- --data-dir ./data --port 3000
-```
-
-Connect from anywhere:
 ```rust
-use hanshiro_api::RemoteClient;
+use turbokv::{Db, WriteBatch};
 
-let client = RemoteClient::connect("http://10.0.1.100:3000").await?;
+let db = Db::open("./my_data").await?;
 
-// JSON API (debuggable)
-client.ingest_event(event).await?;
-
-// Binary API (high-throughput)
-client.ingest_event_binary(&event).await?;
+// Atomic batch write
+let mut batch = WriteBatch::new();
+batch.put(b"key1", b"value1");
+batch.put(b"key2", b"value2");
+batch.delete(b"old_key");
+db.write_batch(&batch).await?;
 ```
 
-### REST API
+### Configuration Options
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | Health check |
-| POST | `/events` | Ingest event (JSON) |
-| GET | `/events/{hi}/{lo}` | Get event by ID |
-| GET | `/events` | Scan all logs |
-| POST | `/code` | Store code artifact |
-| POST | `/similar` | Vector similarity search |
-| POST | `/correlate` | Run auto-correlation |
-| POST | `/bin/events` | Ingest event (binary, fast) |
-| POST | `/bin/code` | Store code (binary, fast) |
+TurboKV provides preset configurations for common use cases:
 
-Example with curl:
-```bash
-# Ingest event
-curl -X POST http://localhost:3000/events \
-  -H "Content-Type: application/json" \
-  -d '{"event_type":"ProcessStart","source_host":"ws-01","collector":"edr","raw_data":"{}"}'
+```rust
+use turbokv::{Db, DbOptions};
 
-# Get all logs
-curl http://localhost:3000/events
+// Fast mode - maximum speed, no durability guarantees
+// Good for: caches, temporary data, benchmarks
+let db = Db::open_with_options("./data", DbOptions::fast()).await?;
+
+// Durable mode (default) - survives crashes
+// Good for: production data that must not be lost
+let db = Db::open_with_options("./data", DbOptions::durable()).await?;
+
+// Tamper-proof mode - cryptographic integrity
+// Good for: audit logs, compliance data, legal evidence
+let db = Db::open_with_options("./data", DbOptions::tamper_proof()).await?;
 ```
 
-## Data Model
+### Custom Configuration
 
-HanshiroDB stores three types of data with key prefixes:
+```rust
+use turbokv::DbOptions;
 
-| Prefix | Type | Description |
-|--------|------|-------------|
-| `0x01` | Log | Security events (OCSF, Zeek, Suricata) |
-| `0x02` | Code | Malware/binary analysis artifacts |
-| `0x03` | Index | Secondary indexes, graph relationships |
+let options = DbOptions {
+    wal_enabled: true,           // Write-ahead log for durability
+    merkle_enabled: false,       // Merkle chains for tamper detection
+    sync_writes: true,           // Sync to disk on each write
+    memtable_size: 64 * 1024 * 1024,   // 64MB memtable
+    block_cache_size: 64 * 1024 * 1024, // 64MB block cache
+};
 
-Auto-correlation links logs to code via:
-- **Vector similarity**: Embedding cosine distance > 0.85
-- **Hash matching**: Log mentions artifact's SHA256
-- **Filename matching**: Log references artifact filename
+let db = Db::open_with_options("./data", options).await?;
+```
 
-## Documentation
+## Architecture
 
-- [API Reference](docs/API.md) - Client API, builders, embedder trait
-- [Data Model](docs/DATA_MODEL.md) - Storage internals, key structure
-- [Optimization Guide](docs/OPTIMIZATION_GUIDE.md) - Performance tuning
+TurboKV uses an LSM-tree (Log-Structured Merge-tree) architecture:
+
+```
+Write Path:
+  Incoming Write -> WAL (optional) -> MemTable -> Flush -> SSTable
+
+Read Path:
+  Query -> MemTable -> Block Cache -> SSTables (newest first)
+           ^                          ^
+           |                          |
+       Hot data                  Bloom filters
+       (fast)                    (skip files)
+```
+
+### Components
+
+- **WAL (Write-Ahead Log)**: Ensures durability by logging writes before applying
+- **MemTable**: In-memory skip list for fast writes
+- **SSTable**: Sorted, immutable files on disk with bloom filters
+- **Block Cache**: LRU cache for frequently accessed data blocks
+- **Compaction**: Background process to merge SSTables and reclaim space
+
+## Performance
+
+TurboKV is optimized for high write throughput:
+
+| Operation | Performance |
+|-----------|-------------|
+| Sequential writes (fast mode) | ~1.5M ops/sec |
+| Sequential writes (durable mode) | ~60K ops/sec |
+| Random reads | ~500K ops/sec |
+| Batch writes (1000 per batch) | ~2M ops/sec |
+| Range scans | ~100K entries/sec |
+
+*Benchmarks on Apple M1, 16GB RAM, SSD storage*
+
+## Comparison
+
+| Feature | TurboKV | RocksDB | fjall |
+|---------|---------|---------|-------|
+| Rust-native | Yes | No (C++) | Yes |
+| Async | Yes | No | No |
+| BTreeMap API | Yes | No | Yes |
+| Merkle chains | Yes | No | No |
+| Learning curve | Low | High | Low |
+
+## API Reference
+
+### Db
+
+| Method | Description |
+|--------|-------------|
+| `open(path)` | Open database with default options |
+| `open_with_options(path, options)` | Open with custom options |
+| `insert(key, value)` | Insert or update a key-value pair |
+| `get(key)` | Get value by key |
+| `remove(key)` | Delete a key |
+| `contains_key(key)` | Check if key exists |
+| `range(start, end)` | Scan keys in range [start, end) |
+| `scan_prefix(prefix)` | Scan all keys with prefix |
+| `write_batch(batch)` | Atomic batch write |
+| `flush()` | Flush memtable to disk |
+| `compact()` | Trigger manual compaction |
+| `stats()` | Get database statistics |
+
+### DbOptions
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `wal_enabled` | true | Enable write-ahead log |
+| `merkle_enabled` | false | Enable Merkle chains |
+| `sync_writes` | true | Sync writes to disk |
+| `memtable_size` | 64MB | MemTable size before flush |
+| `block_cache_size` | 64MB | Block cache size (0 to disable) |
+
+### WriteBatch
+
+| Method | Description |
+|--------|-------------|
+| `new()` | Create empty batch |
+| `put(key, value)` | Add insert operation |
+| `delete(key)` | Add delete operation |
+| `len()` | Number of operations |
+| `clear()` | Clear all operations |
 
 ## Development
 
@@ -133,35 +213,21 @@ Auto-correlation links logs to code via:
 # Build
 cargo build --release
 
-# Test
+# Run tests
 cargo test
 
-# Run server
-cargo run --bin hanshiro-server -- --data-dir ./data --port 3000
+# Run benchmarks
+cargo bench
 
-# Benchmarks
-cargo test --release -p hanshiro-storage --test storage_peak_performance
+# Format code
+cargo fmt
+
+# Lint
+cargo clippy
 ```
-
-## Performance
-
-| Metric | Value |
-|--------|-------|
-| Event write throughput | 980K events/sec |
-| Vector insert throughput | 2.4M vectors/sec |
-| Vector search (10K, top-10) | 0.88ms |
-| Latency per event | ~1 µs |
-| Vector dimensions | 128-768 |
-| Serialization | rkyv (zero-copy) |
-
-Vectors are stored separately in a memory-mapped file for SIMD-optimized similarity search.
 
 ## License
 
 Apache 2.0
 
 ---
-
-<div align="center">
-  Built with ❤️ for the Security Community
-</div>
