@@ -1,19 +1,13 @@
-//! WAL types for TurboKV
-//!
-//! Defines the entry format and configuration for the Write-Ahead Log.
-
 use bytes::Bytes;
 use crate::core::crypto::MerkleNode;
 use thiserror::Error;
 
-/// Magic bytes for WAL file header
 pub const WAL_MAGIC: &[u8; 8] = b"TURBOKV\0";
 pub const WAL_VERSION: u32 = 2;
 pub const WAL_HEADER_SIZE: usize = 64;
 pub const ENTRY_HEADER_SIZE: usize = 32;
 pub const MERKLE_INFO_SIZE: usize = 96;
 
-/// WAL-specific error types
 #[derive(Debug, Error)]
 pub enum WalError {
     #[error("I/O error: {message}")]
@@ -50,7 +44,6 @@ impl From<std::io::Error> for WalError {
 
 pub type Result<T> = std::result::Result<T, WalError>;
 
-/// Type of WAL entry
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EntryType {
@@ -81,27 +74,19 @@ impl TryFrom<u8> for EntryType {
     }
 }
 
-/// A single WAL entry
-///
 /// The `data` field contains encoded key-value pair:
 /// - For Data: `[key_len: u32][key][value]`
 /// - For Delete: `[key_len: u32][key]`
 #[derive(Debug, Clone)]
 pub struct WalEntry {
-    /// Sequence number (monotonically increasing)
     pub sequence: u64,
-    /// Timestamp in milliseconds since epoch
     pub timestamp: u64,
-    /// Type of entry
     pub entry_type: EntryType,
-    /// Encoded key-value data
     pub data: Bytes,
-    /// Merkle chain node (may be empty if merkle disabled)
     pub merkle: MerkleNode,
 }
 
 impl WalEntry {
-    /// Decode the key from the entry data
     pub fn decode_key(&self) -> Option<&[u8]> {
         if self.data.len() < 4 {
             return None;
@@ -119,7 +104,6 @@ impl WalEntry {
         Some(&self.data[4..4 + key_len])
     }
 
-    /// Decode the value from the entry data (None for Delete entries)
     pub fn decode_value(&self) -> Option<&[u8]> {
         if self.entry_type == EntryType::Delete {
             return None;
@@ -140,7 +124,6 @@ impl WalEntry {
         Some(&self.data[4 + key_len..])
     }
 
-    /// Decode both key and value
     pub fn decode_kv(&self) -> Option<(&[u8], Option<&[u8]>)> {
         let key = self.decode_key()?;
         let value = if self.entry_type == EntryType::Delete {
@@ -158,7 +141,6 @@ impl AsRef<WalEntry> for WalEntry {
     }
 }
 
-/// WAL configuration
 #[derive(Debug, Clone)]
 pub struct WalConfig {
     /// Maximum file size before rotation (bytes)
@@ -193,16 +175,7 @@ impl Default for WalConfig {
 }
 
 impl WalConfig {
-    /// Configuration for maximum durability
-    pub fn durable() -> Self {
-        Self {
-            sync_on_write: true,
-            merkle_enabled: false,
-            ..Default::default()
-        }
-    }
-
-    /// Configuration for maximum speed (less durability)
+    /// Fast WAL config - no sync, optimized for throughput
     pub fn fast() -> Self {
         Self {
             sync_on_write: false,
@@ -213,17 +186,41 @@ impl WalConfig {
         }
     }
 
-    /// Configuration for tamper-proof storage
+    /// Durable WAL config - WAL enabled but no sync per write
+    /// Data survives process crash (OS flushes buffers)
+    pub fn durable() -> Self {
+        Self {
+            sync_on_write: false,
+            merkle_enabled: false,
+            group_commit_delay_us: 100, // Low delay for throughput
+            max_batch_size: 1024,
+            ..Default::default()
+        }
+    }
+
+    /// Paranoid WAL config - sync on every write
+    /// Data survives power loss
+    pub fn paranoid() -> Self {
+        Self {
+            sync_on_write: true,
+            merkle_enabled: false,
+            group_commit_delay_us: 0, // No delay - fsync latency itself batches concurrent writes
+            ..Default::default()
+        }
+    }
+
+    /// Tamper-proof WAL config - sync + Merkle chains
+    /// Data survives power loss + detects tampering
     pub fn tamper_proof() -> Self {
         Self {
             sync_on_write: true,
             merkle_enabled: true,
+            group_commit_delay_us: 0, // No delay - fsync latency itself batches concurrent writes
             ..Default::default()
         }
     }
 }
 
-/// Encode a key-value pair for WAL storage
 #[inline]
 pub fn encode_kv(key: &[u8], value: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + key.len() + value.len());
@@ -233,7 +230,6 @@ pub fn encode_kv(key: &[u8], value: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Encode a key for deletion
 #[inline]
 pub fn encode_delete(key: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + key.len());

@@ -1,16 +1,6 @@
 //! # Write-Ahead Log (WAL) for TurboKV
 //!
-//! Provides durability through write-ahead logging with optional Merkle chain integrity.
-//!
-//! ## Key Optimizations (PRESERVED)
-//!
-//! - **Group Commit Loop** - Batches multiple writes with configurable delay
-//! - **write_entries_batch()** - Vectorized I/O, single syscall for all entries
-//! - **Parallel Batch Creation with rayon** - Parallelizes hashing for large batches
-//!
 //! ## Architecture
-//!
-//! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │                    Write Path (Group Commit)                    │
 //! ├─────────────────────────────────────────────────────────────────┤
@@ -20,7 +10,6 @@
 //! │                                                                 │
 //! │  append_batch() ──────────► Direct Write (bypasses group commit)│
 //! └─────────────────────────────────────────────────────────────────┘
-//! ```
 //!
 //! ## File Format
 //!
@@ -50,17 +39,15 @@ use crate::core::crypto::{MerkleChain, MerkleNode};
 
 use file::{
     create_file, entry_size, finalize_header, read_entry, read_header_last_sequence, recover_file,
-    write_entries_batch, WalFile,
+    write_entries_batch, write_entry, WalFile,
 };
 use types::WAL_HEADER_SIZE;
 
-/// Request for the group commit loop
 struct WriteRequest {
     entry: WalEntry,
     response: oneshot::Sender<Result<()>>,
 }
 
-/// Write-Ahead Log with optional Merkle chain integrity and group commit
 pub struct WriteAheadLog {
     wal_dir: PathBuf,
     config: WalConfig,
@@ -71,7 +58,6 @@ pub struct WriteAheadLog {
 }
 
 impl WriteAheadLog {
-    /// Create or recover a WAL in the given directory
     pub async fn new(wal_dir: impl AsRef<Path>, config: WalConfig) -> Result<Self> {
         let wal_dir = wal_dir.as_ref().to_path_buf();
         tokio::fs::create_dir_all(&wal_dir)
@@ -103,41 +89,103 @@ impl WriteAheadLog {
         })
     }
 
-    /// Append a key-value pair (goes through group commit)
     pub async fn append(&self, key: &[u8], value: &[u8]) -> Result<u64> {
         let entry = self.create_entry(key, value, EntryType::Data)?;
         let sequence = entry.sequence;
 
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteRequest { entry, response: tx })
-            .await
-            .map_err(|_| WalError::ChannelClosed)?;
+        if self.config.sync_on_write {
+            // For sync mode (paranoid/tamper_proof):
+            // Try direct path if lock is free, otherwise use group commit
+            // This allows concurrent writers to share fsyncs while avoiding
+            // convoy effect for single writers
 
-        rx.await.map_err(|_| WalError::ChannelClosed)??;
+            // First, check if lock is available (non-blocking)
+            let lock_available = self.current_file.try_write().is_some();
+            // Note: we immediately drop the guard from try_write() so it doesn't cross await
+
+            if lock_available {
+                // Lock was free - now acquire it properly and do direct write
+                self.write_entry_direct(&entry, true)?;
+            } else {
+                // Lock contended - use group commit to share fsync with other writers
+                let (tx, rx) = oneshot::channel();
+                let req = WriteRequest {
+                    entry,
+                    response: tx,
+                };
+                self.write_tx
+                    .send(req)
+                    .await
+                    .map_err(|_| WalError::ChannelClosed)?;
+                rx.await.map_err(|_| WalError::ChannelClosed)??;
+            }
+        } else {
+            // For non-sync mode: direct write path (no fsync)
+            self.write_entry_direct(&entry, false)?;
+        }
 
         Ok(sequence)
     }
 
-    /// Append a delete operation (goes through group commit)
+    /// Write entry directly to buffered file
+    /// This bypasses the channel overhead that causes convoy effect
+    /// If `sync` is true, flushes and fsyncs after write (paranoid mode)
+    fn write_entry_direct(&self, entry: &WalEntry, sync: bool) -> Result<()> {
+        let entry_bytes = entry_size(entry) as u64;
+
+        // Check if rotation needed (check while holding read lock, then upgrade if needed)
+        let needs_rotation = {
+            let file = self.current_file.read();
+            file.size + entry_bytes > self.config.max_file_size
+        };
+
+        if needs_rotation {
+            rotate_sync(&self.current_file, &self.wal_dir, &self.config)?;
+        }
+
+        let mut file = self.current_file.write();
+        write_entry(&mut file.file, entry)?;
+        file.size += entry_bytes;
+        file.entry_count += 1;
+        file.last_sequence = entry.sequence;
+
+        if sync {
+            file.file.flush()?;
+            file.file.get_ref().sync_all()?;
+        }
+        Ok(())
+    }
+
     pub async fn append_delete(&self, key: &[u8]) -> Result<u64> {
         let entry = self.create_delete_entry(key)?;
         let sequence = entry.sequence;
 
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteRequest { entry, response: tx })
-            .await
-            .map_err(|_| WalError::ChannelClosed)?;
+        if self.config.sync_on_write {
+            // Same hybrid approach as append()
+            let lock_available = self.current_file.try_write().is_some();
 
-        rx.await.map_err(|_| WalError::ChannelClosed)??;
+            if lock_available {
+                self.write_entry_direct(&entry, true)?;
+            } else {
+                let (tx, rx) = oneshot::channel();
+                let req = WriteRequest {
+                    entry,
+                    response: tx,
+                };
+                self.write_tx
+                    .send(req)
+                    .await
+                    .map_err(|_| WalError::ChannelClosed)?;
+                rx.await.map_err(|_| WalError::ChannelClosed)??;
+            }
+        } else {
+            self.write_entry_direct(&entry, false)?;
+        }
 
         Ok(sequence)
     }
 
     /// Append multiple key-value pairs in a single batch (bypasses group commit)
-    ///
-    /// Each entry is a tuple of (key, Option<value>) where None means delete.
     pub async fn append_batch(&self, entries: &[(&[u8], Option<&[u8]>)]) -> Result<Vec<u64>> {
         if entries.is_empty() {
             return Ok(vec![]);
@@ -151,7 +199,6 @@ impl WriteAheadLog {
         Ok(sequences)
     }
 
-    /// Flush the WAL to disk
     pub async fn flush(&self) -> Result<()> {
         let mut file = self.current_file.write();
         file.file.flush()?;
@@ -159,7 +206,6 @@ impl WriteAheadLog {
         Ok(())
     }
 
-    /// Read entries starting from a sequence number
     pub async fn read_from(&self, start_sequence: u64) -> Result<Vec<WalEntry>> {
         let mut entries = Vec::new();
         let mut seen = HashSet::new();
@@ -183,12 +229,10 @@ impl WriteAheadLog {
         Ok(entries)
     }
 
-    /// Create an iterator over all entries
     pub async fn iter_entries(&self) -> Result<WalEntryIterator> {
         self.iter_entries_from(0).await
     }
 
-    /// Create an iterator starting from a sequence number
     pub async fn iter_entries_from(&self, start_sequence: u64) -> Result<WalEntryIterator> {
         self.flush().await?;
 
@@ -196,7 +240,6 @@ impl WriteAheadLog {
         let mut wal_files = self.list_wal_files().await?;
         wal_files.sort_by_key(|f| f.0);
 
-        // Filter files that might contain entries > start_sequence
         let paths: Vec<PathBuf> = wal_files
             .into_iter()
             .filter(|(_, path)| {
@@ -213,7 +256,6 @@ impl WriteAheadLog {
         WalEntryIterator::new(paths, start_sequence)
     }
 
-    /// Get the Merkle hash at a specific sequence
     pub async fn get_hash_at_sequence(&self, sequence: u64) -> Result<Option<String>> {
         if !self.config.merkle_enabled {
             return Ok(None);
@@ -231,12 +273,10 @@ impl WriteAheadLog {
         Ok(None)
     }
 
-    /// Verify WAL integrity using Merkle chain
     pub async fn verify_integrity(&self) -> Result<()> {
         self.verify_integrity_from(0, None).await
     }
 
-    /// Verify integrity from a checkpoint
     pub async fn verify_integrity_from(
         &self,
         checkpoint_sequence: u64,
@@ -271,7 +311,6 @@ impl WriteAheadLog {
         Ok(())
     }
 
-    /// Delete WAL files with sequences below `up_to_sequence`
     pub async fn truncate(&self, up_to_sequence: u64) -> Result<()> {
         info!("Truncating WAL up to sequence {}", up_to_sequence);
 
@@ -290,7 +329,6 @@ impl WriteAheadLog {
         Ok(())
     }
 
-    /// Get the current sequence number
     pub fn current_sequence(&self) -> u64 {
         self.sequence.load(Ordering::SeqCst)
     }
@@ -299,7 +337,6 @@ impl WriteAheadLog {
     // Private methods
     // ========================================
 
-    /// Create a WAL entry for a key-value pair
     fn create_entry(&self, key: &[u8], value: &[u8], entry_type: EntryType) -> Result<WalEntry> {
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
         let timestamp = super::cached_time::now_ms();
@@ -320,7 +357,6 @@ impl WriteAheadLog {
         })
     }
 
-    /// Create a WAL entry for a delete operation
     fn create_delete_entry(&self, key: &[u8]) -> Result<WalEntry> {
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
         let timestamp = super::cached_time::now_ms();
@@ -341,9 +377,6 @@ impl WriteAheadLog {
         })
     }
 
-    /// **OPTIMIZED** - Create entries in parallel for large batches
-    ///
-    /// Uses pipelined hashing: data hashes computed in parallel, chain hashes overlap with I/O.
     fn create_entries_batch(&self, entries: &[(&[u8], Option<&[u8]>)]) -> Result<Vec<WalEntry>> {
         use rayon::prelude::*;
 
@@ -413,7 +446,6 @@ impl WriteAheadLog {
         Ok(wal_entries)
     }
 
-    /// Write a batch of entries to the WAL
     async fn write_batch(&self, entries: &[WalEntry]) -> Result<()> {
         let total_batch_size: u64 = entries.iter().map(|e| entry_size(e) as u64).sum();
         let needs_rotation = {
@@ -439,36 +471,53 @@ impl WriteAheadLog {
         Ok(())
     }
 
-    /// Rotate to a new WAL file
     async fn rotate(&self) -> Result<()> {
         rotate_sync(&self.current_file, &self.wal_dir, &self.config)
     }
 
-    /// **OPTIMIZED** - Background group commit loop
-    ///
-    /// Batches multiple writes together to reduce fsync overhead.
     async fn group_commit_loop(
         mut rx: mpsc::Receiver<WriteRequest>,
         current_file: Arc<RwLock<WalFile>>,
         config: WalConfig,
         wal_dir: PathBuf,
     ) {
-        let delay = std::time::Duration::from_micros(config.group_commit_delay_us);
+        // Adaptive group commit: no artificial delay for single writers,
+        // but batches concurrent writers efficiently.
+        //
+        // Key insight: during fsync of batch N, writes for batch N+1 accumulate
+        // in the channel. When fsync completes, we grab all pending writes immediately.
+        // The fsync latency itself provides the batching window.
 
         loop {
+            // Wait for first write (blocking)
             let first = match rx.recv().await {
                 Some(req) => req,
                 None => break,
             };
 
             let mut batch = vec![first];
-            let deadline = tokio::time::Instant::now() + delay;
 
-            // Collect more requests until deadline or max batch size
+            // Immediately grab ALL other pending writes (non-blocking)
+            // This is the key optimization: no artificial delay
             while batch.len() < config.max_batch_size {
-                match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(Some(req)) => batch.push(req),
-                    _ => break,
+                match rx.try_recv() {
+                    Ok(req) => batch.push(req),
+                    Err(_) => break, // No more pending writes
+                }
+            }
+
+            // If batch is small and we expect high concurrency, optionally wait briefly
+            // This helps batch writes that arrive during the write (not fsync) phase
+            if batch.len() < 4 && config.group_commit_delay_us > 0 {
+                let brief_wait = std::time::Duration::from_micros(
+                    config.group_commit_delay_us.min(100) // Cap at 100μs
+                );
+                let deadline = tokio::time::Instant::now() + brief_wait;
+                while batch.len() < config.max_batch_size {
+                    match tokio::time::timeout_at(deadline, rx.recv()).await {
+                        Ok(Some(req)) => batch.push(req),
+                        _ => break,
+                    }
                 }
             }
 
@@ -488,7 +537,6 @@ impl WriteAheadLog {
         }
     }
 
-    /// Open existing WAL or create new one
     async fn open_or_create(
         wal_dir: &Path,
         config: &WalConfig,
@@ -511,7 +559,6 @@ impl WriteAheadLog {
         }
     }
 
-    /// List all WAL files in the directory
     async fn list_wal_files(&self) -> Result<Vec<(u64, PathBuf)>> {
         let mut files = Vec::new();
         let mut entries = tokio::fs::read_dir(&self.wal_dir).await?;
@@ -529,7 +576,6 @@ impl WriteAheadLog {
         Ok(files)
     }
 
-    /// Read entries from a single WAL file
     fn read_entries_from_file(
         &self,
         path: &Path,

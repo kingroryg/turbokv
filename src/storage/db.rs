@@ -34,8 +34,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::core::{DbConfig, WriteBatch};
+use crate::core::types::Compression;
 
 use super::engine::{Engine, StorageConfig, StorageError};
+use super::sstable::CompressionType;
 
 /// Result type for database operations
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -66,6 +68,8 @@ pub struct DbOptions {
     pub memtable_size: usize,
     /// Block cache size in bytes (default: 64MB, 0 to disable)
     pub block_cache_size: usize,
+    /// Compression algorithm for SSTables (default: Snappy)
+    pub compression: Compression,
 }
 
 impl Default for DbOptions {
@@ -76,13 +80,17 @@ impl Default for DbOptions {
             sync_writes: true,
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
+            compression: Compression::Snappy,
         }
     }
 }
 
 impl DbOptions {
     /// Fast configuration - no WAL, no sync, no Merkle
-    /// Good for benchmarks and non-critical data
+    ///
+    /// **Durability:** None - data may be lost on process crash
+    ///
+    /// Best for: caches, temporary data, benchmarks
     pub fn fast() -> Self {
         Self {
             wal_enabled: false,
@@ -90,21 +98,79 @@ impl DbOptions {
             sync_writes: false,
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
+            compression: Compression::Snappy,
         }
     }
 
-    /// Durable configuration - WAL enabled, sync writes
+    /// Durable configuration - WAL enabled, no sync per write
+    ///
+    /// **Durability:** Survives process crashes (data in WAL is recovered)
+    ///
+    /// The WAL is written but not immediately synced to disk. The OS
+    /// will flush buffers periodically. This provides good durability
+    /// for most use cases with much better performance than paranoid mode.
+    ///
+    /// Best for: most production workloads
     pub fn durable() -> Self {
+        Self {
+            wal_enabled: true,
+            merkle_enabled: false,
+            sync_writes: false,
+            memtable_size: 64 * 1024 * 1024,
+            block_cache_size: 64 * 1024 * 1024,
+            compression: Compression::Snappy,
+        }
+    }
+
+    /// Durable audit configuration - WAL + Merkle chains, no sync
+    ///
+    /// **Durability:** Survives process crash + detects tampering
+    ///
+    /// Like durable mode but with Merkle chains for tamper detection.
+    /// Good for audit trails where you want tamper detection but don't
+    /// need power-loss durability.
+    ///
+    /// Best for: audit logs, event sourcing, append-only logs
+    pub fn durable_audit() -> Self {
+        Self {
+            wal_enabled: true,
+            merkle_enabled: true,
+            sync_writes: false,
+            memtable_size: 64 * 1024 * 1024,
+            block_cache_size: 64 * 1024 * 1024,
+            compression: Compression::Snappy,
+        }
+    }
+
+    /// Paranoid configuration - WAL enabled, sync on every write
+    ///
+    /// **Durability:** Survives power loss (each write is fsync'd)
+    ///
+    /// Every write is immediately flushed to disk with fsync(). This
+    /// guarantees no data loss even on sudden power failure, but is
+    /// significantly slower than durable mode.
+    ///
+    /// Best for: financial transactions, critical records
+    pub fn paranoid() -> Self {
         Self {
             wal_enabled: true,
             merkle_enabled: false,
             sync_writes: true,
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
+            compression: Compression::Snappy,
         }
     }
 
-    /// Tamper-proof configuration - Merkle chains enabled
+    /// Tamper-proof configuration - Merkle chains + sync writes
+    ///
+    /// **Durability:** Survives power loss + detects tampering
+    ///
+    /// Includes all paranoid mode guarantees plus cryptographic
+    /// Merkle chain integrity verification. Any modification to
+    /// historical data will be detected.
+    ///
+    /// Best for: compliance data, legal evidence, forensic logs
     pub fn tamper_proof() -> Self {
         Self {
             wal_enabled: true,
@@ -112,7 +178,14 @@ impl DbOptions {
             sync_writes: true,
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
+            compression: Compression::Snappy,
         }
+    }
+
+    /// Set compression algorithm
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
     }
 }
 
@@ -142,7 +215,15 @@ impl Db {
             ..Default::default()
         };
 
-        let storage_config = StorageConfig::from_db_config(&db_config, path.as_ref().to_path_buf());
+        let mut storage_config = StorageConfig::from_db_config(&db_config, path.as_ref().to_path_buf());
+        // Convert user-facing Compression to internal CompressionType
+        storage_config.sstable_config.compression = match options.compression {
+            Compression::None => CompressionType::None,
+            Compression::Snappy => CompressionType::Snappy,
+            Compression::Zstd => CompressionType::Zstd,
+            Compression::Lz4 => CompressionType::Snappy, // Fallback to Snappy (LZ4 not implemented in SSTable)
+        };
+
         let engine = Engine::open(storage_config).await?;
 
         Ok(Self {

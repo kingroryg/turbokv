@@ -151,11 +151,21 @@ impl StorageConfig {
         }
     }
 
-    /// Durable configuration
+    /// Durable configuration - WAL enabled, no sync per write
     pub fn durable(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
             wal_config: WalConfig::durable(),
+            wal_enabled: true,
+            ..Default::default()
+        }
+    }
+
+    /// Paranoid configuration - WAL + sync on every write
+    pub fn paranoid(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir,
+            wal_config: WalConfig::paranoid(),
             wal_enabled: true,
             ..Default::default()
         }
