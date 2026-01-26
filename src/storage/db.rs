@@ -228,6 +228,61 @@ impl Db {
         Ok(self.engine.scan_prefix(prefix.as_ref()).await?)
     }
 
+    /// Scan a range of keys with guard iterator for lazy value access.
+    ///
+    /// Returns an iterator of [`EntryGuard`] that allows inspecting keys
+    /// without loading values, enabling efficient filtering.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Count keys without loading values
+    /// let count = db.range_iter(b"user:", b"user:\xff").await?.count();
+    ///
+    /// // Filter by key, only load matching values
+    /// for guard in db.range_iter(b"user:", b"user:\xff").await? {
+    ///     if guard.key().ends_with(b":active") {
+    ///         let value = guard.value();
+    ///         // process value
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// [`EntryGuard`]: super::iter::EntryGuard
+    pub async fn range_iter<K: AsRef<[u8]>>(
+        &self,
+        start: K,
+        end: K,
+    ) -> Result<super::iter::RangeIter> {
+        Ok(self.engine.range_iter(start.as_ref(), end.as_ref()).await?)
+    }
+
+    /// Scan keys with a prefix using guard iterator for lazy value access.
+    ///
+    /// Returns an iterator of [`EntryGuard`] that allows inspecting keys
+    /// without loading values, enabling efficient filtering.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Get only keys
+    /// let keys = db.scan_prefix_iter(b"user:").await?.keys();
+    ///
+    /// // Paginate results
+    /// let page: Vec<_> = db.scan_prefix_iter(b"user:").await?
+    ///     .paginate(offset, limit)
+    ///     .map(|g| g.into_pair())
+    ///     .collect();
+    /// ```
+    ///
+    /// [`EntryGuard`]: super::iter::EntryGuard
+    pub async fn scan_prefix_iter<K: AsRef<[u8]>>(
+        &self,
+        prefix: K,
+    ) -> Result<super::iter::PrefixIter> {
+        Ok(self.engine.scan_prefix_iter(prefix.as_ref()).await?)
+    }
+
     /// Write multiple operations atomically
     pub async fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
         self.engine.write_batch(batch).await?;
@@ -236,7 +291,7 @@ impl Db {
 
     /// Flush all pending writes to disk
     pub async fn flush(&self) -> Result<()> {
-        // First flush thread-local buffers (for fast mode optimization)
+        // First flush ALL thread-local buffers from ALL threads
         self.engine.flush_write_buffers()?;
         self.engine.flush().await?;
         Ok(())
@@ -346,11 +401,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Fast mode automatically uses sync path + thread-local buffers
+        // Fast mode uses sync path + thread-local buffers with shared registry
         db.insert(b"key1", b"value1").await.unwrap();
         db.insert(b"key2", b"value2").await.unwrap();
 
-        // Flush to ensure all buffered writes are visible
+        // Flush drains ALL thread-local buffers (from all threads)
         db.flush().await.unwrap();
 
         // Verify data is visible
@@ -384,5 +439,96 @@ mod tests {
                 Some(expected.into_bytes())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_range_iter_count() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open_with_options(temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
+
+        db.insert(b"a", b"1").await.unwrap();
+        db.insert(b"b", b"2").await.unwrap();
+        db.insert(b"c", b"3").await.unwrap();
+        db.insert(b"d", b"4").await.unwrap();
+
+        // Count without loading values
+        let count = db.range_iter(b"a", b"d").await.unwrap().count();
+        assert_eq!(count, 3); // a, b, c (exclusive end)
+    }
+
+    #[tokio::test]
+    async fn test_range_iter_keys_only() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open_with_options(temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
+
+        db.insert(b"user:1", b"alice").await.unwrap();
+        db.insert(b"user:2", b"bob").await.unwrap();
+
+        // Get only keys
+        let keys = db.scan_prefix_iter(b"user:").await.unwrap().keys();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&b"user:1".to_vec()));
+        assert!(keys.contains(&b"user:2".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_range_iter_filter_by_key() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open_with_options(temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
+
+        db.insert(b"user:1:name", b"alice").await.unwrap();
+        db.insert(b"user:1:email", b"alice@example.com")
+            .await
+            .unwrap();
+        db.insert(b"user:2:name", b"bob").await.unwrap();
+        db.insert(b"user:2:email", b"bob@example.com")
+            .await
+            .unwrap();
+
+        // Filter by key pattern, only load matching values
+        let names: Vec<_> = db
+            .scan_prefix_iter(b"user:")
+            .await
+            .unwrap()
+            .filter(|g| g.key().ends_with(b":name"))
+            .map(|g| g.into_value())
+            .collect();
+
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&b"alice".to_vec()));
+        assert!(names.contains(&b"bob".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_range_iter_paginate() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open_with_options(temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
+
+        for i in 0..10 {
+            let key = format!("key:{:02}", i);
+            let value = format!("value:{:02}", i);
+            db.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
+        }
+
+        // Paginate: skip 3, take 4
+        let page: Vec<_> = db
+            .scan_prefix_iter(b"key:")
+            .await
+            .unwrap()
+            .paginate(3, 4)
+            .map(|g| String::from_utf8_lossy(g.key()).to_string())
+            .collect();
+
+        assert_eq!(page.len(), 4);
+        assert_eq!(page[0], "key:03");
+        assert_eq!(page[3], "key:06");
     }
 }

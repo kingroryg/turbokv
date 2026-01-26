@@ -6,11 +6,20 @@
 //! - Active memtable for current writes
 //! - Immutable memtables awaiting flush to SSTables
 //! - Automatic rotation when memtable is full
-//! - Thread-local write buffers for reduced lock contention
+//! - Thread-local write buffers with shared registry for cross-thread flushing
+//!
+//! ## Write Buffering
+//!
+//! Each thread has a local write buffer per manager instance to reduce lock
+//! contention. Buffers are registered in a shared registry keyed by
+//! (ThreadId, ManagerId), allowing `flush_thread_local()` to flush ALL threads'
+//! buffers for a specific manager - not just the calling thread's buffer.
 
-use parking_lot::RwLock;
-use std::cell::RefCell;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread::ThreadId;
 use tracing::info;
 
 use super::table::{MemTable, MemTableError, Result};
@@ -19,14 +28,27 @@ use super::types::{MemTableConfig, MemTableEntry, MemTableManagerStats};
 /// Thread-local write buffer size (number of entries before flush to main memtable)
 const THREAD_LOCAL_BUFFER_SIZE: usize = 64;
 
-thread_local! {
-    /// Thread-local write buffer to reduce lock contention
-    /// Each thread accumulates writes here before batch-inserting to memtable
-    static WRITE_BUFFER: RefCell<Vec<(Vec<u8>, Vec<u8>)>> = RefCell::new(Vec::with_capacity(THREAD_LOCAL_BUFFER_SIZE));
-}
+/// Global counter for assigning unique manager IDs
+static MANAGER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Type alias for buffer entries: (key, value)
+type BufferEntry = (Vec<u8>, Vec<u8>);
+
+/// Registry key: (thread ID, manager ID)
+type RegistryKey = (ThreadId, u64);
+
+/// Type alias for the buffer registry to reduce complexity warnings
+/// Maps (ThreadId, ManagerId) -> Buffer
+type BufferRegistry = Mutex<HashMap<RegistryKey, Arc<Mutex<Vec<BufferEntry>>>>>;
+
+/// Shared registry of all thread-local buffers for cross-thread flushing
+static BUFFER_REGISTRY: std::sync::LazyLock<BufferRegistry> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Manages active and immutable memtables
 pub struct MemTableManager {
+    /// Unique identifier for this manager (used for buffer registry)
+    id: u64,
     /// Currently active (writable) memtable
     pub active: Arc<RwLock<Arc<MemTable>>>,
     /// Immutable memtables awaiting flush
@@ -39,12 +61,24 @@ impl MemTableManager {
     /// Create a new MemTableManager
     pub fn new(config: MemTableConfig) -> Self {
         let active = Arc::new(MemTable::new(config.clone()));
+        let id = MANAGER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
         Self {
+            id,
             active: Arc::new(RwLock::new(active)),
             immutable: Arc::new(RwLock::new(Vec::new())),
             config,
         }
+    }
+
+    /// Get or create the thread-local buffer for this manager
+    fn get_buffer(&self) -> Arc<Mutex<Vec<BufferEntry>>> {
+        let key = (std::thread::current().id(), self.id);
+        let mut registry = BUFFER_REGISTRY.lock();
+        registry
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(Vec::with_capacity(THREAD_LOCAL_BUFFER_SIZE))))
+            .clone()
     }
 
     /// Insert a key-value pair
@@ -74,18 +108,17 @@ impl MemTableManager {
     /// ~25-35% faster than `insert()` by reducing lock acquisitions.
     #[inline]
     pub fn insert_buffered(&self, key: &[u8], value: &[u8]) -> Result<u64> {
-        WRITE_BUFFER.with(|buffer| {
-            let mut buf = buffer.borrow_mut();
-            buf.push((key.to_vec(), value.to_vec()));
+        let buffer = self.get_buffer();
+        let mut buf = buffer.lock();
+        buf.push((key.to_vec(), value.to_vec()));
 
-            // Flush buffer when full
-            if buf.len() >= THREAD_LOCAL_BUFFER_SIZE {
-                let entries: Vec<_> = buf.drain(..).collect();
-                drop(buf); // Release borrow before calling flush
-                self.flush_buffer(&entries)?;
-            }
-            Ok(0) // Sequence number not meaningful for buffered writes
-        })
+        // Flush buffer when full
+        if buf.len() >= THREAD_LOCAL_BUFFER_SIZE {
+            let entries: Vec<_> = buf.drain(..).collect();
+            drop(buf); // Release lock before calling flush
+            self.flush_buffer(&entries)?;
+        }
+        Ok(0) // Sequence number not meaningful for buffered writes
     }
 
     /// Flush thread-local buffer to main memtable
@@ -117,19 +150,28 @@ impl MemTableManager {
         Err(MemTableError::Full)
     }
 
-    /// Flush any remaining entries in the thread-local buffer
+    /// Flush ALL thread-local buffers from ALL threads for this manager
     ///
-    /// Call this before reading to ensure all writes are visible.
+    /// This iterates over the global buffer registry and flushes each buffer
+    /// that belongs to this manager instance.
+    /// Call this before reading to ensure all writes from all threads are visible.
     pub fn flush_thread_local(&self) -> Result<()> {
-        WRITE_BUFFER.with(|buffer| {
-            let mut buf = buffer.borrow_mut();
+        // Get all registered buffers for this manager
+        let registry = BUFFER_REGISTRY.lock();
+
+        for ((_, manager_id), buffer) in registry.iter() {
+            // Only flush buffers belonging to this manager
+            if *manager_id != self.id {
+                continue;
+            }
+            let mut buf = buffer.lock();
             if !buf.is_empty() {
                 let entries: Vec<_> = buf.drain(..).collect();
                 drop(buf);
                 self.flush_buffer(&entries)?;
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     /// Delete a key
@@ -357,6 +399,14 @@ impl MemTableManager {
         *active_lock = Arc::new(MemTable::new(self.config.clone()));
 
         Ok(())
+    }
+}
+
+impl Drop for MemTableManager {
+    fn drop(&mut self) {
+        // Clean up all buffers belonging to this manager from the registry
+        let mut registry = BUFFER_REGISTRY.lock();
+        registry.retain(|(_, manager_id), _| *manager_id != self.id);
     }
 }
 

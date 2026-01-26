@@ -32,6 +32,7 @@
 //! ```
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -184,6 +185,10 @@ pub struct Engine {
     #[allow(dead_code)]
     fd_monitor: Arc<FdMonitor>,
     compactor: Arc<Compactor>,
+    // Atomic counters for SSTable stats (updated on flush/compaction)
+    sstable_total_keys: Arc<AtomicU64>,
+    sstable_total_bytes: Arc<AtomicU64>,
+    sstable_count: Arc<AtomicU64>,
 }
 
 impl Engine {
@@ -282,6 +287,11 @@ impl Engine {
             Arc::clone(&next_sstable_id),
         ));
 
+        // Initialize SSTable stats from existing SSTables
+        let initial_sstable_keys: u64 = sstables.iter().map(|s| s.entry_count).sum();
+        let initial_sstable_bytes: u64 = sstables.iter().map(|s| s.file_size).sum();
+        let initial_sstable_count = sstables.len() as u64;
+
         let engine = Self {
             config,
             wal,
@@ -293,6 +303,9 @@ impl Engine {
             sstable_pool,
             fd_monitor,
             compactor,
+            sstable_total_keys: Arc::new(AtomicU64::new(initial_sstable_keys)),
+            sstable_total_bytes: Arc::new(AtomicU64::new(initial_sstable_bytes)),
+            sstable_count: Arc::new(AtomicU64::new(initial_sstable_count)),
         };
 
         // Start background tasks
@@ -323,9 +336,10 @@ impl Engine {
         Ok(())
     }
 
-    /// Flush any pending writes from thread-local buffers
+    /// Flush any pending writes from ALL thread-local buffers
     ///
-    /// Call this before reading to ensure all writes are visible.
+    /// This flushes buffers from ALL threads (not just the calling thread),
+    /// ensuring all concurrent writes are visible before reading.
     pub fn flush_write_buffers(&self) -> Result<()> {
         self.memtable_manager
             .flush_thread_local()
@@ -455,6 +469,22 @@ impl Engine {
             .collect())
     }
 
+    /// Scan a range of keys, returning a guard iterator for lazy value access.
+    ///
+    /// This allows filtering by key without loading values until needed.
+    pub async fn range_iter(&self, start: &[u8], end: &[u8]) -> Result<super::iter::RangeIter> {
+        let entries = self.range(start, end).await?;
+        Ok(super::iter::RangeIter::new(entries))
+    }
+
+    /// Scan keys with a prefix, returning a guard iterator for lazy value access.
+    ///
+    /// This allows filtering by key without loading values until needed.
+    pub async fn scan_prefix_iter(&self, prefix: &[u8]) -> Result<super::iter::PrefixIter> {
+        let entries = self.scan_prefix(prefix).await?;
+        Ok(super::iter::RangeIter::new(entries))
+    }
+
     /// Write a batch of operations atomically
     pub async fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
         // Convert to WAL batch format
@@ -552,13 +582,33 @@ impl Engine {
     pub fn stats(&self) -> StorageStats {
         let memtable_stats = self.memtable_manager.stats();
 
+        // Count keys from active + immutable memtables
+        let memtable_keys = memtable_stats.active.entry_count as u64
+            + memtable_stats
+                .immutable
+                .iter()
+                .map(|s| s.entry_count as u64)
+                .sum::<u64>();
+
+        let memtable_bytes = memtable_stats.active.size_bytes as u64
+            + memtable_stats
+                .immutable
+                .iter()
+                .map(|s| s.size_bytes as u64)
+                .sum::<u64>();
+
+        // Add SSTable stats from atomic counters
+        let sstable_keys = self.sstable_total_keys.load(Ordering::Relaxed);
+        let sstable_bytes = self.sstable_total_bytes.load(Ordering::Relaxed);
+        let sstable_count = self.sstable_count.load(Ordering::Relaxed) as u32;
+
         StorageStats {
-            total_keys: memtable_stats.active.entry_count as u64,
-            total_bytes: memtable_stats.active.size_bytes as u64,
-            wal_size: 0,      // Would need async for this
-            sstable_count: 0, // Would need async for this
+            total_keys: memtable_keys + sstable_keys,
+            total_bytes: memtable_bytes + sstable_bytes,
+            wal_size: 0, // Would need async for WAL size
+            sstable_count,
             memtable_size: memtable_stats.active.size_bytes as u64,
-            compaction_pending: false,
+            compaction_pending: !memtable_stats.immutable.is_empty(),
         }
     }
 
@@ -747,6 +797,13 @@ impl Engine {
         // Add to SSTable list
         self.sstables.write().await.push(info.clone());
 
+        // Update atomic stats counters
+        self.sstable_total_keys
+            .fetch_add(info.entry_count, Ordering::Relaxed);
+        self.sstable_total_bytes
+            .fetch_add(info.file_size, Ordering::Relaxed);
+        self.sstable_count.fetch_add(1, Ordering::Relaxed);
+
         info!("Flushed memtable to SSTable: {:?}", path);
 
         Ok(info)
@@ -758,6 +815,11 @@ impl Engine {
         let input_paths: Vec<PathBuf> = job.input_sstables.iter().map(|s| s.path.clone()).collect();
         let input_ids: Vec<u64> = job.input_sstables.iter().map(|s| s.id).collect();
 
+        // Track stats of removed SSTables for counter updates
+        let removed_keys: u64 = job.input_sstables.iter().map(|s| s.entry_count).sum();
+        let removed_bytes: u64 = job.input_sstables.iter().map(|s| s.size).sum();
+        let removed_count = job.input_sstables.len() as u64;
+
         let result = self
             .compactor
             .execute(job)
@@ -768,6 +830,14 @@ impl Engine {
 
         // Remove old files by id
         sstables.retain(|sst| !input_ids.contains(&sst.id));
+
+        // Update atomic counters: subtract removed SSTables
+        self.sstable_total_keys
+            .fetch_sub(removed_keys, Ordering::Relaxed);
+        self.sstable_total_bytes
+            .fetch_sub(removed_bytes, Ordering::Relaxed);
+        self.sstable_count
+            .fetch_sub(removed_count, Ordering::Relaxed);
 
         // Add new file if compaction produced output
         if let Some(ref output) = result.output_sstable {
@@ -781,6 +851,13 @@ impl Engine {
                 max_key: output.max_key.clone(),
                 creation_time: output.creation_time,
             });
+
+            // Update atomic counters: add new SSTable
+            self.sstable_total_keys
+                .fetch_add(output.entry_count, Ordering::Relaxed);
+            self.sstable_total_bytes
+                .fetch_add(output.size, Ordering::Relaxed);
+            self.sstable_count.fetch_add(1, Ordering::Relaxed);
         }
 
         // Update manifest
@@ -866,6 +943,9 @@ impl Engine {
             next_sstable_id: self.next_sstable_id.clone(),
             compactor: self.compactor.clone(),
             config: self.config.clone(),
+            sstable_total_keys: self.sstable_total_keys.clone(),
+            sstable_total_bytes: self.sstable_total_bytes.clone(),
+            sstable_count: self.sstable_count.clone(),
         }
     }
 }
@@ -879,6 +959,10 @@ struct BackgroundEngine {
     compactor: Arc<Compactor>,
     config: StorageConfig,
     wal: Option<Arc<WriteAheadLog>>,
+    // Atomic counters for SSTable stats
+    sstable_total_keys: Arc<AtomicU64>,
+    sstable_total_bytes: Arc<AtomicU64>,
+    sstable_count: Arc<AtomicU64>,
 }
 
 impl BackgroundEngine {
@@ -977,6 +1061,14 @@ impl BackgroundEngine {
         }
 
         self.sstables.write().await.push(info.clone());
+
+        // Update atomic stats counters
+        self.sstable_total_keys
+            .fetch_add(info.entry_count, Ordering::Relaxed);
+        self.sstable_total_bytes
+            .fetch_add(info.file_size, Ordering::Relaxed);
+        self.sstable_count.fetch_add(1, Ordering::Relaxed);
+
         info!("Background flushed memtable to SSTable: {:?}", path);
 
         Ok(info)
@@ -986,6 +1078,11 @@ impl BackgroundEngine {
         let input_paths: Vec<PathBuf> = job.input_sstables.iter().map(|s| s.path.clone()).collect();
         let input_ids: Vec<u64> = job.input_sstables.iter().map(|s| s.id).collect();
 
+        // Track stats of removed SSTables for counter updates
+        let removed_keys: u64 = job.input_sstables.iter().map(|s| s.entry_count).sum();
+        let removed_bytes: u64 = job.input_sstables.iter().map(|s| s.size).sum();
+        let removed_count = job.input_sstables.len() as u64;
+
         let result = self
             .compactor
             .execute(job)
@@ -993,6 +1090,14 @@ impl BackgroundEngine {
 
         let mut sstables = self.sstables.write().await;
         sstables.retain(|sst| !input_ids.contains(&sst.id));
+
+        // Update atomic counters: subtract removed SSTables
+        self.sstable_total_keys
+            .fetch_sub(removed_keys, Ordering::Relaxed);
+        self.sstable_total_bytes
+            .fetch_sub(removed_bytes, Ordering::Relaxed);
+        self.sstable_count
+            .fetch_sub(removed_count, Ordering::Relaxed);
 
         if let Some(ref output) = result.output_sstable {
             sstables.push(SSTableInfo {
@@ -1005,6 +1110,13 @@ impl BackgroundEngine {
                 max_key: output.max_key.clone(),
                 creation_time: output.creation_time,
             });
+
+            // Update atomic counters: add new SSTable
+            self.sstable_total_keys
+                .fetch_add(output.entry_count, Ordering::Relaxed);
+            self.sstable_total_bytes
+                .fetch_add(output.size, Ordering::Relaxed);
+            self.sstable_count.fetch_add(1, Ordering::Relaxed);
         }
 
         {

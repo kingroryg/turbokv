@@ -5,7 +5,7 @@
 
 [![Build Status](https://github.com/hanshiro-dev/turbokv/workflows/CI/badge.svg)](https://github.com/hanshiro-dev/turbokv/actions)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
 </div>
 
@@ -205,6 +205,8 @@ TurboKV is optimized for high write throughput and outperforms both RocksDB and 
 | `contains_key(key)` | Check if key exists |
 | `range(start, end)` | Scan keys in range [start, end) |
 | `scan_prefix(prefix)` | Scan all keys with prefix |
+| `range_iter(start, end)` | Range scan with lazy value loading |
+| `scan_prefix_iter(prefix)` | Prefix scan with lazy value loading |
 | `write_batch(batch)` | Atomic batch write |
 | `flush()` | Flush memtable to disk |
 | `compact()` | Trigger manual compaction |

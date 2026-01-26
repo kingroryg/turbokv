@@ -143,6 +143,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Query all teams
     let all_teams = db.scan_prefix(b"org:acme:team:").await?;
     println!("\nAll team members ({} total):", all_teams.len());
+    for (key, value) in &all_teams {
+        let key_str = String::from_utf8_lossy(key);
+        let member = key_str.split(':').last().unwrap_or("unknown");
+        println!("  {} - {}", member, String::from_utf8_lossy(value));
+    }
 
     // ============================================
     // Pattern: Secondary indexes

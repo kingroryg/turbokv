@@ -71,6 +71,7 @@ pub mod storage;
 // Primary API
 pub use core::types::{CompactionStyle, Compression, DbConfig, WriteBatch};
 pub use storage::db::{Db, DbError, DbOptions, DbStats};
+pub use storage::iter::{EntryGuard, PrefixIter, RangeIter};
 
 // Advanced API
 pub use core::crypto::{crc32_checksum, MerkleChain, MerkleNode};
