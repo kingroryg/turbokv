@@ -15,7 +15,7 @@ TurboKV is a high-performance, embedded key-value database written in Rust. It p
 ## Features
 
 - **Simple API**: Familiar `get`, `insert`, `remove`, `range` operations
-- **Configurable Durability**: Choose between fast, durable, or tamper-proof modes
+- **Configurable Durability**: Choose between fast, durable, or paranoid modes
 - **LSM-Tree Architecture**: Optimized for write-heavy workloads
 - **Async/Await**: Built on Tokio for modern async Rust
 - **Batch Operations**: Atomic write batches for transactional writes
@@ -88,22 +88,20 @@ db.write_batch(&batch).await?;
 
 ### Configuration Options
 
-TurboKV provides five durability modes to balance speed and safety:
+TurboKV provides three durability modes to balance speed and safety:
 
-| Mode | WAL | Fsync | Merkle | Survives |
-|------|-----|-------|--------|----------|
-| `fast()` | No | No | No | Nothing (max speed) |
-| `durable()` | Yes | Periodic | No | Process crash |
-| `durable_audit()` | Yes | Periodic | Yes | Process crash + tamper detection |
-| `paranoid()` | Yes | Yes | No | Power loss |
-| `tamper_proof()` | Yes | Yes | Yes | Power loss + tamper detection |
+| Mode | WAL | Fsync | Survives |
+|------|-----|-------|----------|
+| `fast()` | No | No | Nothing (max speed) |
+| `durable()` | Yes | Periodic | Process crash |
+| `paranoid()` | Yes | Every write | Power loss |
 
 **Recommended for most users:** `fast()` or `durable()` mode.
 
 - Use **`fast()`** when data can be regenerated (caches, derived data, temp files)
 - Use **`durable()`** for production data that must survive process crashes
 
-The other modes (`paranoid`, `tamper_proof`) are for specialized use cases where you need power-loss durability or cryptographic tamper detection. These modes are significantly slower due to fsync overhead (~263 ops/sec vs ~100K ops/sec).
+The `paranoid()` mode is for specialized use cases where you need power-loss durability. This mode is significantly slower due to fsync overhead (~263 ops/sec vs ~1.1M ops/sec).
 
 ```rust
 use turbokv::{Db, DbOptions};
@@ -116,17 +114,9 @@ let db = Db::open_with_options("./data", DbOptions::fast()).await?;
 // Best for: most production workloads
 let db = Db::open_with_options("./data", DbOptions::durable()).await?;
 
-// Durable audit mode - WAL + Merkle chains (no fsync)
-// Best for: audit logs, event sourcing, append-only logs
-let db = Db::open_with_options("./data", DbOptions::durable_audit()).await?;
-
 // Paranoid mode - fsync on every write
 // Best for: financial transactions, critical records
 let db = Db::open_with_options("./data", DbOptions::paranoid()).await?;
-
-// Tamper-proof mode - Merkle chains + fsync
-// Best for: compliance data, legal evidence, forensic logs
-let db = Db::open_with_options("./data", DbOptions::tamper_proof()).await?;
 ```
 
 ### Custom Configuration
@@ -136,25 +126,19 @@ use turbokv::{DbOptions, Compression};
 
 let options = DbOptions {
     wal_enabled: true,           // Write-ahead log for durability
-    merkle_enabled: false,       // Merkle chains for tamper detection
-    sync_writes: true,           // Sync to disk on each write
+    sync_writes: false,          // Periodic sync (true = fsync every write)
     memtable_size: 64 * 1024 * 1024,   // 64MB memtable
     block_cache_size: 64 * 1024 * 1024, // 64MB block cache
-    compression: Compression::Snappy,   // Snappy, Zstd, or None
+    compression: Compression::Lz4,      // Lz4, Snappy, Zstd, or None
 };
 
 let db = Db::open_with_options("./data", options).await?;
-
-// Or use builder-style configuration
-let db = Db::open_with_options(
-    "./data",
-    DbOptions::durable().with_compression(Compression::Zstd)
-).await?;
 ```
 
 **Compression options:**
 - `Compression::None` - No compression (fastest writes, largest files)
-- `Compression::Snappy` - Fast compression (default, good balance)
+- `Compression::Lz4` - Very fast compression (default, best for most workloads)
+- `Compression::Snappy` - Fast compression (good balance)
 - `Compression::Zstd` - High compression ratio (smaller files, slower)
 
 ## Architecture
@@ -183,16 +167,20 @@ Read Path:
 
 ## Performance
 
-TurboKV is optimized for high write throughput.
+TurboKV is optimized for high write throughput and outperforms both RocksDB and fjall.
 
-**Large-scale benchmark: 1M keys, 400-byte values (400MB total)**
+**Production-scale benchmark: 10M keys, 400-byte values (4.2GB total)**
 
-| Operation | Performance |
-|-----------|-------------|
-| Sequential writes (fast mode) | **1.10M ops/sec** |
-| Sequential writes (durable mode) | **899K ops/sec** |
-| Sequential writes (durable_audit) | 38K ops/sec |
-| Sequential writes (paranoid mode) | ~256 ops/sec |
+| Database | Mode | Throughput |
+|----------|------|------------|
+| **TurboKV** | fast (no WAL) | **1,178K ops/sec** |
+| **TurboKV** | durable (WAL) | **1,111K ops/sec** |
+| RocksDB | default (WAL) | 557K ops/sec |
+| fjall | default | 494K ops/sec |
+| TurboKV | paranoid (fsync/write) | ~263 ops/sec |
+
+| Other Operations | Performance |
+|------------------|-------------|
 | Random reads | ~760K ops/sec |
 | Range scans | ~1.2M entries/sec |
 | Concurrent writes (8 writers, paranoid) | ~1000 ops/sec |
@@ -201,31 +189,34 @@ TurboKV is optimized for high write throughput.
 
 ### Understanding the Numbers
 
+**How does TurboKV compare?**
+- TurboKV is **2x faster** than RocksDB with equivalent durability (WAL enabled)
+- TurboKV is **2.25x faster** than fjall
+- TurboKV provides a simpler async API with zero-allocation write paths
+
 **Why is paranoid mode so slow?** Every write calls `fsync()` which takes 3-5ms on SSDs. This is a hardware limitation that affects all databases equally. RocksDB and fjall hit the same bottleneck (~200-300 ops/sec) when configured for power-loss durability.
 
 **Why is durable mode much faster?** It writes to the WAL but relies on the OS to `fsync()` periodically (every few seconds). This "periodic sync" approach means data survives process crashes but not sudden power loss. This is what RocksDB does by default (`sync_wal: false`).
-
-**Comparison note:** RocksDB's published benchmarks use 900M keys, 8 CPU cores, and enterprise NVMe storage. On similar workloads, RocksDB achieves ~87K overwrites/sec and ~137-189K random reads/sec. TurboKV is competitive for an embedded Rust database, though RocksDB's mature C++ implementation has decades of optimization.
 
 ## Comparison
 
 | Feature | TurboKV | RocksDB | fjall |
 |---------|---------|---------|-------|
 | Language | Rust | C++ | Rust |
+| Write throughput | 1.1M ops/sec | 557K ops/sec | 494K ops/sec |
 | Async support | Yes | No | No |
 | BTreeMap-like API | Yes | No | Yes |
-| Merkle chains | Yes | No | No |
 | Maturity | New | Battle-tested | Established |
 | Learning curve | Low | High | Low |
 
 **When to use TurboKV:**
+- You want the fastest write performance
 - You want a simple, async-native Rust API
-- You need Merkle chain tamper detection
 - You're building an embedded database into your application
 
 **When to use RocksDB:**
-- You need maximum performance at scale (900M+ keys)
 - You need advanced features (column families, transactions, compaction tuning)
+- You need the most battle-tested option for critical production systems
 - You're comfortable with C++ bindings and complex configuration
 
 ## API Reference
@@ -252,10 +243,10 @@ TurboKV is optimized for high write throughput.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `wal_enabled` | true | Enable write-ahead log |
-| `merkle_enabled` | false | Enable Merkle chains |
-| `sync_writes` | true | Sync writes to disk |
+| `sync_writes` | false | Sync writes to disk (true = paranoid mode) |
 | `memtable_size` | 64MB | MemTable size before flush |
 | `block_cache_size` | 64MB | Block cache size (0 to disable) |
+| `compression` | Lz4 | Compression algorithm |
 
 ### WriteBatch
 

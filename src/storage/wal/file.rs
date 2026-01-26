@@ -5,6 +5,18 @@
 //! - **write_entries_batch()** - Vectorized batch write that pre-allocates buffer
 //!   and writes all entries in a single syscall
 //! - **BufWriter::with_capacity()** - Configurable write buffering
+//!
+//! ## WAL Entry Format (v3)
+//!
+//! Entry header: 32 bytes
+//! - length: u32 (4 bytes)
+//! - sequence: u64 (8 bytes)
+//! - timestamp: u64 (8 bytes)
+//! - entry_type: u8 (1 byte)
+//! - flags: u8 (1 byte)
+//! - crc: u32 (4 bytes)
+//! - reserved: 6 bytes
+//! Payload: variable length
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -14,7 +26,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
 use tracing::info;
 
-use crate::core::crypto::{crc32_checksum, MerkleChain, MerkleNode};
+use crate::core::crypto::crc32_checksum;
 
 use super::types::*;
 
@@ -72,7 +84,7 @@ pub(crate) fn create_file(wal_dir: &Path, sequence: u64, config: &WalConfig) -> 
 pub(crate) fn recover_file(
     path: &Path,
     config: &WalConfig,
-) -> Result<(WalFile, u64, MerkleChain)> {
+) -> Result<(WalFile, u64)> {
     info!("Recovering from WAL file: {:?}", path);
 
     let file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -91,7 +103,8 @@ pub(crate) fn recover_file(
     }
 
     let version = reader.read_u32::<LittleEndian>()?;
-    if version != WAL_VERSION && version != 1 {
+    // Support v1, v2 (legacy with Merkle), and v3 (current, no Merkle)
+    if version != WAL_VERSION && version != 1 && version != 2 {
         return Err(WalError::InvalidFormat(format!(
             "Unsupported WAL version: {}",
             version
@@ -105,14 +118,12 @@ pub(crate) fn recover_file(
     let _checksum = reader.read_u32::<LittleEndian>()?;
     reader.read_exact(&mut [0u8; 16])?;
 
-    // Rebuild Merkle chain if enabled
-    let mut merkle_chain = MerkleChain::new();
+    // Read entries to find last sequence
+    // Use version to determine format (v2 has Merkle bytes, v3 doesn't)
+    let has_merkle = version <= 2;
     loop {
-        match read_entry(&mut reader) {
+        match read_entry_versioned(&mut reader, has_merkle) {
             Ok(entry) => {
-                if config.merkle_enabled {
-                    merkle_chain.add(&entry.data);
-                }
                 last_sequence = entry.sequence;
             }
             Err(WalError::Eof) => break,
@@ -135,7 +146,6 @@ pub(crate) fn recover_file(
             last_sequence,
         },
         last_sequence + 1,
-        merkle_chain,
     ))
 }
 
@@ -160,7 +170,7 @@ pub(crate) fn read_header_last_sequence(path: &Path) -> Result<u64> {
     Ok(file.read_u64::<LittleEndian>()?)
 }
 
-/// Write a single entry to the WAL
+/// Write a single entry to the WAL (v3 format - no Merkle)
 #[allow(dead_code)]
 pub(crate) fn write_entry(writer: &mut impl Write, entry: &WalEntry) -> Result<()> {
     writer.write_u32::<LittleEndian>(entry.data.len() as u32)?;
@@ -170,29 +180,19 @@ pub(crate) fn write_entry(writer: &mut impl Write, entry: &WalEntry) -> Result<(
     writer.write_u8(0)?; // Flags
     writer.write_u32::<LittleEndian>(crc32_checksum(&entry.data))?;
     writer.write_all(&[0u8; 6])?; // Reserved
-
-    // Write Merkle info (zeros if disabled)
-    let prev_hash = entry
-        .merkle
-        .prev_hash
-        .as_ref()
-        .and_then(|h| hex::decode(h).ok())
-        .unwrap_or_else(|| vec![0u8; 32]);
-    writer.write_all(&prev_hash)?;
-
-    let hash = hex::decode(&entry.merkle.hash).unwrap_or_else(|_| vec![0u8; 32]);
-    writer.write_all(&hash)?;
-
-    let data_hash = hex::decode(&entry.merkle.data_hash).unwrap_or_else(|_| vec![0u8; 32]);
-    writer.write_all(&data_hash)?;
-
     writer.write_all(&entry.data)?;
 
     Ok(())
 }
 
-/// Read a single entry from the WAL
+/// Read a single entry from the WAL (v3 format - no Merkle)
 pub(crate) fn read_entry(reader: &mut impl Read) -> Result<WalEntry> {
+    read_entry_versioned(reader, false)
+}
+
+/// Read a single entry with version-aware format
+/// has_merkle: true for v1/v2 format (96 bytes Merkle), false for v3
+pub(crate) fn read_entry_versioned(reader: &mut impl Read, has_merkle: bool) -> Result<WalEntry> {
     let length = match reader.read_u32::<LittleEndian>() {
         Ok(len) => len as usize,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -208,12 +208,10 @@ pub(crate) fn read_entry(reader: &mut impl Read) -> Result<WalEntry> {
     let crc = reader.read_u32::<LittleEndian>()?;
     reader.read_exact(&mut [0u8; 6])?;
 
-    let mut prev_hash = [0u8; 32];
-    let mut hash = [0u8; 32];
-    let mut data_hash = [0u8; 32];
-    reader.read_exact(&mut prev_hash)?;
-    reader.read_exact(&mut hash)?;
-    reader.read_exact(&mut data_hash)?;
+    // Skip Merkle bytes if reading legacy format
+    if has_merkle {
+        reader.read_exact(&mut [0u8; 96])?;
+    }
 
     let mut data = vec![0u8; length];
     reader.read_exact(&mut data)?;
@@ -228,22 +226,12 @@ pub(crate) fn read_entry(reader: &mut impl Read) -> Result<WalEntry> {
         timestamp,
         entry_type,
         data: Bytes::from(data),
-        merkle: MerkleNode {
-            hash: hex::encode(hash),
-            prev_hash: if prev_hash == [0u8; 32] {
-                None
-            } else {
-                Some(hex::encode(prev_hash))
-            },
-            data_hash: hex::encode(data_hash),
-            sequence,
-        },
     })
 }
 
-/// Calculate the size of an entry on disk
+/// Calculate the size of an entry on disk (v3 format - no Merkle)
 pub(crate) fn entry_size(entry: &WalEntry) -> usize {
-    ENTRY_HEADER_SIZE + MERKLE_INFO_SIZE + entry.data.len()
+    ENTRY_HEADER_SIZE + entry.data.len()
 }
 
 /// **OPTIMIZED** - Batch write that minimizes syscalls
@@ -261,7 +249,7 @@ pub(crate) fn write_entries_batch<T: AsRef<WalEntry>>(
     for entry in entries {
         let entry = entry.as_ref();
 
-        // Entry header
+        // Entry header (32 bytes)
         buffer.extend_from_slice(&(entry.data.len() as u32).to_le_bytes());
         buffer.extend_from_slice(&entry.sequence.to_le_bytes());
         buffer.extend_from_slice(&entry.timestamp.to_le_bytes());
@@ -270,22 +258,7 @@ pub(crate) fn write_entries_batch<T: AsRef<WalEntry>>(
         buffer.extend_from_slice(&crc32_checksum(&entry.data).to_le_bytes());
         buffer.extend_from_slice(&[0u8; 6]); // Reserved
 
-        // Merkle info (zeros if disabled)
-        let prev_hash = entry
-            .merkle
-            .prev_hash
-            .as_ref()
-            .and_then(|h| hex::decode(h).ok())
-            .unwrap_or_else(|| vec![0u8; 32]);
-        buffer.extend_from_slice(&prev_hash);
-
-        let hash = hex::decode(&entry.merkle.hash).unwrap_or_else(|_| vec![0u8; 32]);
-        buffer.extend_from_slice(&hash);
-
-        let data_hash = hex::decode(&entry.merkle.data_hash).unwrap_or_else(|_| vec![0u8; 32]);
-        buffer.extend_from_slice(&data_hash);
-
-        // Payload
+        // Payload (no Merkle overhead in v3)
         buffer.extend_from_slice(&entry.data);
     }
 

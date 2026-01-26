@@ -127,7 +127,6 @@ impl StorageConfig {
         Self {
             data_dir,
             wal_config: WalConfig {
-                merkle_enabled: db_config.merkle_enabled,
                 sync_on_write: db_config.sync_writes,
                 ..Default::default()
             },
@@ -166,16 +165,6 @@ impl StorageConfig {
         Self {
             data_dir,
             wal_config: WalConfig::paranoid(),
-            wal_enabled: true,
-            ..Default::default()
-        }
-    }
-
-    /// Tamper-proof configuration with Merkle chains
-    pub fn tamper_proof(data_dir: PathBuf) -> Self {
-        Self {
-            data_dir,
-            wal_config: WalConfig::tamper_proof(),
             wal_enabled: true,
             ..Default::default()
         }
@@ -316,17 +305,34 @@ impl Engine {
     }
 
     /// Insert a key-value pair
+    ///
+    /// Automatically uses optimal path based on configuration:
+    /// - No WAL: Sync path with thread-local buffering (faster)
+    /// - With WAL: Async path for durability
     pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        // Write to WAL first (if enabled)
         if let Some(ref wal) = self.wal {
+            // Durable path: WAL write then memtable
             wal.append(key, value).await?;
+            self.memtable_manager
+                .insert(key, value)
+                .map_err(StorageError::MemTable)?;
+        } else {
+            // Fast path: thread-local buffered insert, no async overhead
+            self.memtable_manager
+                .insert_buffered(key, value)
+                .map_err(StorageError::MemTable)?;
         }
 
-        // Insert into memtable
-        self.memtable_manager
-            .insert(key, value)
-            .map_err(StorageError::MemTable)?;
+        Ok(())
+    }
 
+    /// Flush any pending writes from thread-local buffers
+    ///
+    /// Call this before reading to ensure all writes are visible.
+    pub fn flush_write_buffers(&self) -> Result<()> {
+        self.memtable_manager
+            .flush_thread_local()
+            .map_err(StorageError::MemTable)?;
         Ok(())
     }
 
@@ -347,6 +353,13 @@ impl Engine {
 
     /// Get a value by key
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        // In fast mode, flush thread-local buffer to ensure visibility
+        if self.wal.is_none() {
+            self.memtable_manager
+                .flush_thread_local()
+                .map_err(StorageError::MemTable)?;
+        }
+
         // Check memtable first
         if let Some(value) = self.memtable_manager.get(key) {
             return Ok(Some(value));
@@ -379,6 +392,13 @@ impl Engine {
     pub async fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         use std::collections::BTreeMap;
 
+        // In fast mode, flush thread-local buffer to ensure visibility
+        if self.wal.is_none() {
+            self.memtable_manager
+                .flush_thread_local()
+                .map_err(StorageError::MemTable)?;
+        }
+
         let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
 
         // Get from memtable
@@ -406,6 +426,13 @@ impl Engine {
     /// Scan all keys with a given prefix
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         use std::collections::BTreeMap;
+
+        // In fast mode, flush thread-local buffer to ensure visibility
+        if self.wal.is_none() {
+            self.memtable_manager
+                .flush_thread_local()
+                .map_err(StorageError::MemTable)?;
+        }
 
         let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
 

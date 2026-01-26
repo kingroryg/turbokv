@@ -36,8 +36,6 @@ pub enum CompactionStyle {
 pub struct DbConfig {
     /// Enable WAL for durability (default: true)
     pub wal_enabled: bool,
-    /// Enable Merkle chains for tamper-proof storage (default: false for speed)
-    pub merkle_enabled: bool,
     /// Compression algorithm (default: Lz4)
     pub compression: Compression,
     /// Sync writes to disk immediately (default: true)
@@ -62,7 +60,6 @@ impl Default for DbConfig {
     fn default() -> Self {
         Self {
             wal_enabled: true,
-            merkle_enabled: false, // OFF by default for speed
             compression: Compression::Lz4,
             sync_writes: true,
             memtable_size: 64 * 1024 * 1024,       // 64MB
@@ -83,7 +80,6 @@ impl DbConfig {
     pub fn fast() -> Self {
         Self {
             wal_enabled: false,
-            merkle_enabled: false,
             compression: Compression::None,
             sync_writes: false,
             memtable_size: 256 * 1024 * 1024,      // 256MB - larger to reduce flushes
@@ -102,26 +98,6 @@ impl DbConfig {
     pub fn durable() -> Self {
         Self {
             wal_enabled: true,
-            merkle_enabled: false,
-            compression: Compression::Lz4,
-            sync_writes: true,
-            memtable_size: 64 * 1024 * 1024,
-            block_cache_size: 64 * 1024 * 1024,
-            max_open_files: 1000,
-            compaction_style: CompactionStyle::SizeTiered,
-            max_wal_size: 128 * 1024 * 1024,
-            flush_interval: Duration::from_secs(60),
-            compaction_interval: Duration::from_secs(300),
-        }
-    }
-
-    /// Tamper-proof configuration - cryptographic integrity verification
-    ///
-    /// Use for: audit logs, compliance data, legal evidence
-    pub fn tamper_proof() -> Self {
-        Self {
-            wal_enabled: true,
-            merkle_enabled: true,
             compression: Compression::Lz4,
             sync_writes: true,
             memtable_size: 64 * 1024 * 1024,

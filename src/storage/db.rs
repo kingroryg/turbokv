@@ -60,8 +60,6 @@ pub enum DbError {
 pub struct DbOptions {
     /// Enable WAL for durability (default: true)
     pub wal_enabled: bool,
-    /// Enable Merkle chains for tamper detection (default: false)
-    pub merkle_enabled: bool,
     /// Sync writes immediately (default: true for durability)
     pub sync_writes: bool,
     /// MemTable size in bytes before flush (default: 64MB)
@@ -76,7 +74,6 @@ impl Default for DbOptions {
     fn default() -> Self {
         Self {
             wal_enabled: true,
-            merkle_enabled: false,
             sync_writes: true,
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
@@ -86,7 +83,7 @@ impl Default for DbOptions {
 }
 
 impl DbOptions {
-    /// Fast configuration - no WAL, no sync, no Merkle
+    /// Fast configuration - no WAL, no sync
     ///
     /// **Durability:** None - data may be lost on process crash
     ///
@@ -94,7 +91,6 @@ impl DbOptions {
     pub fn fast() -> Self {
         Self {
             wal_enabled: false,
-            merkle_enabled: false,
             sync_writes: false,
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
@@ -114,27 +110,6 @@ impl DbOptions {
     pub fn durable() -> Self {
         Self {
             wal_enabled: true,
-            merkle_enabled: false,
-            sync_writes: false,
-            memtable_size: 64 * 1024 * 1024,
-            block_cache_size: 64 * 1024 * 1024,
-            compression: Compression::Snappy,
-        }
-    }
-
-    /// Durable audit configuration - WAL + Merkle chains, no sync
-    ///
-    /// **Durability:** Survives process crash + detects tampering
-    ///
-    /// Like durable mode but with Merkle chains for tamper detection.
-    /// Good for audit trails where you want tamper detection but don't
-    /// need power-loss durability.
-    ///
-    /// Best for: audit logs, event sourcing, append-only logs
-    pub fn durable_audit() -> Self {
-        Self {
-            wal_enabled: true,
-            merkle_enabled: true,
             sync_writes: false,
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
@@ -154,27 +129,6 @@ impl DbOptions {
     pub fn paranoid() -> Self {
         Self {
             wal_enabled: true,
-            merkle_enabled: false,
-            sync_writes: true,
-            memtable_size: 64 * 1024 * 1024,
-            block_cache_size: 64 * 1024 * 1024,
-            compression: Compression::Snappy,
-        }
-    }
-
-    /// Tamper-proof configuration - Merkle chains + sync writes
-    ///
-    /// **Durability:** Survives power loss + detects tampering
-    ///
-    /// Includes all paranoid mode guarantees plus cryptographic
-    /// Merkle chain integrity verification. Any modification to
-    /// historical data will be detected.
-    ///
-    /// Best for: compliance data, legal evidence, forensic logs
-    pub fn tamper_proof() -> Self {
-        Self {
-            wal_enabled: true,
-            merkle_enabled: true,
             sync_writes: true,
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
@@ -208,7 +162,6 @@ impl Db {
     pub async fn open_with_options<P: AsRef<Path>>(path: P, options: DbOptions) -> Result<Self> {
         let db_config = DbConfig {
             wal_enabled: options.wal_enabled,
-            merkle_enabled: options.merkle_enabled,
             sync_writes: options.sync_writes,
             memtable_size: options.memtable_size,
             block_cache_size: options.block_cache_size,
@@ -221,7 +174,7 @@ impl Db {
             Compression::None => CompressionType::None,
             Compression::Snappy => CompressionType::Snappy,
             Compression::Zstd => CompressionType::Zstd,
-            Compression::Lz4 => CompressionType::Snappy, // Fallback to Snappy (LZ4 not implemented in SSTable)
+            Compression::Lz4 => CompressionType::Lz4,
         };
 
         let engine = Engine::open(storage_config).await?;
@@ -234,6 +187,11 @@ impl Db {
     /// Insert a key-value pair
     ///
     /// If the key already exists, the value is overwritten.
+    ///
+    /// # Performance
+    /// Automatically uses the optimal path based on configuration:
+    /// - Fast mode (no WAL): Uses sync path with thread-local buffering
+    /// - Durable modes: Uses async path for WAL writes
     pub async fn insert<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, key: K, value: V) -> Result<()> {
         self.engine.insert(key.as_ref(), value.as_ref()).await?;
         Ok(())
@@ -277,6 +235,8 @@ impl Db {
 
     /// Flush all pending writes to disk
     pub async fn flush(&self) -> Result<()> {
+        // First flush thread-local buffers (for fast mode optimization)
+        self.engine.flush_write_buffers()?;
         self.engine.flush().await?;
         Ok(())
     }
@@ -370,5 +330,45 @@ mod tests {
 
         let users = db.scan_prefix(b"user:").await.unwrap();
         assert_eq!(users.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_fast_mode_optimized() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open_with_options(temp.path(), DbOptions::fast()).await.unwrap();
+
+        // Fast mode automatically uses sync path + thread-local buffers
+        db.insert(b"key1", b"value1").await.unwrap();
+        db.insert(b"key2", b"value2").await.unwrap();
+
+        // Flush to ensure all buffered writes are visible
+        db.flush().await.unwrap();
+
+        // Verify data is visible
+        assert_eq!(db.get(b"key1").await.unwrap(), Some(b"value1".to_vec()));
+        assert_eq!(db.get(b"key2").await.unwrap(), Some(b"value2".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_fast_mode_many_inserts() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open_with_options(temp.path(), DbOptions::fast()).await.unwrap();
+
+        // Insert many keys (will trigger automatic buffer flushes)
+        for i in 0..1000 {
+            let key = format!("key{:04}", i);
+            let value = format!("value{:04}", i);
+            db.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
+        }
+
+        // Flush to ensure all writes are visible
+        db.flush().await.unwrap();
+
+        // Verify all data is visible
+        for i in 0..1000 {
+            let key = format!("key{:04}", i);
+            let expected = format!("value{:04}", i);
+            assert_eq!(db.get(key.as_bytes()).await.unwrap(), Some(expected.into_bytes()));
+        }
     }
 }

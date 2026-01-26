@@ -9,7 +9,6 @@ mod types_tests {
     fn test_db_config_default() {
         let config = DbConfig::default();
         assert!(config.wal_enabled);
-        assert!(!config.merkle_enabled);
         assert!(config.sync_writes);
         assert_eq!(config.compression, Compression::Lz4);
         assert_eq!(config.compaction_style, CompactionStyle::SizeTiered);
@@ -19,7 +18,6 @@ mod types_tests {
     fn test_db_config_fast() {
         let config = DbConfig::fast();
         assert!(!config.wal_enabled);
-        assert!(!config.merkle_enabled);
         assert!(!config.sync_writes);
         assert_eq!(config.compression, Compression::None);
     }
@@ -28,17 +26,8 @@ mod types_tests {
     fn test_db_config_durable() {
         let config = DbConfig::durable();
         assert!(config.wal_enabled);
-        assert!(!config.merkle_enabled);
         assert!(config.sync_writes);
         assert_eq!(config.compression, Compression::Lz4);
-    }
-
-    #[test]
-    fn test_db_config_tamper_proof() {
-        let config = DbConfig::tamper_proof();
-        assert!(config.wal_enabled);
-        assert!(config.merkle_enabled);
-        assert!(config.sync_writes);
     }
 
     #[test]

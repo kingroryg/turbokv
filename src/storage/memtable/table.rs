@@ -90,7 +90,8 @@ impl MemTable {
             return Err(MemTableError::Full);
         }
 
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+        // Relaxed ordering - monotonicity guaranteed, no memory barrier overhead
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
 
         // Inline size estimation for fast path
         let entry_size = key.len() + value.len() + 32; // 32 for entry overhead
@@ -131,7 +132,8 @@ impl MemTable {
             return Err(MemTableError::Full);
         }
 
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+        // Relaxed ordering - monotonicity guaranteed, no memory barrier overhead
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let entry = MemTableEntry::tombstone(sequence);
 
         // Check if we're deleting an existing non-tombstone entry
@@ -321,7 +323,7 @@ impl MemTable {
 
     /// Get the current sequence number
     pub fn sequence(&self) -> u64 {
-        self.sequence.load(Ordering::SeqCst)
+        self.sequence.load(Ordering::Relaxed)
     }
 
     /// Get the approximate size in bytes

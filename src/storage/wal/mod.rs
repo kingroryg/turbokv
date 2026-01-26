@@ -11,10 +11,15 @@
 //! │  append_batch() ──────────► Direct Write (bypasses group commit)│
 //! └─────────────────────────────────────────────────────────────────┘
 //!
-//! ## File Format
+//! ## File Format (v3)
 //!
 //! - Header: 64 bytes (magic, version, timestamps, sequence range)
-//! - Entries: Header (32B) + Merkle (96B) + Payload (variable)
+//! - Entries: Header (32B) + Payload (variable)
+//!
+//! ## Zero-Allocation Write Path
+//!
+//! For maximum throughput, uses thread-local pre-allocated buffers
+//! to avoid per-write heap allocations.
 
 mod file;
 mod iterator;
@@ -23,6 +28,7 @@ mod types;
 pub use iterator::WalEntryIterator;
 pub use types::{encode_delete, encode_kv, EntryType, Result, WalConfig, WalEntry, WalError};
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom, Write};
@@ -35,13 +41,18 @@ use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
-use crate::core::crypto::{MerkleChain, MerkleNode};
-
+use crate::core::crypto::crc32_checksum;
 use file::{
     create_file, entry_size, finalize_header, read_entry, read_header_last_sequence, recover_file,
     write_entries_batch, write_entry, WalFile,
 };
-use types::WAL_HEADER_SIZE;
+use types::{ENTRY_HEADER_SIZE, WAL_HEADER_SIZE};
+
+// Thread-local buffer for zero-allocation WAL writes
+// Pre-allocated to avoid per-write heap allocations
+thread_local! {
+    static WAL_ENCODE_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
+}
 
 struct WriteRequest {
     entry: WalEntry,
@@ -53,7 +64,6 @@ pub struct WriteAheadLog {
     config: WalConfig,
     current_file: Arc<RwLock<WalFile>>,
     sequence: Arc<AtomicU64>,
-    merkle_chain: Arc<RwLock<MerkleChain>>,
     write_tx: mpsc::Sender<WriteRequest>,
 }
 
@@ -67,7 +77,7 @@ impl WriteAheadLog {
                 source: Some(e),
             })?;
 
-        let (wal_file, sequence, merkle_chain) = Self::open_or_create(&wal_dir, &config).await?;
+        let (wal_file, sequence) = Self::open_or_create(&wal_dir, &config).await?;
         let current_file = Arc::new(RwLock::new(wal_file));
         let (write_tx, write_rx) = mpsc::channel::<WriteRequest>(config.max_batch_size * 2);
 
@@ -84,30 +94,23 @@ impl WriteAheadLog {
             config,
             current_file,
             sequence: Arc::new(AtomicU64::new(sequence)),
-            merkle_chain: Arc::new(RwLock::new(merkle_chain)),
             write_tx,
         })
     }
 
     pub async fn append(&self, key: &[u8], value: &[u8]) -> Result<u64> {
-        let entry = self.create_entry(key, value, EntryType::Data)?;
-        let sequence = entry.sequence;
-
         if self.config.sync_on_write {
-            // For sync mode (paranoid/tamper_proof):
-            // Try direct path if lock is free, otherwise use group commit
-            // This allows concurrent writers to share fsyncs while avoiding
-            // convoy effect for single writers
+            // Sync mode (paranoid): use traditional path with fsync
+            let entry = self.create_entry(key, value, EntryType::Data)?;
+            let sequence = entry.sequence;
 
-            // First, check if lock is available (non-blocking)
+            // Try direct path if lock is free, otherwise use group commit
             let lock_available = self.current_file.try_write().is_some();
-            // Note: we immediately drop the guard from try_write() so it doesn't cross await
 
             if lock_available {
-                // Lock was free - now acquire it properly and do direct write
                 self.write_entry_direct(&entry, true)?;
             } else {
-                // Lock contended - use group commit to share fsync with other writers
+                // Lock contended - use group commit to share fsync
                 let (tx, rx) = oneshot::channel();
                 let req = WriteRequest {
                     entry,
@@ -119,12 +122,84 @@ impl WriteAheadLog {
                     .map_err(|_| WalError::ChannelClosed)?;
                 rx.await.map_err(|_| WalError::ChannelClosed)??;
             }
+            Ok(sequence)
         } else {
-            // For non-sync mode: direct write path (no fsync)
-            self.write_entry_direct(&entry, false)?;
+            // Non-sync mode (durable): use zero-allocation fast path
+            self.append_zero_alloc(key, value, EntryType::Data)
         }
+    }
 
-        Ok(sequence)
+    /// Zero-allocation append - uses thread-local buffer to avoid heap allocations
+    ///
+    /// This is the fast path for durable mode (WAL without fsync).
+    /// Eliminates per-write allocations by reusing a thread-local buffer.
+    #[inline]
+    fn append_zero_alloc(&self, key: &[u8], value: &[u8], entry_type: EntryType) -> Result<u64> {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let timestamp = super::cached_time::now_ms();
+
+        WAL_ENCODE_BUFFER.with(|buf_cell| {
+            let mut buf = buf_cell.borrow_mut();
+            buf.clear();
+
+            // Calculate data length: key_len(4) + key + value
+            let data_len = 4 + key.len() + value.len();
+            let total_len = ENTRY_HEADER_SIZE + data_len;
+
+            // Ensure buffer capacity
+            let cap = buf.capacity();
+            if cap < total_len {
+                buf.reserve(total_len - cap);
+            }
+
+            // Build entry directly in buffer
+
+            // 1. Data length (u32) - offset 0
+            buf.extend_from_slice(&(data_len as u32).to_le_bytes());
+            // 2. Sequence (u64) - offset 4
+            buf.extend_from_slice(&sequence.to_le_bytes());
+            // 3. Timestamp (u64) - offset 12
+            buf.extend_from_slice(&timestamp.to_le_bytes());
+            // 4. Entry type (u8) - offset 20
+            buf.push(entry_type as u8);
+            // 5. Flags (u8) - offset 21
+            buf.push(0);
+            // 6. CRC placeholder (u32) - offset 22, will fill after encoding data
+            let crc_offset = buf.len();
+            buf.extend_from_slice(&[0u8; 4]);
+            // 7. Reserved (6 bytes) - offset 26
+            buf.extend_from_slice(&[0u8; 6]);
+
+            // 8. Encode key-value data
+            let data_start = buf.len();
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(value);
+
+            // 9. Compute CRC over data portion and fill in
+            let crc = crc32_checksum(&buf[data_start..]);
+            buf[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
+
+            // Check rotation and write
+            let entry_bytes = buf.len() as u64;
+            let needs_rotation = {
+                let file = self.current_file.read();
+                file.size + entry_bytes > self.config.max_file_size
+            };
+
+            if needs_rotation {
+                rotate_sync(&self.current_file, &self.wal_dir, &self.config)?;
+            }
+
+            // Single write to file
+            let mut file = self.current_file.write();
+            file.file.write_all(&buf)?;
+            file.size += entry_bytes;
+            file.entry_count += 1;
+            file.last_sequence = sequence;
+
+            Ok(sequence)
+        })
     }
 
     /// Write entry directly to buffered file
@@ -157,11 +232,11 @@ impl WriteAheadLog {
     }
 
     pub async fn append_delete(&self, key: &[u8]) -> Result<u64> {
-        let entry = self.create_delete_entry(key)?;
-        let sequence = entry.sequence;
-
         if self.config.sync_on_write {
-            // Same hybrid approach as append()
+            // Sync mode: use traditional path with fsync
+            let entry = self.create_delete_entry(key)?;
+            let sequence = entry.sequence;
+
             let lock_available = self.current_file.try_write().is_some();
 
             if lock_available {
@@ -178,11 +253,70 @@ impl WriteAheadLog {
                     .map_err(|_| WalError::ChannelClosed)?;
                 rx.await.map_err(|_| WalError::ChannelClosed)??;
             }
+            Ok(sequence)
         } else {
-            self.write_entry_direct(&entry, false)?;
+            // Non-sync mode: use zero-allocation fast path
+            self.append_delete_zero_alloc(key)
         }
+    }
 
-        Ok(sequence)
+    /// Zero-allocation delete append
+    #[inline]
+    fn append_delete_zero_alloc(&self, key: &[u8]) -> Result<u64> {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let timestamp = super::cached_time::now_ms();
+
+        WAL_ENCODE_BUFFER.with(|buf_cell| {
+            let mut buf = buf_cell.borrow_mut();
+            buf.clear();
+
+            // Data length: key_len(4) + key (no value for delete)
+            let data_len = 4 + key.len();
+            let total_len = ENTRY_HEADER_SIZE + data_len;
+
+            let cap = buf.capacity();
+            if cap < total_len {
+                buf.reserve(total_len - cap);
+            }
+
+            // Build entry header
+            buf.extend_from_slice(&(data_len as u32).to_le_bytes());
+            buf.extend_from_slice(&sequence.to_le_bytes());
+            buf.extend_from_slice(&timestamp.to_le_bytes());
+            buf.push(EntryType::Delete as u8);
+            buf.push(0); // flags
+            let crc_offset = buf.len();
+            buf.extend_from_slice(&[0u8; 4]); // CRC placeholder
+            buf.extend_from_slice(&[0u8; 6]); // reserved
+
+            // Encode key only (no value for delete)
+            let data_start = buf.len();
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
+
+            // Compute CRC
+            let crc = crc32_checksum(&buf[data_start..]);
+            buf[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
+
+            // Check rotation and write
+            let entry_bytes = buf.len() as u64;
+            let needs_rotation = {
+                let file = self.current_file.read();
+                file.size + entry_bytes > self.config.max_file_size
+            };
+
+            if needs_rotation {
+                rotate_sync(&self.current_file, &self.wal_dir, &self.config)?;
+            }
+
+            let mut file = self.current_file.write();
+            file.file.write_all(&buf)?;
+            file.size += entry_bytes;
+            file.entry_count += 1;
+            file.last_sequence = sequence;
+
+            Ok(sequence)
+        })
     }
 
     /// Append multiple key-value pairs in a single batch (bypasses group commit)
@@ -256,61 +390,6 @@ impl WriteAheadLog {
         WalEntryIterator::new(paths, start_sequence)
     }
 
-    pub async fn get_hash_at_sequence(&self, sequence: u64) -> Result<Option<String>> {
-        if !self.config.merkle_enabled {
-            return Ok(None);
-        }
-
-        for entry in self.iter_entries().await? {
-            let entry = entry?;
-            if entry.sequence == sequence {
-                return Ok(Some(entry.merkle.hash));
-            }
-            if entry.sequence > sequence {
-                break;
-            }
-        }
-        Ok(None)
-    }
-
-    pub async fn verify_integrity(&self) -> Result<()> {
-        self.verify_integrity_from(0, None).await
-    }
-
-    pub async fn verify_integrity_from(
-        &self,
-        checkpoint_sequence: u64,
-        checkpoint_hash: Option<String>,
-    ) -> Result<()> {
-        if !self.config.merkle_enabled {
-            info!("Merkle verification skipped (disabled)");
-            return Ok(());
-        }
-
-        info!(
-            "Verifying WAL integrity from sequence {}",
-            checkpoint_sequence
-        );
-
-        let mut count = 0u64;
-        let mut prev_hash = checkpoint_hash;
-
-        for entry in self.iter_entries_from(checkpoint_sequence).await? {
-            let entry = entry?;
-            if entry.merkle.prev_hash != prev_hash {
-                return Err(WalError::MerkleValidation {
-                    expected: prev_hash.unwrap_or_default(),
-                    actual: entry.merkle.prev_hash.unwrap_or_default(),
-                });
-            }
-            prev_hash = Some(entry.merkle.hash);
-            count += 1;
-        }
-
-        info!("WAL integrity verified: {} entries", count);
-        Ok(())
-    }
-
     pub async fn truncate(&self, up_to_sequence: u64) -> Result<()> {
         info!("Truncating WAL up to sequence {}", up_to_sequence);
 
@@ -342,18 +421,11 @@ impl WriteAheadLog {
         let timestamp = super::cached_time::now_ms();
         let data = encode_kv(key, value);
 
-        let merkle = if self.config.merkle_enabled {
-            self.merkle_chain.write().add(&data)
-        } else {
-            MerkleNode::empty(sequence)
-        };
-
         Ok(WalEntry {
             sequence,
             timestamp,
             entry_type,
             data: Bytes::from(data),
-            merkle,
         })
     }
 
@@ -362,18 +434,11 @@ impl WriteAheadLog {
         let timestamp = super::cached_time::now_ms();
         let data = encode_delete(key);
 
-        let merkle = if self.config.merkle_enabled {
-            self.merkle_chain.write().add(&data)
-        } else {
-            MerkleNode::empty(sequence)
-        };
-
         Ok(WalEntry {
             sequence,
             timestamp,
             entry_type: EntryType::Delete,
             data: Bytes::from(data),
-            merkle,
         })
     }
 
@@ -384,10 +449,9 @@ impl WriteAheadLog {
             .sequence
             .fetch_add(entries.len() as u64, Ordering::SeqCst);
         let timestamp = super::cached_time::now_ms();
-        let merkle_enabled = self.config.merkle_enabled;
 
-        // Phase 1: Parallel encoding + data hashing (CPU-bound, parallelizable)
-        let encoded: Vec<(u64, Vec<u8>, EntryType, String)> = entries
+        // Parallel encoding (CPU-bound, parallelizable)
+        let wal_entries: Vec<WalEntry> = entries
             .par_iter()
             .enumerate()
             .map(|(i, (key, value))| {
@@ -396,52 +460,14 @@ impl WriteAheadLog {
                     Some(v) => (encode_kv(key, v), EntryType::Data),
                     None => (encode_delete(key), EntryType::Delete),
                 };
-                let data_hash = if merkle_enabled {
-                    blake3::hash(&data).to_hex().to_string()
-                } else {
-                    String::new()
-                };
-                (sequence, data, entry_type, data_hash)
-            })
-            .collect();
-
-        // Phase 2: Sequential chain hash (must be serial, but fast)
-        let wal_entries: Vec<WalEntry> = if merkle_enabled {
-            let mut merkle_chain = self.merkle_chain.write();
-            encoded
-                .into_iter()
-                .map(|(sequence, data, entry_type, data_hash)| {
-                    let prev_hash = merkle_chain.get_last_hash();
-                    let hash = merkle_chain.chain_hash_fast(&data_hash, prev_hash.as_deref());
-                    merkle_chain.set_last_hash(hash.clone());
-
-                    WalEntry {
-                        sequence,
-                        timestamp,
-                        entry_type,
-                        data: Bytes::from(data),
-                        merkle: MerkleNode {
-                            hash,
-                            prev_hash,
-                            data_hash,
-                            sequence,
-                        },
-                    }
-                })
-                .collect()
-        } else {
-            // No Merkle - just create entries directly
-            encoded
-                .into_iter()
-                .map(|(sequence, data, entry_type, _)| WalEntry {
+                WalEntry {
                     sequence,
                     timestamp,
                     entry_type,
                     data: Bytes::from(data),
-                    merkle: MerkleNode::empty(sequence),
-                })
-                .collect()
-        };
+                }
+            })
+            .collect();
 
         Ok(wal_entries)
     }
@@ -540,7 +566,7 @@ impl WriteAheadLog {
     async fn open_or_create(
         wal_dir: &Path,
         config: &WalConfig,
-    ) -> Result<(WalFile, u64, MerkleChain)> {
+    ) -> Result<(WalFile, u64)> {
         let mut entries = tokio::fs::read_dir(wal_dir).await?;
         let mut wal_files = Vec::new();
 
@@ -555,7 +581,7 @@ impl WriteAheadLog {
         if let Some(latest) = wal_files.last() {
             recover_file(latest, config)
         } else {
-            Ok((create_file(wal_dir, 0, config)?, 0, MerkleChain::new()))
+            Ok((create_file(wal_dir, 0, config)?, 0))
         }
     }
 
@@ -658,7 +684,6 @@ mod tests {
     async fn test_wal_append_and_read() {
         let temp_dir = TempDir::new().unwrap();
         let config = WalConfig {
-            merkle_enabled: false,
             sync_on_write: true,
             ..Default::default()
         };
@@ -689,7 +714,6 @@ mod tests {
     async fn test_wal_batch() {
         let temp_dir = TempDir::new().unwrap();
         let config = WalConfig {
-            merkle_enabled: false,
             sync_on_write: true,
             ..Default::default()
         };
@@ -707,24 +731,5 @@ mod tests {
 
         let entries = wal.read_from(0).await.unwrap();
         assert_eq!(entries.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_wal_merkle_integrity() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = WalConfig {
-            merkle_enabled: true,
-            sync_on_write: false,
-            ..Default::default()
-        };
-
-        let wal = WriteAheadLog::new(temp_dir.path(), config).await.unwrap();
-
-        wal.append(b"key1", b"value1").await.unwrap();
-        wal.append(b"key2", b"value2").await.unwrap();
-        wal.append(b"key3", b"value3").await.unwrap();
-
-        // Integrity check should pass
-        wal.verify_integrity().await.unwrap();
     }
 }

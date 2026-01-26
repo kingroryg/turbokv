@@ -45,11 +45,11 @@
 //! // Fast mode - no WAL, no fsync (for benchmarks/non-critical data)
 //! let db = Db::open_with_options("./data", DbOptions::fast()).await?;
 //!
-//! // Durable mode - WAL enabled, fsync on writes (default)
+//! // Durable mode - WAL enabled, no sync per write (survives process crash)
 //! let db = Db::open_with_options("./data", DbOptions::durable()).await?;
 //!
-//! // Tamper-proof mode - Merkle chains for integrity verification
-//! let db = Db::open_with_options("./data", DbOptions::tamper_proof()).await?;
+//! // Paranoid mode - WAL enabled, fsync on every write (survives power loss)
+//! let db = Db::open_with_options("./data", DbOptions::paranoid()).await?;
 //! # Ok(())
 //! # }
 //! ```

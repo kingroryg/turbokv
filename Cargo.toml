@@ -47,6 +47,7 @@ parking_lot = "0.12"
 # Compression
 zstd = "0.13"
 snap = "1.1"
+lz4_flex = "0.11"
 
 # Utilities
 tracing = "0.1"
@@ -57,6 +58,9 @@ lru = "0.12"
 num_cpus = "1.16"
 gxhash = "3"
 uuid = { version = "1.8", features = ["v4"] }
+tempfile = "3.10"  # For benchmarks
+fjall = "2"        # For benchmarks
+rocksdb = "0.22"   # For benchmarks
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -98,4 +102,8 @@ debug = true
 
 [[bench]]
 name = "kv_benchmarks"
+harness = false
+
+[[bench]]
+name = "large_scale_bench"
 harness = false

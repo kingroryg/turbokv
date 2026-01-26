@@ -3,7 +3,7 @@
 //! Run with: cargo bench
 //!
 //! Benchmarks include:
-//! - All TurboKV modes: fast, durable, paranoid, tamper_proof
+//! - All TurboKV modes: fast, durable, paranoid
 //! - Comparison with fjall and RocksDB
 //! - Sequential writes, random writes, sequential reads, random reads
 //! - Batch operations, range scans
@@ -31,7 +31,7 @@ const VALUE_SIZE: usize = 400; // RocksDB default
 // 10M keys × 400 bytes = 4GB of data
 const WRITE_COUNT: usize = 10_000_000;   // For fast mode (no WAL) - ~9 sec at 1.1M ops/s
 const WRITE_COUNT_WAL: usize = 10_000_000; // For durable mode - ~11 sec at 900K ops/s
-const WRITE_COUNT_SYNC: usize = 100;    // For paranoid/tamper_proof (fsync-bound)
+const WRITE_COUNT_SYNC: usize = 100;    // For paranoid (fsync-bound)
 const READ_COUNT: usize = 100_000;
 const BATCH_SIZE: usize = 1000;
 
@@ -95,6 +95,7 @@ fn bench_turbokv_sequential_writes(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("turbokv_sequential_writes");
     group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(120)); // Allow 2 min per benchmark
 
     // Fast mode - no WAL, no sync (10K writes)
     group.throughput(Throughput::Elements(WRITE_COUNT as u64));
@@ -132,23 +133,6 @@ fn bench_turbokv_sequential_writes(c: &mut Criterion) {
         });
     });
 
-    // Durable audit mode - WAL + Merkle, no sync (1K writes)
-    group.bench_function("durable_audit", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let temp = TempDir::new().unwrap();
-                let db = Db::open_with_options(temp.path(), DbOptions::durable_audit())
-                    .await
-                    .unwrap();
-
-                for (key, value) in &wal_data {
-                    db.insert(black_box(key), black_box(value)).await.unwrap();
-                }
-                db.flush().await.unwrap();
-            });
-        });
-    });
-
     // Paranoid mode - WAL + sync per write (100 writes - fsync is slow)
     group.throughput(Throughput::Elements(WRITE_COUNT_SYNC as u64));
     group.bench_function("paranoid", |b| {
@@ -156,23 +140,6 @@ fn bench_turbokv_sequential_writes(c: &mut Criterion) {
             rt.block_on(async {
                 let temp = TempDir::new().unwrap();
                 let db = Db::open_with_options(temp.path(), DbOptions::paranoid())
-                    .await
-                    .unwrap();
-
-                for (key, value) in &sync_data {
-                    db.insert(black_box(key), black_box(value)).await.unwrap();
-                }
-                db.flush().await.unwrap();
-            });
-        });
-    });
-
-    // Tamper-proof mode - WAL + sync + Merkle (100 writes)
-    group.bench_function("tamper_proof", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let temp = TempDir::new().unwrap();
-                let db = Db::open_with_options(temp.path(), DbOptions::tamper_proof())
                     .await
                     .unwrap();
 
@@ -256,7 +223,6 @@ fn bench_turbokv_random_reads(c: &mut Criterion) {
     // Setup databases once for all modes
     let fast_temp = TempDir::new().unwrap();
     let durable_temp = TempDir::new().unwrap();
-    let tamper_temp = TempDir::new().unwrap();
 
     // Pre-populate databases
     rt.block_on(async {
@@ -265,10 +231,6 @@ fn bench_turbokv_random_reads(c: &mut Criterion) {
         db.flush().await.unwrap();
 
         let db = Db::open_with_options(durable_temp.path(), DbOptions::durable()).await.unwrap();
-        for (key, value) in &data { db.insert(key, value).await.unwrap(); }
-        db.flush().await.unwrap();
-
-        let db = Db::open_with_options(tamper_temp.path(), DbOptions::tamper_proof()).await.unwrap();
         for (key, value) in &data { db.insert(key, value).await.unwrap(); }
         db.flush().await.unwrap();
     });
@@ -295,20 +257,6 @@ fn bench_turbokv_random_reads(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let db = Db::open_with_options(&durable_path, DbOptions::durable()).await.unwrap();
-                for key in keys.iter() {
-                    let _ = db.get(black_box(key)).await.unwrap();
-                }
-            });
-        });
-    });
-
-    // Tamper-proof mode reads
-    let tamper_path = tamper_temp.path().to_path_buf();
-    group.bench_function("tamper_proof", |b| {
-        let keys = Arc::clone(&read_keys_clone);
-        b.iter(|| {
-            rt.block_on(async {
-                let db = Db::open_with_options(&tamper_path, DbOptions::tamper_proof()).await.unwrap();
                 for key in keys.iter() {
                     let _ = db.get(black_box(key)).await.unwrap();
                 }

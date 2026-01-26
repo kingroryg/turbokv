@@ -6,16 +6,18 @@ pub enum CompressionType {
     None = 0,
     Zstd = 1,
     Snappy = 2,
+    Lz4 = 3,
 }
 
 impl TryFrom<u8> for CompressionType {
     type Error = Error;
-    
+
     fn try_from(value: u8) -> Result<Self> {
         match value {
             0 => Ok(CompressionType::None),
             1 => Ok(CompressionType::Zstd),
             2 => Ok(CompressionType::Snappy),
+            3 => Ok(CompressionType::Lz4),
             _ => Err(Error::SSTable {
                 message: format!("Invalid compression type: {}", value),
                 source: None,
@@ -43,6 +45,10 @@ pub fn compress_block(data: &[u8], compression: CompressionType) -> Result<Vec<u
                 })?;
             Ok(compressed)
         }
+        CompressionType::Lz4 => {
+            let compressed = lz4_flex::compress_prepend_size(data);
+            Ok(compressed)
+        }
     }
 }
 
@@ -61,6 +67,14 @@ pub fn decompress_block(data: &[u8], compression: CompressionType) -> Result<Vec
             let decompressed = snap::raw::Decoder::new().decompress_vec(data)
                 .map_err(|e| Error::SSTable {
                     message: format!("Snappy decompression failed: {}", e),
+                    source: None,
+                })?;
+            Ok(decompressed)
+        }
+        CompressionType::Lz4 => {
+            let decompressed = lz4_flex::decompress_size_prepended(data)
+                .map_err(|e| Error::SSTable {
+                    message: format!("LZ4 decompression failed: {}", e),
                     source: None,
                 })?;
             Ok(decompressed)

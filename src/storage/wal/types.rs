@@ -1,12 +1,10 @@
 use bytes::Bytes;
-use crate::core::crypto::MerkleNode;
 use thiserror::Error;
 
 pub const WAL_MAGIC: &[u8; 8] = b"TURBOKV\0";
-pub const WAL_VERSION: u32 = 2;
+pub const WAL_VERSION: u32 = 3; // v3: removed Merkle overhead
 pub const WAL_HEADER_SIZE: usize = 64;
 pub const ENTRY_HEADER_SIZE: usize = 32;
-pub const MERKLE_INFO_SIZE: usize = 96;
 
 #[derive(Debug, Error)]
 pub enum WalError {
@@ -22,9 +20,6 @@ pub enum WalError {
 
     #[error("CRC mismatch: data corrupted")]
     CrcMismatch,
-
-    #[error("Merkle validation failed: expected {expected}, got {actual}")]
-    MerkleValidation { expected: String, actual: String },
 
     #[error("Channel closed")]
     ChannelClosed,
@@ -83,7 +78,6 @@ pub struct WalEntry {
     pub timestamp: u64,
     pub entry_type: EntryType,
     pub data: Bytes,
-    pub merkle: MerkleNode,
 }
 
 impl WalEntry {
@@ -155,9 +149,6 @@ pub struct WalConfig {
     pub group_commit_delay_us: u64,
     /// Maximum batch size for group commit
     pub max_batch_size: usize,
-    /// Enable Merkle chain integrity (tamper-proof)
-    /// Disable for higher throughput
-    pub merkle_enabled: bool,
 }
 
 impl Default for WalConfig {
@@ -169,7 +160,6 @@ impl Default for WalConfig {
             buffer_size: 64 * 1024, // 64KB
             group_commit_delay_us: 2000,
             max_batch_size: 512,
-            merkle_enabled: false, // Disabled by default for speed
         }
     }
 }
@@ -179,7 +169,6 @@ impl WalConfig {
     pub fn fast() -> Self {
         Self {
             sync_on_write: false,
-            merkle_enabled: false,
             group_commit_delay_us: 500,
             max_batch_size: 1024,
             ..Default::default()
@@ -191,7 +180,6 @@ impl WalConfig {
     pub fn durable() -> Self {
         Self {
             sync_on_write: false,
-            merkle_enabled: false,
             group_commit_delay_us: 100, // Low delay for throughput
             max_batch_size: 1024,
             ..Default::default()
@@ -203,18 +191,6 @@ impl WalConfig {
     pub fn paranoid() -> Self {
         Self {
             sync_on_write: true,
-            merkle_enabled: false,
-            group_commit_delay_us: 0, // No delay - fsync latency itself batches concurrent writes
-            ..Default::default()
-        }
-    }
-
-    /// Tamper-proof WAL config - sync + Merkle chains
-    /// Data survives power loss + detects tampering
-    pub fn tamper_proof() -> Self {
-        Self {
-            sync_on_write: true,
-            merkle_enabled: true,
             group_commit_delay_us: 0, // No delay - fsync latency itself batches concurrent writes
             ..Default::default()
         }
