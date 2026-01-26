@@ -141,6 +141,7 @@ borrow_deref_ref = "allow"
 unreadable_literal = "allow"
 unwrap_used = "allow"
 unnecessary_literal_unwrap = "allow"
+unchecked_time_subtraction = "allow"
 
 [profile.release]
 opt-level = 3
