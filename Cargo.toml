@@ -10,7 +10,7 @@ homepage = "https://github.com/hanshiro-dev/turbokv"
 documentation = "https://docs.rs/turbokv"
 readme = "README.md"
 description = "A fast, embedded key-value store with BTreeMap-like API."
-keywords = ["database", "kv", "lsm", "storage", "embedded", "btree", "key-value"]
+keywords = ["database", "kv", "lsm", "storage", "key-value"]
 categories = ["database-implementations", "data-structures"]
 include = ["src/**/*", "Cargo.toml", "LICENSE.md", "README.md"]
 
@@ -141,7 +141,7 @@ borrow_deref_ref = "allow"
 unreadable_literal = "allow"
 unwrap_used = "allow"
 unnecessary_literal_unwrap = "allow"
-unchecked_time_subtraction = "allow"
+unchecked_duration_subtraction = "allow"
 
 [profile.release]
 opt-level = 3

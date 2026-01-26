@@ -293,26 +293,33 @@
 //!
 //! ---
 //!
-//! ## Removed Optimizations
+//! ## 12. Direct I/O (Optional)
 //!
-//! ### Merkle Chains (Removed)
-//! Originally TurboKV included Merkle chains for tamper detection, but this added
-//! **96 bytes per WAL entry**. For most use cases, CRC32 checksums provide sufficient
-//! integrity verification.
+//! **Location:** [`crate::storage::direct_io`]
 //!
-//! If you need cryptographic tamper detection, consider:
-//! - Signing batches of entries instead of individual entries
-//! - Using external audit logging
+//! TurboKV supports Direct I/O to bypass the OS page cache:
+//!
+//! ```rust,ignore
+//! // Linux: O_DIRECT
+//! // macOS: F_NOCACHE
+//! let file = open_with_direct_io(path, create, write, direct)?;
+//! ```
+//!
+//! Benefits:
+//! - **Bypass OS cache** when application manages its own cache
+//! - **Predictable latency** - no page cache eviction delays
+//! - **Better for large datasets** that exceed RAM
+//!
+//! Includes `AlignedBuffer` for proper memory alignment (4KB boundary).
 //!
 //! ---
 //!
 //! ## Future Optimizations
 //!
 //! Potential areas for further improvement:
-//! 1. **Direct I/O** - Bypass OS page cache for more predictable latency
-//! 2. **io_uring** - Async I/O on Linux for higher throughput
-//! 3. **Column families** - Better cache utilization for different access patterns
-//! 4. **Tiered storage** - Hot/cold data separation
+//! 1. **io_uring** - Async I/O on Linux for higher throughput
+//! 2. **Column families** - Better cache utilization for different access patterns
+//! 3. **Tiered storage** - Hot/cold data separation
 //!
 //! ---
 //!

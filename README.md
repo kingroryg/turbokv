@@ -24,6 +24,25 @@ TurboKV is a high-performance, embedded key-value database written in Rust. It p
 - **Bloom Filters**: Fast negative lookups
 - **Compression**: LZ4, Snappy, and Zstd support
 
+## Development
+
+```bash
+# Build
+cargo build --release
+
+# Run tests
+cargo test
+
+# Run benchmarks
+cargo bench
+
+# Format code
+cargo fmt
+
+# Lint
+cargo clippy
+```
+
 ## Quick Start
 
 Add TurboKV to your `Cargo.toml`:
@@ -33,6 +52,9 @@ Add TurboKV to your `Cargo.toml`:
 turbokv = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
+
+or just run `cargo add turbokv`
+
 
 ### Basic Usage
 
@@ -115,7 +137,7 @@ let db = Db::open_with_options("./data", DbOptions::fast()).await?;
 let db = Db::open_with_options("./data", DbOptions::durable()).await?;
 
 // Paranoid mode - fsync on every write
-// Best for: financial transactions, critical records
+// Best for: financial transactions, critical records, audit logs
 let db = Db::open_with_options("./data", DbOptions::paranoid()).await?;
 ```
 
@@ -134,22 +156,6 @@ let options = DbOptions {
 
 let db = Db::open_with_options("./data", options).await?;
 ```
-
-**Compression options:**
-- `Compression::None` - No compression (fastest writes, largest files)
-- `Compression::Lz4` - Very fast compression (default, best for most workloads)
-- `Compression::Snappy` - Fast compression (good balance)
-- `Compression::Zstd` - High compression ratio (smaller files, slower)
-
-
-
-### Components
-
-- **WAL (Write-Ahead Log)**: Ensures durability by logging writes before applying
-- **MemTable**: In-memory skip list for fast writes
-- **SSTable**: Sorted, immutable files on disk with bloom filters
-- **Block Cache**: LRU cache for frequently accessed data blocks
-- **Compaction**: Background process to merge SSTables and reclaim space
 
 ## Performance
 
@@ -171,7 +177,7 @@ TurboKV is optimized for high write throughput and outperforms both RocksDB and 
 | Range scans | ~1.2M entries/sec |
 | Concurrent writes (8 writers, paranoid) | ~1000 ops/sec |
 
-*Benchmarks on Apple Silicon Mac, SSD storage, RocksDB-comparable parameters (20-byte keys, 400-byte values)*
+*Benchmarks on Apple Silicon Mac, SSD storage, 32GB Memory
 
 ### Understanding the Numbers
 
@@ -184,15 +190,6 @@ TurboKV is optimized for high write throughput and outperforms both RocksDB and 
 
 **Why is durable mode much faster?** It writes to the WAL but relies on the OS to `fsync()` periodically (every few seconds). This "periodic sync" approach means data survives process crashes but not sudden power loss. This is what RocksDB does by default (`sync_wal: false`).
 
-## Comparison
-
-| Feature | TurboKV | RocksDB | fjall |
-|---------|---------|---------|-------|
-| Language | Rust | C++ | Rust |
-| Write throughput | 1.1M ops/sec | 560K ops/sec | 501K ops/sec |
-| Async support | Yes | No | No |
-| BTreeMap-like API | Yes | No | Yes |
-| Learning curve | Low | High | Low |
 
 ## API Reference
 
@@ -232,22 +229,3 @@ TurboKV is optimized for high write throughput and outperforms both RocksDB and 
 | `delete(key)` | Add delete operation |
 | `len()` | Number of operations |
 | `clear()` | Clear all operations |
-
-## Development
-
-```bash
-# Build
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run benchmarks
-cargo bench
-
-# Format code
-cargo fmt
-
-# Lint
-cargo clippy
-```
