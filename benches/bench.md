@@ -7,11 +7,13 @@
 
 TurboKV supports three durability modes:
 
-| Mode | WAL | Fsync | Survives | Use Case |
-|------|-----|-------|----------|----------|
-| `fast()` | No | No | Nothing | Caching, temp data |
-| `durable()` | Yes | Periodic | Process crash | Most production |
-| `paranoid()` | Yes | Every write | Power loss | Financial transactions |
+| Mode | WAL | Fsync | Crash Behavior | Use Case |
+|------|-----|-------|----------------|----------|
+| `fast()` | No | No | Flushed data survives; unflushed memtable data lost | Caching, temp data |
+| `durable()` | Yes | Periodic | All data survives process crash | Most production |
+| `paranoid()` | Yes | Every write | All data survives power loss | Financial transactions |
+
+**Note:** In all modes, data that has been flushed to SSTables on disk is durable. The difference is what happens to in-flight writes that haven't been flushed yet.
 
 
 ## Write Performance
@@ -20,10 +22,13 @@ TurboKV supports three durability modes:
 
 | Database | Mode | Throughput | Total Time |
 |----------|------|------------|------------|
-| **TurboKV** | fast (no WAL) | **1,178K ops/sec** | 8.5s |
-| **TurboKV** | durable (WAL) | **1,111K ops/sec** | 9.0s |
-| RocksDB | default (WAL) | 557K ops/sec | 18.0s |
-| fjall | default | 494K ops/sec | 20.2s |
+| **TurboKV** | fast (no WAL) | **1,132K ops/sec** | 8.8s |
+| **TurboKV** | durable (WAL) | **1,094K ops/sec** | 9.1s |
+| RocksDB | default (WAL) | 560K ops/sec | 17.9s |
+| fjall | default | 501K ops/sec | 20.0s |
+| TurboKV | paranoid (fsync) | 257 ops/sec | ~10.8 hours* |
+
+*Paranoid mode extrapolated from 1K key test (fsync-bound)
 
 **Analysis:**
 - TurboKV is **2x faster** than RocksDB with equivalent durability (WAL enabled)
@@ -86,7 +91,7 @@ const KEY_COUNT: usize = 10_000_000;  // 10M keys
 
 ```bash
 # Quick benchmark (TurboKV vs RocksDB vs fjall)
-cargo run --release --bin large_scale_bench
+cargo bench --bench large_scale_bench
 
 # Detailed criterion benchmarks
 cargo bench --bench kv_benchmarks

@@ -90,18 +90,18 @@ db.write_batch(&batch).await?;
 
 TurboKV provides three durability modes to balance speed and safety:
 
-| Mode | WAL | Fsync | Survives |
+| Mode | WAL | Fsync | On Crash |
 |------|-----|-------|----------|
-| `fast()` | No | No | Nothing (max speed) |
-| `durable()` | Yes | Periodic | Process crash |
-| `paranoid()` | Yes | Every write | Power loss |
+| `fast()` | No | No | Flushed data survives; unflushed data lost |
+| `durable()` | Yes | Periodic | All data survives process crash |
+| `paranoid()` | Yes | Every write | All data survives power loss |
 
 **Recommended for most users:** `fast()` or `durable()` mode.
 
-- Use **`fast()`** when data can be regenerated (caches, derived data, temp files)
+- Use **`fast()`** when data can be regenerated or occasional loss is acceptable
 - Use **`durable()`** for production data that must survive process crashes
 
-The `paranoid()` mode is for specialized use cases where you need power-loss durability. This mode is significantly slower due to fsync overhead (~263 ops/sec vs ~1.1M ops/sec).
+The `paranoid()` mode is for specialized use cases where you need power-loss durability. This mode is significantly slower due to fsync overhead (~257 ops/sec vs ~1.1M ops/sec).
 
 ```rust
 use turbokv::{Db, DbOptions};
@@ -141,21 +141,7 @@ let db = Db::open_with_options("./data", options).await?;
 - `Compression::Snappy` - Fast compression (good balance)
 - `Compression::Zstd` - High compression ratio (smaller files, slower)
 
-## Architecture
 
-TurboKV uses an LSM-tree (Log-Structured Merge-tree) architecture:
-
-```
-Write Path:
-  Incoming Write -> WAL (optional) -> MemTable -> Flush -> SSTable
-
-Read Path:
-  Query -> MemTable -> Block Cache -> SSTables (newest first)
-           ^                          ^
-           |                          |
-       Hot data                  Bloom filters
-       (fast)                    (skip files)
-```
 
 ### Components
 
@@ -173,11 +159,11 @@ TurboKV is optimized for high write throughput and outperforms both RocksDB and 
 
 | Database | Mode | Throughput |
 |----------|------|------------|
-| **TurboKV** | fast (no WAL) | **1,178K ops/sec** |
-| **TurboKV** | durable (WAL) | **1,111K ops/sec** |
-| RocksDB | default (WAL) | 557K ops/sec |
-| fjall | default | 494K ops/sec |
-| TurboKV | paranoid (fsync/write) | ~263 ops/sec |
+| **TurboKV** | fast (no WAL) | **1,132K ops/sec** |
+| **TurboKV** | durable (WAL) | **1,094K ops/sec** |
+| RocksDB | default (WAL) | 560K ops/sec |
+| fjall | default | 501K ops/sec |
+| TurboKV | paranoid (fsync/write) | ~257 ops/sec |
 
 | Other Operations | Performance |
 |------------------|-------------|
@@ -203,21 +189,10 @@ TurboKV is optimized for high write throughput and outperforms both RocksDB and 
 | Feature | TurboKV | RocksDB | fjall |
 |---------|---------|---------|-------|
 | Language | Rust | C++ | Rust |
-| Write throughput | 1.1M ops/sec | 557K ops/sec | 494K ops/sec |
+| Write throughput | 1.1M ops/sec | 560K ops/sec | 501K ops/sec |
 | Async support | Yes | No | No |
 | BTreeMap-like API | Yes | No | Yes |
-| Maturity | New | Battle-tested | Established |
 | Learning curve | Low | High | Low |
-
-**When to use TurboKV:**
-- You want the fastest write performance
-- You want a simple, async-native Rust API
-- You're building an embedded database into your application
-
-**When to use RocksDB:**
-- You need advanced features (column families, transactions, compaction tuning)
-- You need the most battle-tested option for critical production systems
-- You're comfortable with C++ bindings and complex configuration
 
 ## API Reference
 
