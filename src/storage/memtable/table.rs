@@ -37,7 +37,7 @@ pub enum MemTableError {
 /// Values can be actual data or tombstones (marking deleted keys).
 pub struct MemTable {
     /// Lock-free skip list: key bytes -> entry
-    /// Using Vec<u8> as key for byte-level ordering
+    /// Using `Vec<u8>` as key for byte-level ordering
     pub(crate) data: Arc<SkipMap<Vec<u8>, MemTableEntry>>,
 
     /// Approximate size in bytes (atomic for lock-free updates)

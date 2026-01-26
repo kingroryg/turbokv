@@ -5,7 +5,7 @@
 //!
 //! ## Optimization Technique
 //!
-//! Instead of allocating a new Vec<u8> for every write batch, we maintain
+//! Instead of allocating a new `Vec<u8>` for every write batch, we maintain
 //! a pool of pre-allocated buffers that can be reused. This reduces:
 //! - Memory allocation overhead
 //! - GC pressure

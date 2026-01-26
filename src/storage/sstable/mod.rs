@@ -1,5 +1,7 @@
 //! SSTables are immutable, sorted files that store data on disk.
-//! They are the primary storage format for HanshiroDB.
+//! They are the primary storage format for TurboKV.
+//!
+//! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                    SSTable File Structure                   │
 //! ├─────────────────────────────────────────────────────────────┤
@@ -39,6 +41,7 @@
 //! │  │  [magic_number][version][checksum]                   │   │
 //! │  └──────────────────────────────────────────────────────┘   │
 //! └─────────────────────────────────────────────────────────────┘
+//! ```
 
 pub mod bloom;
 mod builder;
