@@ -29,9 +29,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Wrote user:1 data atomically ({} operations)", batch.len());
 
     // Verify
-    for key in &[&b"user:1:name"[..], &b"user:1:email"[..], &b"user:1:role"[..]] {
+    for key in &[
+        &b"user:1:name"[..],
+        &b"user:1:email"[..],
+        &b"user:1:role"[..],
+    ] {
         if let Some(value) = db.get(*key).await? {
-            println!("  {} = {}",
+            println!(
+                "  {} = {}",
                 String::from_utf8_lossy(key),
                 String::from_utf8_lossy(&value)
             );
@@ -118,9 +123,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Transfer $200 from Alice to Bob
     // This must be atomic - we can't have money disappear!
     let mut transfer = WriteBatch::new();
-    transfer.put(b"balance:alice", b"800");  // 1000 - 200
-    transfer.put(b"balance:bob", b"700");    // 500 + 200
-    transfer.put(b"tx:001", b"alice->bob:200");  // Audit trail
+    transfer.put(b"balance:alice", b"800"); // 1000 - 200
+    transfer.put(b"balance:bob", b"700"); // 500 + 200
+    transfer.put(b"tx:001", b"alice->bob:200"); // Audit trail
 
     db.write_batch(&transfer).await?;
     println!("Transferred $200 from Alice to Bob atomically");
@@ -134,7 +139,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let stats = db.stats();
-    println!("\nFinal stats: {} keys, {} bytes", stats.total_keys, stats.total_bytes);
+    println!(
+        "\nFinal stats: {} keys, {} bytes",
+        stats.total_keys, stats.total_bytes
+    );
 
     println!("\nBatch writes example completed successfully!");
     Ok(())

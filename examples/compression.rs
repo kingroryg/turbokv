@@ -15,11 +15,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Generate test data - compressible text
     let test_value: Vec<u8> = (0..1000)
-        .map(|i| format!("This is test data line {} with some repetitive content. ", i))
+        .map(|i| {
+            format!(
+                "This is test data line {} with some repetitive content. ",
+                i
+            )
+        })
         .collect::<String>()
         .into_bytes();
 
-    println!("Test value size: {} bytes ({}KB)", test_value.len(), test_value.len() / 1024);
+    println!(
+        "Test value size: {} bytes ({}KB)",
+        test_value.len(),
+        test_value.len() / 1024
+    );
     println!("Writing 100 entries with each compression type...\n");
 
     let compressions = [
@@ -59,8 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Write time: {:?}", write_time);
         println!("  Read time: {:?}", read_time);
         println!("  Disk usage: {} KB", disk_size / 1024);
-        println!("  Compression ratio: {:.2}x",
-            (test_value.len() * 100) as f64 / disk_size as f64);
+        println!(
+            "  Compression ratio: {:.2}x",
+            (test_value.len() * 100) as f64 / disk_size as f64
+        );
         println!();
 
         drop(db);

@@ -49,7 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let users = db.scan_prefix(b"user:").await?;
     println!("Found {} user entries:", users.len());
     for (key, value) in &users {
-        println!("  {} = {}",
+        println!(
+            "  {} = {}",
             String::from_utf8_lossy(key),
             String::from_utf8_lossy(value)
         );
@@ -62,7 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let user_001 = db.scan_prefix(b"user:001:").await?;
     for (key, value) in &user_001 {
-        println!("  {} = {}",
+        println!(
+            "  {} = {}",
             String::from_utf8_lossy(key),
             String::from_utf8_lossy(value)
         );
@@ -76,7 +78,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let posts = db.scan_prefix(b"post:").await?;
     println!("Found {} post entries:", posts.len());
     for (key, value) in &posts {
-        println!("  {} = {}",
+        println!(
+            "  {} = {}",
             String::from_utf8_lossy(key),
             String::from_utf8_lossy(value)
         );
@@ -91,7 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = db.range(b"metric:2024-01-02", b"metric:2024-01-05").await?;
     println!("Found {} metrics in range:", metrics.len());
     for (key, value) in &metrics {
-        println!("  {} = {}",
+        println!(
+            "  {} = {}",
             String::from_utf8_lossy(key),
             String::from_utf8_lossy(value)
         );
@@ -104,7 +108,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let user_range = db.range(b"user:001", b"user:003").await?;
     for (key, value) in &user_range {
-        println!("  {} = {}",
+        println!(
+            "  {} = {}",
             String::from_utf8_lossy(key),
             String::from_utf8_lossy(value)
         );
@@ -116,10 +121,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Pattern: Hierarchical Keys ===");
 
     // Store hierarchical data
-    db.insert(b"org:acme:team:eng:member:alice", b"engineer").await?;
-    db.insert(b"org:acme:team:eng:member:bob", b"senior engineer").await?;
-    db.insert(b"org:acme:team:sales:member:carol", b"sales rep").await?;
-    db.insert(b"org:acme:team:sales:member:dan", b"sales lead").await?;
+    db.insert(b"org:acme:team:eng:member:alice", b"engineer")
+        .await?;
+    db.insert(b"org:acme:team:eng:member:bob", b"senior engineer")
+        .await?;
+    db.insert(b"org:acme:team:sales:member:carol", b"sales rep")
+        .await?;
+    db.insert(b"org:acme:team:sales:member:dan", b"sales lead")
+        .await?;
 
     // Query all of engineering team
     let eng_team = db.scan_prefix(b"org:acme:team:eng:").await?;
@@ -147,8 +156,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.insert(b"product:SKU002:price", b"19.99").await?;
 
     // Secondary index by price range (store SKU as value)
-    db.insert(b"idx:price:00999:SKU001", b"").await?;  // $9.99 -> SKU001
-    db.insert(b"idx:price:01999:SKU002", b"").await?;  // $19.99 -> SKU002
+    db.insert(b"idx:price:00999:SKU001", b"").await?; // $9.99 -> SKU001
+    db.insert(b"idx:price:01999:SKU002", b"").await?; // $19.99 -> SKU002
 
     // Find products under $15 (price < 01500)
     let cheap = db.range(b"idx:price:00000", b"idx:price:01500").await?;

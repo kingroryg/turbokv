@@ -41,7 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  - 5 user entries");
 
         let stats = db.stats();
-        println!("  - Total: {} keys, {} bytes\n", stats.total_keys, stats.total_bytes);
+        println!(
+            "  - Total: {} keys, {} bytes\n",
+            stats.total_keys, stats.total_bytes
+        );
 
         // Simulate a clean shutdown
         db.flush().await?;
@@ -60,7 +63,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Verify config
         let app_name = db.get(b"config:app_name").await?;
         assert_eq!(app_name, Some(b"MyApp".to_vec()));
-        println!("  config:app_name = {:?}", app_name.map(|v| String::from_utf8_lossy(&v).to_string()));
+        println!(
+            "  config:app_name = {:?}",
+            app_name.map(|v| String::from_utf8_lossy(&v).to_string())
+        );
 
         // Verify users
         let users = db.scan_prefix(b"user:").await?;
@@ -99,8 +105,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if important.is_some() && transaction.is_some() {
             println!("SUCCESS: WAL recovery worked!");
-            println!("  important:data = {}", String::from_utf8_lossy(&important.unwrap()));
-            println!("  transaction:001 = {}", String::from_utf8_lossy(&transaction.unwrap()));
+            println!(
+                "  important:data = {}",
+                String::from_utf8_lossy(&important.unwrap())
+            );
+            println!(
+                "  transaction:001 = {}",
+                String::from_utf8_lossy(&transaction.unwrap())
+            );
         } else {
             println!("Note: Data may not be recovered depending on timing");
             println!("  (OS may not have flushed buffers yet)");

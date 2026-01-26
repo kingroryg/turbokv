@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Shared Database Access ===\n");
 
     let db = Arc::new(
-        Db::open_with_options(temp_dir.path().join("concurrent"), DbOptions::fast()).await?
+        Db::open_with_options(temp_dir.path().join("concurrent"), DbOptions::fast()).await?,
     );
 
     println!("Database opened and wrapped in Arc for sharing\n");
@@ -64,9 +64,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_writes = num_writers * writes_per_task;
 
     println!("\nResults:");
-    println!("  {} writers x {} writes = {} total", num_writers, writes_per_task, total_writes);
+    println!(
+        "  {} writers x {} writes = {} total",
+        num_writers, writes_per_task, total_writes
+    );
     println!("  Time: {:?}", elapsed);
-    println!("  Throughput: {:.0} writes/sec", total_writes as f64 / elapsed.as_secs_f64());
+    println!(
+        "  Throughput: {:.0} writes/sec",
+        total_writes as f64 / elapsed.as_secs_f64()
+    );
 
     // Verify all data was written
     let stats = db.stats();
@@ -103,16 +109,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(result) = handles.join_next().await {
         let (reader_id, found) = result?;
-        println!("  Reader {} found {}/{} keys", reader_id, found, reads_per_task);
+        println!(
+            "  Reader {} found {}/{} keys",
+            reader_id, found, reads_per_task
+        );
     }
 
     let elapsed = start.elapsed();
     let total_reads = num_readers * reads_per_task;
 
     println!("\nResults:");
-    println!("  {} readers x {} reads = {} total", num_readers, reads_per_task, total_reads);
+    println!(
+        "  {} readers x {} reads = {} total",
+        num_readers, reads_per_task, total_reads
+    );
     println!("  Time: {:?}", elapsed);
-    println!("  Throughput: {:.0} reads/sec", total_reads as f64 / elapsed.as_secs_f64());
+    println!(
+        "  Throughput: {:.0} reads/sec",
+        total_reads as f64 / elapsed.as_secs_f64()
+    );
 
     // ============================================
     // Mixed Read/Write Workload
@@ -160,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Producer-Consumer Pattern ===");
 
     let db = Arc::new(
-        Db::open_with_options(temp_dir.path().join("producer_consumer"), DbOptions::fast()).await?
+        Db::open_with_options(temp_dir.path().join("producer_consumer"), DbOptions::fast()).await?,
     );
 
     // Counter for produced items
@@ -174,7 +189,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     handles.spawn(async move {
         for i in 0..100 {
             let key = format!("queue:{:05}", i);
-            db_producer.insert(key.as_bytes(), b"task data").await.unwrap();
+            db_producer
+                .insert(key.as_bytes(), b"task data")
+                .await
+                .unwrap();
             counter_producer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         db_producer.flush().await.unwrap();

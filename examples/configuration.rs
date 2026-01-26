@@ -55,7 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let durable_path = temp_dir.path().join("durable_db");
     let db = Db::open_with_options(&durable_path, DbOptions::durable()).await?;
 
-    db.insert(b"important:data", b"this survives crashes").await?;
+    db.insert(b"important:data", b"this survives crashes")
+        .await?;
     println!("Wrote important data with durability guarantee");
 
     drop(db);
@@ -76,7 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paranoid_path = temp_dir.path().join("paranoid_db");
     let db = Db::open_with_options(&paranoid_path, DbOptions::paranoid()).await?;
 
-    db.insert(b"transaction:001", b"$1000.00 transferred").await?;
+    db.insert(b"transaction:001", b"$1000.00 transferred")
+        .await?;
     println!("Wrote transaction with fsync guarantee");
 
     drop(db);
@@ -90,16 +92,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let custom = DbOptions {
         wal_enabled: true,
         sync_writes: false,
-        memtable_size: 128 * 1024 * 1024,  // 128MB memtable
-        block_cache_size: 256 * 1024 * 1024,  // 256MB cache
-        compression: Compression::Zstd,  // Maximum compression
+        memtable_size: 128 * 1024 * 1024,    // 128MB memtable
+        block_cache_size: 256 * 1024 * 1024, // 256MB cache
+        compression: Compression::Zstd,      // Maximum compression
     };
 
     println!("Configuration:");
     println!("  WAL enabled: {}", custom.wal_enabled);
     println!("  Sync writes: {}", custom.sync_writes);
-    println!("  MemTable size: {} MB", custom.memtable_size / (1024 * 1024));
-    println!("  Block cache: {} MB", custom.block_cache_size / (1024 * 1024));
+    println!(
+        "  MemTable size: {} MB",
+        custom.memtable_size / (1024 * 1024)
+    );
+    println!(
+        "  Block cache: {} MB",
+        custom.block_cache_size / (1024 * 1024)
+    );
     println!("  Compression: {:?}", custom.compression);
 
     let custom_path = temp_dir.path().join("custom_db");
@@ -116,8 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Builder Pattern ===");
 
     // Start with a preset and customize
-    let tuned = DbOptions::durable()
-        .with_compression(Compression::Lz4);
+    let tuned = DbOptions::durable().with_compression(Compression::Lz4);
 
     println!("Durable mode with LZ4 compression:");
     println!("  Compression: {:?}", tuned.compression);
