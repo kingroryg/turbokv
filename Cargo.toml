@@ -5,7 +5,6 @@ authors = ["Sarthak Munshi <s@hanshiro.dev>"]
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0"
-license-file = "LICENSE.md"
 repository = "https://github.com/hanshiro-dev/turbokv"
 homepage = "https://github.com/hanshiro-dev/turbokv"
 documentation = "https://docs.rs/turbokv"
