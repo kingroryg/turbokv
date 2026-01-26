@@ -1,306 +1,94 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release version (e.g., 0.1.0)'
-        required: true
-      release_type:
-        description: 'Release type'
-        required: true
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
-          - pre-release
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  prepare-release:
-    name: Prepare Release
+  test:
+    name: Test before release
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Configure Git
-        run: |
-          git config user.name "HanshiroDB Bot"
-          git config user.email "bot@hanshiro.dev"
-      
-      - name: Determine version
-        id: version
-        run: |
-          VERSION=${{ github.event.inputs.version }}
-          TAG="v${VERSION}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-      
-      - name: Update version in Cargo.toml files
-        run: |
-          # Update workspace version
-          sed -i 's/^version = ".*"/version = "'${{ steps.version.outputs.version }}'/' Cargo.toml
-          
-          # Update all crate versions
-          find . -name Cargo.toml -not -path "./target/*" -exec \
-            sed -i 's/^version\.workspace = true/version = "'${{ steps.version.outputs.version }}'/' {} \;
-          
-          # Update dependencies
-          cargo update
-      
-      - name: Generate changelog
-        run: |
-          echo "# Changelog for v${{ steps.version.outputs.version }}" > CHANGELOG_RELEASE.md
-          echo "" >> CHANGELOG_RELEASE.md
-          echo "## What's Changed" >> CHANGELOG_RELEASE.md
-          
-          # Get commits since last tag
-          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -z "$LAST_TAG" ]; then
-            git log --pretty=format:"* %s (%h)" >> CHANGELOG_RELEASE.md
-          else
-            git log ${LAST_TAG}..HEAD --pretty=format:"* %s (%h)" >> CHANGELOG_RELEASE.md
-          fi
-      
-      - name: Commit version bump
-        run: |
-          git add -A
-          git commit -m "chore: bump version to ${{ steps.version.outputs.version }}"
-          git push origin main
-      
-      - name: Create and push tag
-        run: |
-          git tag -a ${{ steps.version.outputs.tag }} -m "Release ${{ steps.version.outputs.version }}"
-          git push origin ${{ steps.version.outputs.tag }}
 
-  build-binaries:
-    name: Build Release Binaries
-    needs: prepare-release
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: hanshirodb-linux-amd64
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            artifact_name: hanshirodb-linux-amd64-musl
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact_name: hanshirodb-linux-arm64
-            use-cross: true
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: hanshirodb-darwin-amd64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: hanshirodb-darwin-arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: hanshirodb-windows-amd64
-    runs-on: ${{ matrix.os }}
-    
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare-release.outputs.tag }}
-      
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      
-      - name: Install cross
-        if: matrix.use-cross
-        run: cargo install cross
-      
-      - name: Install dependencies (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
-          
-          # For musl target
-          if [[ "${{ matrix.target }}" == *"musl"* ]]; then
-            sudo apt-get install -y musl-tools
-          fi
-      
-      - name: Install dependencies (macOS)
-        if: matrix.os == 'macos-latest'
-        run: brew install protobuf
-      
-      - name: Install dependencies (Windows)
-        if: matrix.os == 'windows-latest'
-        run: choco install protoc
-      
-      - name: Build release binary
-        run: |
-          if [ "${{ matrix.use-cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --all-features
-          else
-            cargo build --release --target ${{ matrix.target }} --all-features
-          fi
-        shell: bash
-      
-      - name: Package binary (Unix)
-        if: matrix.os != 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ${{ matrix.artifact_name }}.tar.gz hanshiro-cli hanshiro-api
-          mv ${{ matrix.artifact_name }}.tar.gz ../../../
-      
-      - name: Package binary (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a -tzip ${{ matrix.artifact_name }}.zip hanshiro-cli.exe hanshiro-api.exe
-          mv ${{ matrix.artifact_name }}.zip ../../../
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: |
-            ${{ matrix.artifact_name }}.tar.gz
-            ${{ matrix.artifact_name }}.zip
 
-  build-docker:
-    name: Build and Push Docker Images
-    needs: prepare-release
+      - name: Run tests
+        run: cargo test --release
+
+  publish:
+    name: Publish to crates.io
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare-release.outputs.tag }}
-      
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-      
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Build and push Docker images
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            hanshirodb/hanshirodb:${{ needs.prepare-release.outputs.version }}
-            hanshirodb/hanshirodb:latest
-            ghcr.io/${{ github.repository }}:${{ needs.prepare-release.outputs.version }}
-            ghcr.io/${{ github.repository }}:latest
 
-  create-release:
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify version matches tag
+        run: |
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "Version mismatch: Cargo.toml ($CARGO_VERSION) != tag ($TAG_VERSION)"
+            exit 1
+          fi
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
+  release:
     name: Create GitHub Release
-    needs: [prepare-release, build-binaries, build-docker]
+    needs: publish
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare-release.outputs.tag }}
-      
-      - name: Download all artifacts
-        uses: actions/download-artifact@v3
-        with:
-          path: artifacts
-      
-      - name: Create release notes
+          fetch-depth: 0
+
+      - name: Generate release notes
+        id: notes
         run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+
+          # Get commits since last tag
+          LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
           cat > release_notes.md << EOF
-          # HanshiroDB v${{ needs.prepare-release.outputs.version }}
-          
-          ## Docker Images
-          
-          \`\`\`bash
-          docker pull hanshirodb/hanshirodb:${{ needs.prepare-release.outputs.version }}
-          docker pull ghcr.io/${{ github.repository }}:${{ needs.prepare-release.outputs.version }}
-          \`\`\`
-          
+          # TurboKV v${VERSION}
+
           ## Installation
-          
-          ### Linux (amd64)
-          \`\`\`bash
-          curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/hanshirodb-linux-amd64.tar.gz | tar xz
-          sudo mv hanshiro-cli /usr/local/bin/hanshirodb
+
+          Add to your \`Cargo.toml\`:
+
+          \`\`\`toml
+          [dependencies]
+          turbokv = "${VERSION}"
           \`\`\`
-          
-          ### macOS (Apple Silicon)
-          \`\`\`bash
-          curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/hanshirodb-darwin-arm64.tar.gz | tar xz
-          sudo mv hanshiro-cli /usr/local/bin/hanshirodb
-          \`\`\`
-          
+
+          ## Changes
+
           EOF
-          
-          if [ -f CHANGELOG_RELEASE.md ]; then
-            cat CHANGELOG_RELEASE.md >> release_notes.md
+
+          if [ -z "$LAST_TAG" ]; then
+            git log --pretty=format:"- %s" >> release_notes.md
+          else
+            git log ${LAST_TAG}..HEAD --pretty=format:"- %s" >> release_notes.md
           fi
-      
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ needs.prepare-release.outputs.tag }}
-          name: Release ${{ needs.prepare-release.outputs.version }}
           body_path: release_notes.md
           draft: false
-          prerelease: ${{ contains(needs.prepare-release.outputs.version, '-') }}
-          files: |
-            artifacts/**/*.tar.gz
-            artifacts/**/*.zip
-
-  publish-crates:
-    name: Publish to crates.io
-    needs: [prepare-release, create-release]
-    runs-on: ubuntu-latest
-    if: ${{ !contains(needs.prepare-release.outputs.version, '-') }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare-release.outputs.tag }}
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
-      
-      - name: Publish crates
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          # Publish in dependency order
-          cargo publish -p hanshiro-core
-          sleep 30
-          cargo publish -p hanshiro-storage
-          sleep 30
-          cargo publish -p hanshiro-index
-          sleep 30
-          cargo publish -p hanshiro-ingest
-          sleep 30
-          cargo publish -p hanshiro-api
-          sleep 30
-          cargo publish -p hanshiro-cli
+          prerelease: ${{ contains(github.ref, '-') }}

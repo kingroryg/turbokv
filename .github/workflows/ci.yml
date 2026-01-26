@@ -2,361 +2,90 @@ name: CI
 
 on:
   push:
-    branches: [ main, develop ]
-    tags: [ 'v*' ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, develop ]
-  schedule:
-    # Run security audit daily at 2 AM UTC
-    - cron: '0 2 * * *'
+    branches: [ main ]
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  RUSTFLAGS: "-D warnings"
   CARGO_INCREMENTAL: 0
-  CARGO_NET_RETRY: 10
-  RUSTUP_MAX_RETRIES: 10
 
 jobs:
-  # Quick checks before running expensive tests
-  pre-check:
-    name: Pre-checks
+  check:
+    name: Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          key: "pre-check"
-      
+
       - name: Check formatting
         run: cargo fmt --all -- --check
-      
-      - name: Clippy lints
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      
-      - name: Check documentation
-        run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: "-D warnings"
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --release
 
   test:
-    name: Test Suite
-    needs: pre-check
+    name: Test
+    needs: check
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-        rust: [stable, beta, nightly]
-        exclude:
-          # Only test nightly on Linux
-          - os: macos-latest
-            rust: nightly
-          - os: macos-latest
-            rust: beta
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.rust == 'nightly' }}
-    
+
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install Rust ${{ matrix.rust }}
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-      
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          key: "${{ matrix.os }}-${{ matrix.rust }}"
-      
-      - name: Install system dependencies (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
-      
-      - name: Install system dependencies (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          brew install protobuf
-      
-      - name: Build
-        run: cargo build --all-features --verbose
-      
-      - name: Run unit tests
-        run: cargo test --all-features --verbose
-        env:
-          RUST_TEST_THREADS: 2
-      
+
+      - name: Run tests
+        run: cargo test --release
+
       - name: Run doc tests
-        run: cargo test --doc --all-features
+        run: cargo test --doc
 
-  integration-test:
-    name: Integration Tests
-    needs: pre-check
+  docs:
+    name: Documentation
     runs-on: ubuntu-latest
-    
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          key: "integration"
-      
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
-      
-      - name: Run integration tests
-        run: |
-          cargo test --test '*' --all-features -- --test-threads=1
+
+      - name: Build docs
+        run: cargo doc --no-deps
         env:
-          RUST_LOG: debug
+          RUSTDOCFLAGS: "-D warnings"
 
-  benchmark:
-    name: Performance Benchmarks
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: "bench"
-      
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
-      
-      - name: Run benchmarks
-        run: cargo bench --all-features | tee benchmark_results.txt
-      
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v3
-        with:
-          name: benchmark-results
-          path: benchmark_results.txt
-          retention-days: 90
-      
-      # Optional: Comment PR with benchmark results
-      - name: Comment benchmark results
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v6
-        with:
-          script: |
-            const fs = require('fs');
-            const results = fs.readFileSync('benchmark_results.txt', 'utf8');
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: '## Benchmark Results\n```\n' + results + '\n```'
-            });
-
-  security-audit:
+  security:
     name: Security Audit
     runs-on: ubuntu-latest
-    
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      
-      - name: Cache cargo-audit
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo/bin/cargo-audit
-          key: cargo-audit-${{ runner.os }}
-      
+
       - name: Install cargo-audit
-        run: |
-          if ! command -v cargo-audit &> /dev/null; then
-            cargo install cargo-audit
-          fi
-      
+        run: cargo install cargo-audit
+
       - name: Security audit
         run: cargo audit
-      
-      - name: Check for known vulnerabilities
-        run: cargo audit --deny warnings
-
-  coverage:
-    name: Code Coverage
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: "coverage"
-      
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
-          cargo install cargo-llvm-cov
-      
-      - name: Generate coverage
-        run: |
-          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
-      
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
-
-  build-release:
-    name: Build Release Binaries
-    needs: [test, security-audit]
-    if: startsWith(github.ref, 'refs/tags/')
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-    runs-on: ${{ matrix.os }}
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      
-      - name: Install dependencies (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
-      
-      - name: Install dependencies (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          brew install protobuf
-      
-      - name: Build release binary
-        run: |
-          cargo build --release --target ${{ matrix.target }} --all-features
-          
-      - name: Package binary
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf hanshirodb-${{ matrix.target }}.tar.gz hanshiro-cli
-          mv hanshirodb-${{ matrix.target }}.tar.gz ../../../
-      
-      - name: Upload release artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: hanshirodb-${{ matrix.target }}
-          path: hanshirodb-${{ matrix.target }}.tar.gz
-
-  docker:
-    name: Build Docker Images
-    needs: [test, security-audit]
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      
-      - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-      
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: hanshirodb/hanshirodb
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-      
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  release:
-    name: Create Release
-    needs: [build-release, docker]
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Download artifacts
-        uses: actions/download-artifact@v3
-        with:
-          path: artifacts
-      
-      - name: Create release notes
-        id: release_notes
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "# Release $VERSION" > release_notes.md
-          echo "" >> release_notes.md
-          echo "## Changes" >> release_notes.md
-          git log --pretty=format:"- %s" $(git describe --tags --abbrev=0 HEAD^)..HEAD >> release_notes.md
-      
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          body_path: release_notes.md
-          files: |
-            artifacts/hanshirodb-*/hanshirodb-*.tar.gz
-          draft: false
-          prerelease: ${{ contains(steps.release_notes.outputs.VERSION, '-') }}

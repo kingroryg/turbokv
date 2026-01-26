@@ -5,10 +5,15 @@ authors = ["Sarthak Munshi <s@hanshiro.dev>"]
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0"
+license-file = "LICENSE.md"
 repository = "https://github.com/hanshiro-dev/turbokv"
-description = "A fast, embedded key-value store with BTreeMap-like API"
+homepage = "https://github.com/hanshiro-dev/turbokv"
+documentation = "https://docs.rs/turbokv"
+readme = "README.md"
+description = "A fast, embedded key-value store with BTreeMap-like API."
 keywords = ["database", "kv", "lsm", "storage", "embedded"]
 categories = ["database-implementations", "data-structures"]
+include = ["src/**/*", "Cargo.toml", "LICENSE.md", "README.md"]
 
 [dependencies]
 # Async runtime
@@ -58,18 +63,15 @@ lru = "0.12"
 num_cpus = "1.16"
 gxhash = "3"
 uuid = { version = "1.8", features = ["v4"] }
-tempfile = "3.10"  # For benchmarks
-fjall = "2"        # For benchmarks
-rocksdb = "0.22"   # For benchmarks
 
 [dev-dependencies]
 tempfile = "3.10"
+fjall = "2"
+rocksdb = "0.22"
 proptest = "1.5"
 quickcheck = "1.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
-fjall = "2"
-rocksdb = "0.22"
 tokio = { version = "1.40", features = ["full", "test-util"] }
 
 [lints.rust]

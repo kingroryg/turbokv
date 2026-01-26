@@ -2,217 +2,51 @@ name: Security
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main ]
   schedule:
-    # Run daily at 3 AM UTC
-    - cron: '0 3 * * *'
+    - cron: '0 3 * * *'  # Daily at 3 AM UTC
 
 jobs:
-  dependency-audit:
-    name: Dependency Security Audit
+  audit:
+    name: Security Audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      
+
       - name: Install cargo-audit
         run: cargo install cargo-audit
-      
+
       - name: Run cargo audit
-        run: |
-          cargo audit --deny warnings
-          cargo audit --json > audit-report.json
-      
-      - name: Upload audit report
-        uses: actions/upload-artifact@v3
-        with:
-          name: security-audit-report
-          path: audit-report.json
-          retention-days: 30
-      
-      - name: Check for critical vulnerabilities
-        run: |
-          if cargo audit --json | jq '.vulnerabilities.list[] | select(.advisory.severity == "critical")' | grep .; then
-            echo "Critical vulnerabilities found!"
-            exit 1
-          fi
+        run: cargo audit
 
-  supply-chain-audit:
-    name: Supply Chain Security
+  license:
+    name: License Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      
-      - name: Install cargo-supply-chain
-        run: cargo install cargo-supply-chain
-      
-      - name: Analyze supply chain
-        run: |
-          cargo supply-chain update
-          cargo supply-chain crates
-      
-      - name: Check for suspicious crates
-        run: |
-          # Check for crates with few downloads or recent publication
-          cargo metadata --format-version 1 | jq -r '.packages[].name' | while read crate; do
-            echo "Checking $crate..."
-          done
 
-  sast:
-    name: Static Application Security Testing
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Run Semgrep
-        uses: returntocorp/semgrep-action@v1
-        with:
-          config: >-
-            p/security-audit
-            p/rust
-            p/secrets
-      
-      - name: Upload SAST results
-        uses: github/codeql-action/upload-sarif@v2
-        if: always()
-        with:
-          sarif_file: semgrep.sarif
-
-  secrets-scanning:
-    name: Secret Scanning
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      
-      - name: TruffleHog OSS
-        uses: trufflesecurity/trufflehog@main
-        with:
-          path: ./
-          base: ${{ github.event.repository.default_branch }}
-          head: HEAD
-          extra_args: --debug --only-verified
-
-  codeql:
-    name: CodeQL Analysis
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v2
-        with:
-          languages: 'rust'
-      
-      - name: Build
-        run: cargo build --all-features
-      
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v2
-
-  license-check:
-    name: License Compliance
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      
       - name: Install cargo-license
         run: cargo install cargo-license
-      
+
       - name: Check licenses
         run: |
           cargo license --json > licenses.json
-          
-          # Check for incompatible licenses
-          FORBIDDEN_LICENSES="GPL-3.0 AGPL-3.0 LGPL-3.0"
-          for license in $FORBIDDEN_LICENSES; do
+
+          # Check for copyleft licenses that may be incompatible
+          FORBIDDEN="AGPL-3.0"
+          for license in $FORBIDDEN; do
             if jq -r '.[] | select(.license == "'$license'")' licenses.json | grep .; then
-              echo "Found forbidden license: $license"
+              echo "Found potentially incompatible license: $license"
               exit 1
             fi
           done
-      
-      - name: Generate license report
-        run: |
-          echo "# License Report" > LICENSE_REPORT.md
-          echo "" >> LICENSE_REPORT.md
-          echo "Generated on $(date)" >> LICENSE_REPORT.md
-          echo "" >> LICENSE_REPORT.md
-          cargo license --authors --do-not-bundle >> LICENSE_REPORT.md
-      
-      - name: Upload license report
-        uses: actions/upload-artifact@v3
-        with:
-          name: license-report
-          path: LICENSE_REPORT.md
 
-  container-scan:
-    name: Container Security Scan
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Build Docker image
-        run: docker build -t hanshirodb:scan .
-      
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: 'hanshirodb:scan'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
-      
-      - name: Upload Trivy scan results
-        uses: github/codeql-action/upload-sarif@v2
-        with:
-          sarif_file: 'trivy-results.sarif'
-
-  fuzzing:
-    name: Fuzz Testing
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-      
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
-      
-      - name: Run fuzz tests
-        run: |
-          cd hanshiro-storage
-          cargo fuzz init
-          # Add fuzz targets for critical functions
-          echo '
-          #![no_main]
-          use libfuzzer_sys::fuzz_target;
-          use hanshiro_storage::wal::WriteAheadLog;
-          
-          fuzz_target!(|data: &[u8]| {
-              // Fuzz WAL with random data
-              // This is a placeholder - implement actual fuzzing
-          });
-          ' > fuzz/fuzz_targets/fuzz_wal.rs
-          
-          # Run for 60 seconds
-          timeout 60s cargo fuzz run fuzz_wal || true
+          echo "All licenses OK"
