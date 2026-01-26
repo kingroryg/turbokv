@@ -62,11 +62,11 @@ impl Default for DbConfig {
             wal_enabled: true,
             compression: Compression::Lz4,
             sync_writes: true,
-            memtable_size: 64 * 1024 * 1024,       // 64MB
-            block_cache_size: 64 * 1024 * 1024,    // 64MB
+            memtable_size: 64 * 1024 * 1024,    // 64MB
+            block_cache_size: 64 * 1024 * 1024, // 64MB
             max_open_files: 1000,
             compaction_style: CompactionStyle::SizeTiered,
-            max_wal_size: 128 * 1024 * 1024,       // 128MB
+            max_wal_size: 128 * 1024 * 1024, // 128MB
             flush_interval: Duration::from_secs(60),
             compaction_interval: Duration::from_secs(300),
         }
@@ -82,8 +82,8 @@ impl DbConfig {
             wal_enabled: false,
             compression: Compression::None,
             sync_writes: false,
-            memtable_size: 256 * 1024 * 1024,      // 256MB - larger to reduce flushes
-            block_cache_size: 128 * 1024 * 1024,   // 128MB
+            memtable_size: 256 * 1024 * 1024, // 256MB - larger to reduce flushes
+            block_cache_size: 128 * 1024 * 1024, // 128MB
             max_open_files: 1000,
             compaction_style: CompactionStyle::SizeTiered,
             max_wal_size: 256 * 1024 * 1024,
@@ -162,7 +162,9 @@ impl WriteBatch {
 
     /// Create a write batch with pre-allocated capacity
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { ops: Vec::with_capacity(capacity) }
+        Self {
+            ops: Vec::with_capacity(capacity),
+        }
     }
 
     /// Add a put operation

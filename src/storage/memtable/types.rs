@@ -84,8 +84,8 @@ impl Default for MemTableConfig {
     fn default() -> Self {
         Self {
             max_size: 64 * 1024 * 1024,        // 64MB (more reasonable default)
-            max_entries: 1_000_000,             // 1M entries
-            max_age: Duration::from_secs(300),  // 5 minutes
+            max_entries: 1_000_000,            // 1M entries
+            max_age: Duration::from_secs(300), // 5 minutes
         }
     }
 }

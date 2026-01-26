@@ -8,9 +8,9 @@
 //! - Automatic rotation when memtable is full
 //! - Thread-local write buffers for reduced lock contention
 
+use parking_lot::RwLock;
 use std::cell::RefCell;
 use std::sync::Arc;
-use parking_lot::RwLock;
 use tracing::info;
 
 use super::table::{MemTable, MemTableError, Result};
@@ -406,7 +406,9 @@ mod tests {
 
         // Insert enough entries to trigger rotation
         for i in 0..15 {
-            manager.insert(format!("key{}", i).as_bytes(), b"value").unwrap();
+            manager
+                .insert(format!("key{}", i).as_bytes(), b"value")
+                .unwrap();
         }
 
         // Should have at least one immutable memtable
@@ -423,7 +425,12 @@ mod tests {
 
         // Insert entries that will span multiple memtables
         for i in 0..12 {
-            manager.insert(format!("key{}", i).as_bytes(), format!("value{}", i).as_bytes()).unwrap();
+            manager
+                .insert(
+                    format!("key{}", i).as_bytes(),
+                    format!("value{}", i).as_bytes(),
+                )
+                .unwrap();
         }
 
         // Should be able to find all entries

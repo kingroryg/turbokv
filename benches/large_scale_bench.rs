@@ -5,23 +5,30 @@
 //!
 //! Run with: cargo run --release --bin large_scale_bench
 
+use fjall::{Config, PersistMode};
 use std::time::Instant;
 use tempfile::TempDir;
 use turbokv::{Db, DbOptions};
-use fjall::{Config, PersistMode};
 
 const KEY_COUNT: usize = 10_000_000; // 10M keys
-const VALUE_SIZE: usize = 400;       // 400 bytes per value (RocksDB default)
-const KEY_SIZE: usize = 20;          // 20-byte keys (RocksDB default)
+const VALUE_SIZE: usize = 400; // 400 bytes per value (RocksDB default)
+const KEY_SIZE: usize = 20; // 20-byte keys (RocksDB default)
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Large-Scale Benchmark: TurboKV vs RocksDB vs fjall");
     println!("===================================================");
-    println!("Keys: {} ({:.1}M)", KEY_COUNT, KEY_COUNT as f64 / 1_000_000.0);
+    println!(
+        "Keys: {} ({:.1}M)",
+        KEY_COUNT,
+        KEY_COUNT as f64 / 1_000_000.0
+    );
     println!("Key size: {} bytes", KEY_SIZE);
     println!("Value size: {} bytes", VALUE_SIZE);
-    println!("Total data: {:.2} GB", (KEY_COUNT * (KEY_SIZE + VALUE_SIZE)) as f64 / 1_000_000_000.0);
+    println!(
+        "Total data: {:.2} GB",
+        (KEY_COUNT * (KEY_SIZE + VALUE_SIZE)) as f64 / 1_000_000_000.0
+    );
     println!();
 
     // Pre-generate values (reuse same value to reduce memory pressure)
@@ -43,14 +50,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if i > 0 && i % 1_000_000 == 0 {
                 let elapsed = start.elapsed().as_secs_f64();
                 let rate = i as f64 / elapsed;
-                println!("  Progress: {}M keys, {:.0}K ops/sec", i / 1_000_000, rate / 1000.0);
+                println!(
+                    "  Progress: {}M keys, {:.0}K ops/sec",
+                    i / 1_000_000,
+                    rate / 1000.0
+                );
             }
         }
         db.flush().await?;
 
         let elapsed = start.elapsed();
         let ops_per_sec = KEY_COUNT as f64 / elapsed.as_secs_f64();
-        println!("TURBOKV fast: {:.2}s, {:.0}K ops/sec", elapsed.as_secs_f64(), ops_per_sec / 1000.0);
+        println!(
+            "TURBOKV fast: {:.2}s, {:.0}K ops/sec",
+            elapsed.as_secs_f64(),
+            ops_per_sec / 1000.0
+        );
     }
     println!();
 
@@ -70,18 +85,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if i > 0 && i % 1_000_000 == 0 {
                 let elapsed = start.elapsed().as_secs_f64();
                 let rate = i as f64 / elapsed;
-                println!("  Progress: {}M keys, {:.0}K ops/sec", i / 1_000_000, rate / 1000.0);
+                println!(
+                    "  Progress: {}M keys, {:.0}K ops/sec",
+                    i / 1_000_000,
+                    rate / 1000.0
+                );
             }
         }
         let write_elapsed = start.elapsed();
-        println!("  Writes done in {:.2}s, now flushing...", write_elapsed.as_secs_f64());
+        println!(
+            "  Writes done in {:.2}s, now flushing...",
+            write_elapsed.as_secs_f64()
+        );
         db.flush().await?;
 
         let elapsed = start.elapsed();
         let flush_time = elapsed - write_elapsed;
         let ops_per_sec = KEY_COUNT as f64 / elapsed.as_secs_f64();
         println!("  Flush took {:.2}s", flush_time.as_secs_f64());
-        println!("TURBOKV durable: {:.2}s total, {:.0}K ops/sec", elapsed.as_secs_f64(), ops_per_sec / 1000.0);
+        println!(
+            "TURBOKV durable: {:.2}s total, {:.0}K ops/sec",
+            elapsed.as_secs_f64(),
+            ops_per_sec / 1000.0
+        );
     }
     println!();
 
@@ -102,14 +128,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if i > 0 && i % 1_000_000 == 0 {
                 let elapsed = start.elapsed().as_secs_f64();
                 let rate = i as f64 / elapsed;
-                println!("  Progress: {}M keys, {:.0}K ops/sec", i / 1_000_000, rate / 1000.0);
+                println!(
+                    "  Progress: {}M keys, {:.0}K ops/sec",
+                    i / 1_000_000,
+                    rate / 1000.0
+                );
             }
         }
         keyspace.persist(PersistMode::SyncAll)?;
 
         let elapsed = start.elapsed();
         let ops_per_sec = KEY_COUNT as f64 / elapsed.as_secs_f64();
-        println!("fjall default: {:.2}s, {:.0}K ops/sec", elapsed.as_secs_f64(), ops_per_sec / 1000.0);
+        println!(
+            "fjall default: {:.2}s, {:.0}K ops/sec",
+            elapsed.as_secs_f64(),
+            ops_per_sec / 1000.0
+        );
     }
     println!();
 
@@ -129,14 +163,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if i > 0 && i % 1_000_000 == 0 {
                 let elapsed = start.elapsed().as_secs_f64();
                 let rate = i as f64 / elapsed;
-                println!("  Progress: {}M keys, {:.0}K ops/sec", i / 1_000_000, rate / 1000.0);
+                println!(
+                    "  Progress: {}M keys, {:.0}K ops/sec",
+                    i / 1_000_000,
+                    rate / 1000.0
+                );
             }
         }
         db.flush()?;
 
         let elapsed = start.elapsed();
         let ops_per_sec = KEY_COUNT as f64 / elapsed.as_secs_f64();
-        println!("RocksDB: {:.2}s, {:.0}K ops/sec", elapsed.as_secs_f64(), ops_per_sec / 1000.0);
+        println!(
+            "RocksDB: {:.2}s, {:.0}K ops/sec",
+            elapsed.as_secs_f64(),
+            ops_per_sec / 1000.0
+        );
     }
     println!();
 

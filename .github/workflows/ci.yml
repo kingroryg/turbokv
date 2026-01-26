@@ -15,6 +15,8 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C target-feature=+aes,+sse2"
     steps:
       - uses: actions/checkout@v4
 
@@ -35,14 +37,31 @@ jobs:
       - name: Build
         run: cargo build --release
 
-  test:
-    name: Test
+  test-linux:
+    name: Test (Linux)
     needs: check
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C target-feature=+aes,+sse2"
+    steps:
+      - uses: actions/checkout@v4
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Run doc tests
+        run: cargo test --doc
+
+  test-macos:
+    name: Test (macOS)
+    needs: check
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -61,6 +80,8 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C target-feature=+aes,+sse2"
     steps:
       - uses: actions/checkout@v4
 

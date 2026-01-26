@@ -536,7 +536,7 @@ impl WriteAheadLog {
             // This helps batch writes that arrive during the write (not fsync) phase
             if batch.len() < 4 && config.group_commit_delay_us > 0 {
                 let brief_wait = std::time::Duration::from_micros(
-                    config.group_commit_delay_us.min(100) // Cap at 100μs
+                    config.group_commit_delay_us.min(100), // Cap at 100μs
                 );
                 let deadline = tokio::time::Instant::now() + brief_wait;
                 while batch.len() < config.max_batch_size {
@@ -563,10 +563,7 @@ impl WriteAheadLog {
         }
     }
 
-    async fn open_or_create(
-        wal_dir: &Path,
-        config: &WalConfig,
-    ) -> Result<(WalFile, u64)> {
+    async fn open_or_create(wal_dir: &Path, config: &WalConfig) -> Result<(WalFile, u64)> {
         let mut entries = tokio::fs::read_dir(wal_dir).await?;
         let mut wal_files = Vec::new();
 

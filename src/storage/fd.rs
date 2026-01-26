@@ -17,9 +17,9 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use tracing::{debug, info};
 
-use crate::core::error::{Error, Result};
 use super::cache::BlockCache;
 use super::sstable::SSTableReader;
+use crate::core::error::{Error, Result};
 
 /// FD pool configuration
 #[derive(Debug, Clone)]
@@ -78,12 +78,12 @@ impl SSTablePool {
     pub fn new(config: FdConfig) -> Self {
         Self::with_cache(config, None)
     }
-    
+
     pub fn with_cache(config: FdConfig, block_cache: Option<Arc<BlockCache>>) -> Self {
         let system_fd_limit = get_fd_limit();
-        let max_size = config.max_open_sstables.min(
-            ((system_fd_limit as f64 * config.soft_limit_ratio) as usize).saturating_sub(64)
-        );
+        let max_size = config
+            .max_open_sstables
+            .min(((system_fd_limit as f64 * config.soft_limit_ratio) as usize).saturating_sub(64));
 
         // 2 partitions per core, min 4, max 64
         let num_partitions = if config.partitions > 0 {
@@ -91,9 +91,9 @@ impl SSTablePool {
         } else {
             (num_cpus::get() * 2).clamp(4, 64)
         };
-        
+
         let per_partition = (max_size / num_partitions).max(1);
-        
+
         let partitions: Vec<_> = (0..num_partitions)
             .map(|_| PoolPartition {
                 cache: Mutex::new(LruCache::new(NonZeroUsize::new(per_partition).unwrap())),
@@ -105,7 +105,10 @@ impl SSTablePool {
 
         info!(
             "SSTable pool: {} partitions, {} per partition, system_limit={}, block_cache={}",
-            num_partitions, per_partition, system_fd_limit, block_cache.is_some()
+            num_partitions,
+            per_partition,
+            system_fd_limit,
+            block_cache.is_some()
         );
 
         Self {
@@ -129,7 +132,7 @@ impl SSTablePool {
     pub fn get(&self, path: &Path) -> Result<Arc<SSTableReader>> {
         let path_buf = path.to_path_buf();
         let partition = self.partition_for(path);
-        
+
         // Check cache first
         {
             let mut cache = partition.cache.lock();
@@ -151,12 +154,12 @@ impl SSTablePool {
             Some(cache) => Arc::new(SSTableReader::open_with_cache(path, Arc::clone(cache))?),
             None => Arc::new(SSTableReader::open(path)?),
         };
-        
+
         {
             let mut cache = partition.cache.lock();
             let old_len = cache.len();
             cache.put(path_buf, Arc::clone(&reader));
-            
+
             if cache.len() <= old_len && old_len > 0 {
                 partition.evictions.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -194,7 +197,7 @@ impl SSTablePool {
                 acc.2 + p.evictions.load(Ordering::Relaxed),
             )
         });
-        
+
         FdStats {
             open_sstables: self.current_open.load(Ordering::Relaxed),
             cache_hits: hits,
@@ -234,7 +237,7 @@ impl FdMonitor {
     pub fn check(&self) -> FdStatus {
         let current = estimate_open_fds();
         let threshold = (self.system_limit as f64 * self.soft_limit_ratio) as u64;
-        
+
         FdStatus {
             current,
             limit: self.system_limit,
@@ -265,8 +268,8 @@ pub struct FdStatus {
 /// Get system file descriptor limit
 #[cfg(unix)]
 fn get_fd_limit() -> u64 {
-    use std::io::{BufRead, BufReader};
     use std::fs::File;
+    use std::io::{BufRead, BufReader};
 
     // Try /proc/self/limits first (Linux)
     if let Ok(file) = File::open("/proc/self/limits") {
@@ -347,7 +350,7 @@ mod tests {
     fn test_fd_monitor() {
         let monitor = FdMonitor::new(0.8);
         let status = monitor.check();
-        
+
         assert!(status.limit > 0);
         assert!(status.usage_ratio >= 0.0 && status.usage_ratio <= 1.0);
         println!("FD status: {:?}", status);
@@ -363,7 +366,7 @@ mod tests {
         };
         let pool = SSTablePool::new(config);
         let stats = pool.stats();
-        
+
         assert_eq!(stats.open_sstables, 0);
         assert_eq!(stats.cache_hits, 0);
         assert_eq!(stats.partitions, 8);

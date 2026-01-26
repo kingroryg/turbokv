@@ -3,10 +3,10 @@
 //! Tests for the generic key-value memtable implementation.
 
 use std::sync::Arc;
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
-use turbokv::storage::memtable::{MemTable, MemTableManager, MemTableConfig};
+use turbokv::storage::memtable::{MemTable, MemTableConfig, MemTableManager};
 
 fn test_config() -> MemTableConfig {
     MemTableConfig {
@@ -127,7 +127,9 @@ fn test_memtable_entry_limit() {
     let memtable = MemTable::new(config);
 
     for i in 0..10 {
-        memtable.insert(format!("key{}", i).as_bytes(), b"value").unwrap();
+        memtable
+            .insert(format!("key{}", i).as_bytes(), b"value")
+            .unwrap();
     }
 
     assert!(memtable.should_flush());
@@ -176,7 +178,9 @@ fn test_memtable_concurrent_writes() {
             for i in 0..writes_per_thread {
                 let key = format!("t{}k{}", t, i);
                 let value = format!("value{}", i);
-                memtable_clone.insert(key.as_bytes(), value.as_bytes()).unwrap();
+                memtable_clone
+                    .insert(key.as_bytes(), value.as_bytes())
+                    .unwrap();
             }
         });
         handles.push(handle);
@@ -237,7 +241,9 @@ fn test_manager_rotation() {
 
     // Insert enough entries to trigger rotation
     for i in 0..25 {
-        manager.insert(format!("key{}", i).as_bytes(), b"value").unwrap();
+        manager
+            .insert(format!("key{}", i).as_bytes(), b"value")
+            .unwrap();
     }
 
     // Should have immutable tables
@@ -260,7 +266,9 @@ fn test_manager_flush() {
 
     // Insert and rotate
     for i in 0..15 {
-        manager.insert(format!("key{}", i).as_bytes(), b"value").unwrap();
+        manager
+            .insert(format!("key{}", i).as_bytes(), b"value")
+            .unwrap();
     }
 
     // Get immutable for flush

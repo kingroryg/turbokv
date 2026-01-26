@@ -153,10 +153,8 @@ impl AlignedBuffer {
         let aligned_capacity = (capacity + alignment - 1) & !(alignment - 1);
 
         // Allocate with extra space for alignment
-        let layout = std::alloc::Layout::from_size_align(
-            aligned_capacity + alignment,
-            alignment,
-        ).unwrap();
+        let layout =
+            std::alloc::Layout::from_size_align(aligned_capacity + alignment, alignment).unwrap();
 
         let data = unsafe {
             let ptr = std::alloc::alloc_zeroed(layout);

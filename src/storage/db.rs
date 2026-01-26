@@ -33,8 +33,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::core::{DbConfig, WriteBatch};
 use crate::core::types::Compression;
+use crate::core::{DbConfig, WriteBatch};
 
 use super::engine::{Engine, StorageConfig, StorageError};
 use super::sstable::CompressionType;
@@ -168,7 +168,8 @@ impl Db {
             ..Default::default()
         };
 
-        let mut storage_config = StorageConfig::from_db_config(&db_config, path.as_ref().to_path_buf());
+        let mut storage_config =
+            StorageConfig::from_db_config(&db_config, path.as_ref().to_path_buf());
         // Convert user-facing Compression to internal CompressionType
         storage_config.sstable_config.compression = match options.compression {
             Compression::None => CompressionType::None,
@@ -283,7 +284,9 @@ mod tests {
     #[tokio::test]
     async fn test_basic_operations() {
         let temp = TempDir::new().unwrap();
-        let db = Db::open_with_options(temp.path(), DbOptions::fast()).await.unwrap();
+        let db = Db::open_with_options(temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
 
         // Insert
         db.insert(b"key1", b"value1").await.unwrap();
@@ -306,7 +309,9 @@ mod tests {
     #[tokio::test]
     async fn test_range_scan() {
         let temp = TempDir::new().unwrap();
-        let db = Db::open_with_options(temp.path(), DbOptions::fast()).await.unwrap();
+        let db = Db::open_with_options(temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
 
         db.insert(b"a", b"1").await.unwrap();
         db.insert(b"b", b"2").await.unwrap();
@@ -322,7 +327,9 @@ mod tests {
     #[tokio::test]
     async fn test_prefix_scan() {
         let temp = TempDir::new().unwrap();
-        let db = Db::open_with_options(temp.path(), DbOptions::fast()).await.unwrap();
+        let db = Db::open_with_options(temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
 
         db.insert(b"user:1", b"alice").await.unwrap();
         db.insert(b"user:2", b"bob").await.unwrap();
@@ -335,7 +342,9 @@ mod tests {
     #[tokio::test]
     async fn test_fast_mode_optimized() {
         let temp = TempDir::new().unwrap();
-        let db = Db::open_with_options(temp.path(), DbOptions::fast()).await.unwrap();
+        let db = Db::open_with_options(temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
 
         // Fast mode automatically uses sync path + thread-local buffers
         db.insert(b"key1", b"value1").await.unwrap();
@@ -352,7 +361,9 @@ mod tests {
     #[tokio::test]
     async fn test_fast_mode_many_inserts() {
         let temp = TempDir::new().unwrap();
-        let db = Db::open_with_options(temp.path(), DbOptions::fast()).await.unwrap();
+        let db = Db::open_with_options(temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
 
         // Insert many keys (will trigger automatic buffer flushes)
         for i in 0..1000 {
@@ -368,7 +379,10 @@ mod tests {
         for i in 0..1000 {
             let key = format!("key{:04}", i);
             let expected = format!("value{:04}", i);
-            assert_eq!(db.get(key.as_bytes()).await.unwrap(), Some(expected.into_bytes()));
+            assert_eq!(
+                db.get(key.as_bytes()).await.unwrap(),
+                Some(expected.into_bytes())
+            );
         }
     }
 }

@@ -81,10 +81,7 @@ pub(crate) fn create_file(wal_dir: &Path, sequence: u64, config: &WalConfig) -> 
 }
 
 /// Recover a WAL file, returning the file handle and last sequence
-pub(crate) fn recover_file(
-    path: &Path,
-    config: &WalConfig,
-) -> Result<(WalFile, u64)> {
+pub(crate) fn recover_file(path: &Path, config: &WalConfig) -> Result<(WalFile, u64)> {
     info!("Recovering from WAL file: {:?}", path);
 
     let file = OpenOptions::new().read(true).write(true).open(path)?;

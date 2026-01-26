@@ -71,7 +71,7 @@ impl Manifest {
     /// Load manifest from disk, or create new if doesn't exist
     pub fn load_or_create(data_dir: &Path) -> Result<Self> {
         let manifest_path = data_dir.join("MANIFEST");
-        
+
         if manifest_path.exists() {
             Self::load(&manifest_path)
         } else {
@@ -107,7 +107,7 @@ impl Manifest {
 
         // Read WAL checkpoint
         let wal_checkpoint = reader.read_u64::<LittleEndian>()?;
-        
+
         // Read checkpoint hash length and data
         let hash_len = reader.read_u32::<LittleEndian>()? as usize;
         let checkpoint_hash = if hash_len > 0 {
@@ -134,7 +134,9 @@ impl Manifest {
 
         info!(
             "Loaded manifest: version={}, wal_checkpoint={}, sstables={}",
-            version, wal_checkpoint, sstables.len()
+            version,
+            wal_checkpoint,
+            sstables.len()
         );
 
         Ok(Self {
@@ -167,7 +169,7 @@ impl Manifest {
 
             // Write WAL checkpoint
             writer.write_u64::<LittleEndian>(self.wal_checkpoint)?;
-            
+
             // Write checkpoint hash
             if let Some(ref hash) = self.checkpoint_hash {
                 let hash_bytes = hash.as_bytes();
@@ -225,7 +227,7 @@ impl Manifest {
     fn read_sstable_entry(reader: &mut impl Read) -> Result<SSTableManifestEntry> {
         let id = reader.read_u64::<LittleEndian>()?;
         let level = reader.read_u32::<LittleEndian>()?;
-        
+
         // Read path
         let path_len = reader.read_u32::<LittleEndian>()? as usize;
         let mut path_bytes = vec![0u8; path_len];
@@ -305,7 +307,7 @@ mod tests {
     #[test]
     fn test_manifest_save_load() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let mut manifest = Manifest::new();
         manifest.wal_checkpoint = 12345;
         manifest.add_sstable(SSTableManifestEntry {
@@ -326,7 +328,7 @@ mod tests {
 
         // Load
         let loaded = Manifest::load_or_create(temp_dir.path()).unwrap();
-        
+
         assert_eq!(loaded.wal_checkpoint, 12345);
         assert_eq!(loaded.sstables.len(), 1);
         assert_eq!(loaded.sstables[0].id, 1);
@@ -336,9 +338,9 @@ mod tests {
     #[test]
     fn test_manifest_new_database() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let manifest = Manifest::load_or_create(temp_dir.path()).unwrap();
-        
+
         assert_eq!(manifest.wal_checkpoint, 0);
         assert!(manifest.sstables.is_empty());
     }

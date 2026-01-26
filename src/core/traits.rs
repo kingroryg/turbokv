@@ -9,8 +9,8 @@
 //! 3. **Zero-Copy**: Keys and values are borrowed where possible
 //! 4. **Error Propagation**: All operations return Result
 
+use super::types::{CompactionResult, StorageStats, WriteBatch};
 use super::Result;
-use super::types::{StorageStats, CompactionResult, WriteBatch};
 
 /// Storage engine trait - BTreeMap-like interface
 ///

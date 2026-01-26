@@ -85,12 +85,8 @@ impl WalEntry {
         if self.data.len() < 4 {
             return None;
         }
-        let key_len = u32::from_le_bytes([
-            self.data[0],
-            self.data[1],
-            self.data[2],
-            self.data[3],
-        ]) as usize;
+        let key_len =
+            u32::from_le_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]) as usize;
 
         if self.data.len() < 4 + key_len {
             return None;
@@ -105,12 +101,8 @@ impl WalEntry {
         if self.data.len() < 4 {
             return None;
         }
-        let key_len = u32::from_le_bytes([
-            self.data[0],
-            self.data[1],
-            self.data[2],
-            self.data[3],
-        ]) as usize;
+        let key_len =
+            u32::from_le_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]) as usize;
 
         if self.data.len() < 4 + key_len {
             return None;

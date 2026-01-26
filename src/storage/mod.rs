@@ -68,7 +68,7 @@ pub use fd::{FdConfig, FdMonitor, FdStats, SSTablePool};
 pub use buffer_pool::{BufferPool, PooledBuffer};
 
 // Direct I/O exports (bypass OS cache)
-pub use direct_io::{DirectIoConfig, AlignedBuffer, DirectIoWriter};
+pub use direct_io::{AlignedBuffer, DirectIoConfig, DirectIoWriter};
 
 // Prefix bloom filter exports
 pub use sstable::bloom::PrefixBloomFilter;

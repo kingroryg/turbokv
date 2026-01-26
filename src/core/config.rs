@@ -49,8 +49,8 @@ impl Default for StorageConfig {
             data_dir: PathBuf::from("./data"),
             wal_dir: PathBuf::from("./data/wal"),
             max_wal_size: 1024 * 1024 * 1024, // 1GB
-            memtable_size: 256 * 1024 * 1024,  // 256MB
-            sstable_size: 512 * 1024 * 1024,   // 512MB
+            memtable_size: 256 * 1024 * 1024, // 256MB
+            sstable_size: 512 * 1024 * 1024,  // 512MB
             compaction_threshold: 4,
             compression: CompressionConfig::default(),
             sync_writes: true,

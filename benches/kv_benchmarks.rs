@@ -12,8 +12,8 @@
 //! across benchmark iterations for fair comparison.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -29,9 +29,9 @@ const VALUE_SIZE: usize = 400; // RocksDB default
 
 // Large-scale counts comparable to RocksDB methodology
 // 10M keys × 400 bytes = 4GB of data
-const WRITE_COUNT: usize = 10_000_000;   // For fast mode (no WAL) - ~9 sec at 1.1M ops/s
+const WRITE_COUNT: usize = 10_000_000; // For fast mode (no WAL) - ~9 sec at 1.1M ops/s
 const WRITE_COUNT_WAL: usize = 10_000_000; // For durable mode - ~11 sec at 900K ops/s
-const WRITE_COUNT_SYNC: usize = 100;    // For paranoid (fsync-bound)
+const WRITE_COUNT_SYNC: usize = 100; // For paranoid (fsync-bound)
 const READ_COUNT: usize = 100_000;
 const BATCH_SIZE: usize = 1000;
 
@@ -226,12 +226,20 @@ fn bench_turbokv_random_reads(c: &mut Criterion) {
 
     // Pre-populate databases
     rt.block_on(async {
-        let db = Db::open_with_options(fast_temp.path(), DbOptions::fast()).await.unwrap();
-        for (key, value) in &data { db.insert(key, value).await.unwrap(); }
+        let db = Db::open_with_options(fast_temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
+        for (key, value) in &data {
+            db.insert(key, value).await.unwrap();
+        }
         db.flush().await.unwrap();
 
-        let db = Db::open_with_options(durable_temp.path(), DbOptions::durable()).await.unwrap();
-        for (key, value) in &data { db.insert(key, value).await.unwrap(); }
+        let db = Db::open_with_options(durable_temp.path(), DbOptions::durable())
+            .await
+            .unwrap();
+        for (key, value) in &data {
+            db.insert(key, value).await.unwrap();
+        }
         db.flush().await.unwrap();
     });
 
@@ -242,7 +250,9 @@ fn bench_turbokv_random_reads(c: &mut Criterion) {
         let keys = Arc::clone(&read_keys_clone);
         b.iter(|| {
             rt.block_on(async {
-                let db = Db::open_with_options(&fast_path, DbOptions::fast()).await.unwrap();
+                let db = Db::open_with_options(&fast_path, DbOptions::fast())
+                    .await
+                    .unwrap();
                 for key in keys.iter() {
                     let _ = db.get(black_box(key)).await.unwrap();
                 }
@@ -256,7 +266,9 @@ fn bench_turbokv_random_reads(c: &mut Criterion) {
         let keys = Arc::clone(&read_keys_clone);
         b.iter(|| {
             rt.block_on(async {
-                let db = Db::open_with_options(&durable_path, DbOptions::durable()).await.unwrap();
+                let db = Db::open_with_options(&durable_path, DbOptions::durable())
+                    .await
+                    .unwrap();
                 for key in keys.iter() {
                     let _ = db.get(black_box(key)).await.unwrap();
                 }
@@ -283,8 +295,12 @@ fn bench_turbokv_sequential_reads(c: &mut Criterion) {
     // Setup database once
     let temp = TempDir::new().unwrap();
     rt.block_on(async {
-        let db = Db::open_with_options(temp.path(), DbOptions::fast()).await.unwrap();
-        for (key, value) in &data { db.insert(key, value).await.unwrap(); }
+        let db = Db::open_with_options(temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
+        for (key, value) in &data {
+            db.insert(key, value).await.unwrap();
+        }
         db.flush().await.unwrap();
     });
 
@@ -296,7 +312,9 @@ fn bench_turbokv_sequential_reads(c: &mut Criterion) {
         let keys = Arc::clone(&seq_keys);
         b.iter(|| {
             rt.block_on(async {
-                let db = Db::open_with_options(&temp_path, DbOptions::fast()).await.unwrap();
+                let db = Db::open_with_options(&temp_path, DbOptions::fast())
+                    .await
+                    .unwrap();
                 for key in keys.iter() {
                     let _ = db.get(black_box(key)).await.unwrap();
                 }
@@ -357,8 +375,12 @@ fn bench_turbokv_range_scan(c: &mut Criterion) {
     // Setup database once
     let temp = TempDir::new().unwrap();
     rt.block_on(async {
-        let db = Db::open_with_options(temp.path(), DbOptions::fast()).await.unwrap();
-        for (key, value) in &data { db.insert(key, value).await.unwrap(); }
+        let db = Db::open_with_options(temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
+        for (key, value) in &data {
+            db.insert(key, value).await.unwrap();
+        }
         db.flush().await.unwrap();
     });
 
@@ -366,7 +388,9 @@ fn bench_turbokv_range_scan(c: &mut Criterion) {
     group.bench_function("scan_1000_keys", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let db = Db::open_with_options(&temp_path, DbOptions::fast()).await.unwrap();
+                let db = Db::open_with_options(&temp_path, DbOptions::fast())
+                    .await
+                    .unwrap();
                 let start = format!("key{:016}", 50000).into_bytes();
                 let end = format!("key{:016}", 51000).into_bytes();
                 let _ = db.range(black_box(&start), black_box(&end)).await.unwrap();
@@ -467,7 +491,9 @@ fn bench_fjall_writes(c: &mut Criterion) {
         b.iter(|| {
             let temp = TempDir::new().unwrap();
             let keyspace = fjall::Config::new(temp.path()).open().unwrap();
-            let tree = keyspace.open_partition("default", Default::default()).unwrap();
+            let tree = keyspace
+                .open_partition("default", Default::default())
+                .unwrap();
 
             for (key, value) in &data {
                 tree.insert(black_box(key), black_box(value)).unwrap();
@@ -480,7 +506,9 @@ fn bench_fjall_writes(c: &mut Criterion) {
         b.iter(|| {
             let temp = TempDir::new().unwrap();
             let keyspace = fjall::Config::new(temp.path()).open().unwrap();
-            let tree = keyspace.open_partition("default", Default::default()).unwrap();
+            let tree = keyspace
+                .open_partition("default", Default::default())
+                .unwrap();
 
             for chunk in data.chunks(BATCH_SIZE) {
                 let mut batch = keyspace.batch();
@@ -508,7 +536,9 @@ fn bench_fjall_reads(c: &mut Criterion) {
     let temp = TempDir::new().unwrap();
     {
         let keyspace = fjall::Config::new(temp.path()).open().unwrap();
-        let tree = keyspace.open_partition("default", Default::default()).unwrap();
+        let tree = keyspace
+            .open_partition("default", Default::default())
+            .unwrap();
         for (key, value) in &data {
             tree.insert(key, value).unwrap();
         }
@@ -522,7 +552,9 @@ fn bench_fjall_reads(c: &mut Criterion) {
         let keys = Arc::clone(&read_keys);
         b.iter(|| {
             let keyspace = fjall::Config::new(&temp_path).open().unwrap();
-            let tree = keyspace.open_partition("default", Default::default()).unwrap();
+            let tree = keyspace
+                .open_partition("default", Default::default())
+                .unwrap();
             for key in keys.iter() {
                 let _ = tree.get(black_box(key)).unwrap();
             }
@@ -549,7 +581,9 @@ fn bench_write_comparison(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let temp = TempDir::new().unwrap();
-                let db = Db::open_with_options(temp.path(), DbOptions::fast()).await.unwrap();
+                let db = Db::open_with_options(temp.path(), DbOptions::fast())
+                    .await
+                    .unwrap();
                 for (key, value) in &data {
                     db.insert(black_box(key), black_box(value)).await.unwrap();
                 }
@@ -575,7 +609,9 @@ fn bench_write_comparison(c: &mut Criterion) {
         b.iter(|| {
             let temp = TempDir::new().unwrap();
             let keyspace = fjall::Config::new(temp.path()).open().unwrap();
-            let tree = keyspace.open_partition("default", Default::default()).unwrap();
+            let tree = keyspace
+                .open_partition("default", Default::default())
+                .unwrap();
             for (key, value) in &data {
                 tree.insert(black_box(key), black_box(value)).unwrap();
             }
@@ -602,23 +638,33 @@ fn bench_read_comparison(c: &mut Criterion) {
 
     // Populate TurboKV
     rt.block_on(async {
-        let db = Db::open_with_options(turbokv_temp.path(), DbOptions::fast()).await.unwrap();
-        for (key, value) in &data { db.insert(key, value).await.unwrap(); }
+        let db = Db::open_with_options(turbokv_temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
+        for (key, value) in &data {
+            db.insert(key, value).await.unwrap();
+        }
         db.flush().await.unwrap();
     });
 
     // Populate RocksDB
     {
         let db = rocksdb::DB::open_default(rocksdb_temp.path()).unwrap();
-        for (key, value) in &data { db.put(key, value).unwrap(); }
+        for (key, value) in &data {
+            db.put(key, value).unwrap();
+        }
         db.flush().unwrap();
     }
 
     // Populate fjall
     {
         let keyspace = fjall::Config::new(fjall_temp.path()).open().unwrap();
-        let tree = keyspace.open_partition("default", Default::default()).unwrap();
-        for (key, value) in &data { tree.insert(key, value).unwrap(); }
+        let tree = keyspace
+            .open_partition("default", Default::default())
+            .unwrap();
+        for (key, value) in &data {
+            tree.insert(key, value).unwrap();
+        }
         keyspace.persist(fjall::PersistMode::SyncAll).unwrap();
     }
 
@@ -628,7 +674,9 @@ fn bench_read_comparison(c: &mut Criterion) {
         let keys = Arc::clone(&read_keys);
         b.iter(|| {
             rt.block_on(async {
-                let db = Db::open_with_options(&turbokv_path, DbOptions::fast()).await.unwrap();
+                let db = Db::open_with_options(&turbokv_path, DbOptions::fast())
+                    .await
+                    .unwrap();
                 for key in keys.iter() {
                     let _ = db.get(black_box(key)).await.unwrap();
                 }
@@ -654,7 +702,9 @@ fn bench_read_comparison(c: &mut Criterion) {
         let keys = Arc::clone(&read_keys);
         b.iter(|| {
             let keyspace = fjall::Config::new(&fjall_path).open().unwrap();
-            let tree = keyspace.open_partition("default", Default::default()).unwrap();
+            let tree = keyspace
+                .open_partition("default", Default::default())
+                .unwrap();
             for key in keys.iter() {
                 let _ = tree.get(black_box(key)).unwrap();
             }
@@ -705,7 +755,7 @@ fn bench_concurrent_writes(c: &mut Criterion) {
                 let db = Arc::new(
                     Db::open_with_options(temp.path(), DbOptions::paranoid())
                         .await
-                        .unwrap()
+                        .unwrap(),
                 );
 
                 let counter = Arc::new(AtomicUsize::new(0));
@@ -741,7 +791,7 @@ fn bench_concurrent_writes(c: &mut Criterion) {
 // ============================================================================
 
 fn bench_readwhilewriting(c: &mut Criterion) {
-    use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)
@@ -776,7 +826,7 @@ fn bench_readwhilewriting(c: &mut Criterion) {
                 let db = Arc::new(
                     Db::open_with_options(temp.path(), DbOptions::durable())
                         .await
-                        .unwrap()
+                        .unwrap(),
                 );
 
                 // Prepopulate
@@ -816,7 +866,10 @@ fn bench_readwhilewriting(c: &mut Criterion) {
                 let write_data_clone = write_data.clone();
                 handles.push(tokio::spawn(async move {
                     for (key, value) in write_data_clone {
-                        db_write.insert(black_box(&key), black_box(&value)).await.unwrap();
+                        db_write
+                            .insert(black_box(&key), black_box(&value))
+                            .await
+                            .unwrap();
                         w_counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }));
@@ -865,7 +918,9 @@ fn bench_overwrite(c: &mut Criterion) {
                 // Overwrite all keys with new values
                 let new_value = vec![0xABu8; VALUE_SIZE];
                 for (key, _) in &data {
-                    db.insert(black_box(key), black_box(&new_value)).await.unwrap();
+                    db.insert(black_box(key), black_box(&new_value))
+                        .await
+                        .unwrap();
                 }
                 db.flush().await.unwrap();
             });

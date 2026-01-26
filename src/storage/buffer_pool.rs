@@ -134,7 +134,8 @@ impl BufferPool {
     pub fn get(&self) -> PooledBuffer {
         let buffer = {
             let mut pool = self.inner.buffers.lock();
-            pool.pop().unwrap_or_else(|| Vec::with_capacity(self.inner.buffer_size))
+            pool.pop()
+                .unwrap_or_else(|| Vec::with_capacity(self.inner.buffer_size))
         };
 
         PooledBuffer {
@@ -148,7 +149,8 @@ impl BufferPool {
     pub fn get_with_capacity(&self, min_capacity: usize) -> PooledBuffer {
         let mut buffer = {
             let mut pool = self.inner.buffers.lock();
-            pool.pop().unwrap_or_else(|| Vec::with_capacity(min_capacity))
+            pool.pop()
+                .unwrap_or_else(|| Vec::with_capacity(min_capacity))
         };
 
         if buffer.capacity() < min_capacity {

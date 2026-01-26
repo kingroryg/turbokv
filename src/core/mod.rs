@@ -50,17 +50,13 @@ pub mod utils;
 
 // Re-export commonly used types
 pub use error::{Error, Result};
-pub use types::{
-    DbConfig, Compression, CompactionStyle,
-    StorageStats, CompactionResult,
-    WriteBatch, BatchOp,
+pub use serialization::{
+    decode_delete, decode_kv, encode_delete, encode_kv, from_bytes, from_msgpack, to_bytes,
+    to_msgpack,
 };
 pub use traits::StorageEngine;
-pub use serialization::{
-    to_bytes, from_bytes,
-    to_msgpack, from_msgpack,
-    encode_kv, decode_kv,
-    encode_delete, decode_delete,
+pub use types::{
+    BatchOp, CompactionResult, CompactionStyle, Compression, DbConfig, StorageStats, WriteBatch,
 };
 
 /// Version information

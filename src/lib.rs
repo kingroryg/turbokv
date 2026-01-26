@@ -2,6 +2,9 @@
 //!
 //! A fast, embedded key-value store with BTreeMap-like API.
 //!
+//! TurboKV achieves **2x faster** durable writes than RocksDB and fjall through
+//! careful optimization. See the [`optimizations`] module for details.
+//!
 //! ## Quick Start
 //!
 //! ```rust,no_run
@@ -78,6 +81,9 @@ pub mod core;
 // Storage engine implementation
 pub mod storage;
 
+// Performance optimization documentation
+pub mod optimizations;
+
 // ============================================================================
 // Public API - Primary exports
 // ============================================================================
@@ -89,15 +95,15 @@ pub use storage::db::{Db, DbError, DbOptions, DbStats};
 pub use core::types::WriteBatch;
 
 // Configuration
-pub use core::types::{DbConfig, Compression, CompactionStyle};
+pub use core::types::{CompactionStyle, Compression, DbConfig};
 
 // ============================================================================
 // Advanced API - For power users
 // ============================================================================
 
 // Storage engine (low-level)
-pub use storage::engine::{Engine, StorageConfig, StorageError};
 pub use storage::engine::Result as StorageResult;
+pub use storage::engine::{Engine, StorageConfig, StorageError};
 
 // WAL
 pub use storage::wal::{WalConfig, WriteAheadLog};

@@ -30,19 +30,20 @@ pub fn compress_block(data: &[u8], compression: CompressionType) -> Result<Vec<u
     match compression {
         CompressionType::None => Ok(data.to_vec()),
         CompressionType::Zstd => {
-            let compressed = zstd::encode_all(data, 3)
-                .map_err(|e| Error::SSTable {
-                    message: format!("Zstd compression failed: {}", e),
-                    source: None,
-                })?;
+            let compressed = zstd::encode_all(data, 3).map_err(|e| Error::SSTable {
+                message: format!("Zstd compression failed: {}", e),
+                source: None,
+            })?;
             Ok(compressed)
         }
         CompressionType::Snappy => {
-            let compressed = snap::raw::Encoder::new().compress_vec(data)
-                .map_err(|e| Error::SSTable {
-                    message: format!("Snappy compression failed: {}", e),
-                    source: None,
-                })?;
+            let compressed =
+                snap::raw::Encoder::new()
+                    .compress_vec(data)
+                    .map_err(|e| Error::SSTable {
+                        message: format!("Snappy compression failed: {}", e),
+                        source: None,
+                    })?;
             Ok(compressed)
         }
         CompressionType::Lz4 => {
@@ -56,15 +57,15 @@ pub fn decompress_block(data: &[u8], compression: CompressionType) -> Result<Vec
     match compression {
         CompressionType::None => Ok(data.to_vec()),
         CompressionType::Zstd => {
-            let decompressed = zstd::decode_all(data)
-                .map_err(|e| Error::SSTable {
-                    message: format!("Zstd decompression failed: {}", e),
-                    source: None,
-                })?;
+            let decompressed = zstd::decode_all(data).map_err(|e| Error::SSTable {
+                message: format!("Zstd decompression failed: {}", e),
+                source: None,
+            })?;
             Ok(decompressed)
         }
         CompressionType::Snappy => {
-            let decompressed = snap::raw::Decoder::new().decompress_vec(data)
+            let decompressed = snap::raw::Decoder::new()
+                .decompress_vec(data)
                 .map_err(|e| Error::SSTable {
                     message: format!("Snappy decompression failed: {}", e),
                     source: None,
@@ -72,8 +73,8 @@ pub fn decompress_block(data: &[u8], compression: CompressionType) -> Result<Vec
             Ok(decompressed)
         }
         CompressionType::Lz4 => {
-            let decompressed = lz4_flex::decompress_size_prepended(data)
-                .map_err(|e| Error::SSTable {
+            let decompressed =
+                lz4_flex::decompress_size_prepended(data).map_err(|e| Error::SSTable {
                     message: format!("LZ4 decompression failed: {}", e),
                     source: None,
                 })?;

@@ -17,19 +17,19 @@ struct MetricsInner {
     events_ingested: AtomicU64,
     bytes_ingested: AtomicU64,
     ingestion_errors: AtomicU64,
-    
+
     // Storage metrics
     wal_writes: AtomicU64,
     wal_bytes: AtomicU64,
     memtable_flushes: AtomicU64,
     compactions: AtomicU64,
-    
+
     // Query metrics
     queries_executed: AtomicU64,
     query_errors: AtomicU64,
     vector_searches: AtomicU64,
     metadata_searches: AtomicU64,
-    
+
     // System metrics
     active_connections: AtomicU64,
     memory_usage: AtomicU64,
@@ -58,69 +58,75 @@ impl Metrics {
             }),
         }
     }
-    
+
     /// Record event ingestion
     pub fn record_ingestion(&self, count: u64, bytes: u64) {
-        self.inner.events_ingested.fetch_add(count, Ordering::Relaxed);
-        self.inner.bytes_ingested.fetch_add(bytes, Ordering::Relaxed);
+        self.inner
+            .events_ingested
+            .fetch_add(count, Ordering::Relaxed);
+        self.inner
+            .bytes_ingested
+            .fetch_add(bytes, Ordering::Relaxed);
     }
-    
+
     /// Record ingestion error
     pub fn record_ingestion_error(&self) {
         self.inner.ingestion_errors.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     /// Record WAL write
     pub fn record_wal_write(&self, bytes: u64) {
         self.inner.wal_writes.fetch_add(1, Ordering::Relaxed);
         self.inner.wal_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
-    
+
     /// Record memtable flush
     pub fn record_flush(&self) {
         self.inner.memtable_flushes.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     /// Record compaction
     pub fn record_compaction(&self) {
         self.inner.compactions.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     /// Record query execution
     pub fn record_query(&self) {
         self.inner.queries_executed.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     /// Record query error
     pub fn record_query_error(&self) {
         self.inner.query_errors.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     /// Record vector search
     pub fn record_vector_search(&self) {
         self.inner.vector_searches.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     /// Record metadata search
     pub fn record_metadata_search(&self) {
         self.inner.metadata_searches.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     /// Update active connections
     pub fn update_connections(&self, count: u64) {
-        self.inner.active_connections.store(count, Ordering::Relaxed);
+        self.inner
+            .active_connections
+            .store(count, Ordering::Relaxed);
     }
-    
+
     /// Update memory usage
     pub fn update_memory(&self, bytes: u64) {
         self.inner.memory_usage.store(bytes, Ordering::Relaxed);
     }
-    
+
     /// Update disk usage
     pub fn update_disk(&self, bytes: u64) {
         self.inner.disk_usage.store(bytes, Ordering::Relaxed);
     }
-    
+
     /// Get current metrics snapshot
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -175,12 +181,12 @@ impl Timer {
             name: name.into(),
         }
     }
-    
+
     /// Get elapsed time
     pub fn elapsed(&self) -> Duration {
         self.start.elapsed()
     }
-    
+
     /// Stop timer and log duration
     pub fn stop(self) {
         let duration = self.elapsed();
@@ -206,20 +212,20 @@ impl Histogram {
             .into_iter()
             .map(|b| (b, AtomicU64::new(0)))
             .collect();
-            
+
         Self {
             buckets,
             sum: AtomicU64::new(0),
             count: AtomicU64::new(0),
         }
     }
-    
+
     /// Record a value
     pub fn record(&self, value: f64) {
         // Update sum and count
         self.sum.fetch_add(value as u64, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
-        
+
         // Find appropriate bucket
         for (boundary, count) in &self.buckets {
             if value <= *boundary {
@@ -228,16 +234,20 @@ impl Histogram {
             }
         }
     }
-    
+
     /// Get histogram statistics
     pub fn stats(&self) -> HistogramStats {
         let count = self.count.load(Ordering::Relaxed);
         let sum = self.sum.load(Ordering::Relaxed);
-        
+
         HistogramStats {
             count,
             sum,
-            mean: if count > 0 { sum as f64 / count as f64 } else { 0.0 },
+            mean: if count > 0 {
+                sum as f64 / count as f64
+            } else {
+                0.0
+            },
         }
     }
 }

@@ -14,7 +14,7 @@ pub fn init() {
     INIT.get_or_init(|| {
         // Set initial value
         update_timestamp();
-        
+
         // Spawn background updater
         thread::Builder::new()
             .name("timestamp-cache".into())
@@ -64,7 +64,7 @@ mod tests {
         init();
         let t1 = now_ms();
         assert!(t1 > 0);
-        
+
         // Should be close to real time
         let real = SystemTime::now()
             .duration_since(UNIX_EPOCH)

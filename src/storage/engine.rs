@@ -210,13 +210,7 @@ impl Engine {
             .map_err(|e| StorageError::Manifest(e.to_string()))?;
         let wal_checkpoint = manifest.wal_checkpoint;
 
-        let next_sstable_id = manifest
-            .sstables
-            .iter()
-            .map(|s| s.id)
-            .max()
-            .unwrap_or(0)
-            + 1;
+        let next_sstable_id = manifest.sstables.iter().map(|s| s.id).max().unwrap_or(0) + 1;
 
         info!(
             "Opening database: wal_checkpoint={}, sstables={}",
@@ -275,7 +269,10 @@ impl Engine {
             None
         };
 
-        let sstable_pool = Arc::new(SSTablePool::with_cache(config.fd_config.clone(), block_cache));
+        let sstable_pool = Arc::new(SSTablePool::with_cache(
+            config.fd_config.clone(),
+            block_cache,
+        ));
         let fd_monitor = Arc::new(FdMonitor::new(config.fd_config.soft_limit_ratio));
 
         let compactor = Arc::new(Compactor::new(
@@ -558,7 +555,7 @@ impl Engine {
         StorageStats {
             total_keys: memtable_stats.active.entry_count as u64,
             total_bytes: memtable_stats.active.size_bytes as u64,
-            wal_size: 0, // Would need async for this
+            wal_size: 0,      // Would need async for this
             sstable_count: 0, // Would need async for this
             memtable_size: memtable_stats.active.size_bytes as u64,
             compaction_pending: false,
@@ -1052,14 +1049,8 @@ mod tests {
         engine.insert(b"key2", b"value2").await.unwrap();
 
         // Get
-        assert_eq!(
-            engine.get(b"key1").await.unwrap(),
-            Some(b"value1".to_vec())
-        );
-        assert_eq!(
-            engine.get(b"key2").await.unwrap(),
-            Some(b"value2".to_vec())
-        );
+        assert_eq!(engine.get(b"key1").await.unwrap(), Some(b"value1".to_vec()));
+        assert_eq!(engine.get(b"key2").await.unwrap(), Some(b"value2".to_vec()));
         assert_eq!(engine.get(b"key3").await.unwrap(), None);
 
         // Delete

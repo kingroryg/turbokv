@@ -19,70 +19,79 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     // Storage Errors
     #[error("WAL error: {message}")]
-    WriteAheadLog { message: String, source: Option<Box<dyn std::error::Error + Send + Sync>> },
-    
+    WriteAheadLog {
+        message: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+
     #[error("SSTable error: {message}")]
-    SSTable { message: String, source: Option<Box<dyn std::error::Error + Send + Sync>> },
-    
+    SSTable {
+        message: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+
     #[error("MemTable error: {message}")]
     MemTable { message: String },
-    
+
     #[error("Compaction failed: {reason}")]
     Compaction { reason: String },
-    
+
     // Index Errors
     #[error("Vector index error: {message}")]
     VectorIndex { message: String },
-    
+
     #[error("Metadata index error: {message}")]
     MetadataIndex { message: String },
-    
+
     #[error("Index corruption detected: {details}")]
     IndexCorruption { details: String },
-    
+
     // Ingestion Errors
     #[error("Parsing error for format {format}: {message}")]
     ParseError { format: String, message: String },
-    
+
     #[error("Vectorization failed: {message}")]
     VectorizationError { message: String },
-    
+
     #[error("Schema validation error: {message}")]
     SchemaValidation { message: String },
-    
+
     // Query Errors
     #[error("Query error: {message}")]
     QueryError { message: String },
-    
+
     #[error("Invalid query syntax: {message}")]
     InvalidQuery { message: String },
-    
+
     #[error("Query timeout after {seconds}s")]
     QueryTimeout { seconds: u64 },
-    
+
     // Security Errors
     #[error("Merkle chain validation failed: expected {expected}, got {actual}")]
     MerkleValidation { expected: String, actual: String },
-    
+
     #[error("Tampering detected at position {position}")]
     TamperingDetected { position: u64 },
-    
+
     #[error("Authentication failed: {reason}")]
     Authentication { reason: String },
-    
+
     #[error("Authorization failed: {reason}")]
     Authorization { reason: String },
-    
+
     // System Errors
     #[error("IO error: {message}")]
-    Io { message: String, source: std::io::Error },
-    
+    Io {
+        message: String,
+        source: std::io::Error,
+    },
+
     #[error("Configuration error: {message}")]
     Configuration { message: String },
-    
+
     #[error("Resource exhausted: {resource}")]
     ResourceExhausted { resource: String },
-    
+
     #[error("Internal error: {message}")]
     Internal { message: String },
 }
@@ -99,7 +108,7 @@ impl Error {
             _ => true,
         }
     }
-    
+
     /// Get error code for monitoring
     pub fn error_code(&self) -> &'static str {
         match self {
@@ -147,7 +156,7 @@ impl<T> ErrorContext<T> {
     pub fn new(result: Result<T>) -> Self {
         Self { result }
     }
-    
+
     pub fn context(self, message: &str) -> Result<T> {
         self.result.map_err(|e| Error::Internal {
             message: format!("{}: {}", message, e),

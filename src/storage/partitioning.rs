@@ -105,7 +105,7 @@ impl Default for RetentionPolicy {
         Self {
             retention_period: Duration::from_secs(30 * 24 * 3600), // 30 days
             cleanup_interval: Duration::from_secs(3600),           // 1 hour
-            min_partitions: 24,                                     // Keep at least 24 partitions
+            min_partitions: 24,                                    // Keep at least 24 partitions
         }
     }
 }
@@ -125,7 +125,7 @@ impl PartitionId {
         let dt = DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(timestamp_secs));
         let date = dt.date_naive();
         let window_idx = window.window_index(dt.hour());
-        
+
         Self {
             date,
             window: window_idx,
@@ -144,7 +144,7 @@ impl PartitionId {
             PartitionWindow::SixHour => self.window * 6,
             PartitionWindow::Daily => 0,
         };
-        
+
         let dt = self.date.and_hms_opt(start_hour, 0, 0).unwrap();
         Utc.from_utc_datetime(&dt).timestamp() as u64
     }
@@ -161,11 +161,14 @@ impl PartitionId {
 
     /// Get file prefix for this partition
     pub fn file_prefix(&self, window: PartitionWindow) -> String {
-        let start_hour = window.window_start_hour(self.window * match window {
-            PartitionWindow::Hourly => 1,
-            PartitionWindow::SixHour => 6,
-            PartitionWindow::Daily => 24,
-        });
+        let start_hour = window.window_start_hour(
+            self.window
+                * match window {
+                    PartitionWindow::Hourly => 1,
+                    PartitionWindow::SixHour => 6,
+                    PartitionWindow::Daily => 24,
+                },
+        );
         format!("{:02}", start_hour)
     }
 }
@@ -224,7 +227,7 @@ impl PartitionManager {
         for entry in std::fs::read_dir(&self.base_dir)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             if !path.is_dir() {
                 continue;
             }
@@ -236,13 +239,16 @@ impl PartitionManager {
                         let sst_entry = sst_entry?;
                         let sst_name = sst_entry.file_name();
                         let sst_str = sst_name.to_string_lossy();
-                        
+
                         if sst_str.ends_with(".sst") {
                             // Parse window from filename prefix (e.g., "06_...")
                             if let Some(hour_str) = sst_str.split('_').next() {
                                 if let Ok(hour) = hour_str.parse::<u32>() {
                                     let window_idx = self.window.window_index(hour);
-                                    let partition = PartitionId { date, window: window_idx };
+                                    let partition = PartitionId {
+                                        date,
+                                        window: window_idx,
+                                    };
                                     if !partitions.contains(&partition) {
                                         partitions.push(partition);
                                     }
@@ -284,22 +290,18 @@ impl PartitionManager {
     }
 
     /// Get partitions that overlap with a time range
-    pub fn partitions_for_range(
-        &self,
-        start_secs: u64,
-        end_secs: u64,
-    ) -> Vec<PartitionId> {
+    pub fn partitions_for_range(&self, start_secs: u64, end_secs: u64) -> Vec<PartitionId> {
         let mut partitions = Vec::new();
-        
+
         let start_partition = self.get_partition(start_secs);
         let end_partition = self.get_partition(end_secs);
 
         // Generate all partitions between start and end
         let mut current = start_partition.clone();
-        
+
         loop {
             partitions.push(current.clone());
-            
+
             if current >= end_partition {
                 break;
             }
@@ -339,7 +341,7 @@ impl PartitionManager {
     /// Delete a partition and all its SSTables
     pub fn delete_partition(&self, partition: &PartitionId) -> Result<u64> {
         let dir = self.partition_dir(partition);
-        
+
         if !dir.exists() {
             return Ok(0);
         }
@@ -350,7 +352,7 @@ impl PartitionManager {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             if path.extension() == Some(std::ffi::OsStr::new("sst")) {
                 bytes_deleted += entry.metadata()?.len();
                 std::fs::remove_file(&path)?;
@@ -377,7 +379,7 @@ impl PartitionManager {
     /// Run retention cleanup
     pub fn enforce_retention(&self) -> Result<RetentionResult> {
         let partitions = self.partitions_to_delete()?;
-        
+
         let mut result = RetentionResult {
             partitions_deleted: 0,
             bytes_reclaimed: 0,
@@ -403,7 +405,11 @@ impl PartitionManager {
     }
 
     /// Merge small SSTables within a partition
-    pub fn should_merge_partition(&self, partition: &PartitionId, max_sstables: usize) -> Result<bool> {
+    pub fn should_merge_partition(
+        &self,
+        partition: &PartitionId,
+        max_sstables: usize,
+    ) -> Result<bool> {
         let sstables = self.list_sstables_in_partition(partition)?;
         Ok(sstables.len() > max_sstables)
     }
@@ -430,7 +436,7 @@ impl PartitionManager {
             let future_ts = now_secs + (i as u64 * window_secs);
             let partition = self.get_partition(future_ts);
             let dir = self.partition_dir(&partition);
-            
+
             if !dir.exists() {
                 std::fs::create_dir_all(&dir)?;
                 created += 1;
@@ -460,7 +466,7 @@ mod tests {
     fn test_partition_id_from_timestamp() {
         // 2024-01-15 14:30:00 UTC
         let ts = 1705329000u64;
-        
+
         let hourly = PartitionId::from_timestamp(ts, PartitionWindow::Hourly);
         assert_eq!(hourly.date, NaiveDate::from_ymd_opt(2024, 1, 15).unwrap());
         assert_eq!(hourly.window, 14);
@@ -497,10 +503,10 @@ mod tests {
 
         // Range spanning 2 days
         let start = 1705329000u64; // 2024-01-15 14:30
-        let end = 1705415400u64;   // 2024-01-16 14:30
+        let end = 1705415400u64; // 2024-01-16 14:30
 
         let partitions = manager.partitions_for_range(start, end);
-        
+
         // Should cover: 01-15 window 2, 3, 01-16 window 0, 1, 2
         assert!(partitions.len() >= 5);
     }

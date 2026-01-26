@@ -160,18 +160,23 @@ impl MerkleChain {
             if node.sequence != prev_node.sequence + 1 {
                 return Err(MerkleError::InvalidChain {
                     position: i,
-                    reason: format!("Invalid sequence: expected {}, got {}",
-                        prev_node.sequence + 1, node.sequence),
+                    reason: format!(
+                        "Invalid sequence: expected {}, got {}",
+                        prev_node.sequence + 1,
+                        node.sequence
+                    ),
                 });
             }
 
             // Check previous hash reference
             match (&node.prev_hash, &prev_node.hash) {
-                (Some(prev_hash), actual_prev) if prev_hash == actual_prev => {},
-                _ => return Err(MerkleError::InvalidChain {
-                    position: i,
-                    reason: "Previous hash mismatch".to_string(),
-                }),
+                (Some(prev_hash), actual_prev) if prev_hash == actual_prev => {}
+                _ => {
+                    return Err(MerkleError::InvalidChain {
+                        position: i,
+                        reason: "Previous hash mismatch".to_string(),
+                    })
+                }
             }
 
             // Recompute and verify hash
@@ -200,8 +205,15 @@ impl MerkleChain {
 /// Merkle chain errors
 #[derive(Debug, Clone)]
 pub enum MerkleError {
-    InvalidChain { position: usize, reason: String },
-    TamperingDetected { position: usize, expected: String, computed: String },
+    InvalidChain {
+        position: usize,
+        reason: String,
+    },
+    TamperingDetected {
+        position: usize,
+        expected: String,
+        computed: String,
+    },
 }
 
 impl fmt::Display for MerkleError {
@@ -210,9 +222,16 @@ impl fmt::Display for MerkleError {
             MerkleError::InvalidChain { position, reason } => {
                 write!(f, "Invalid chain at position {}: {}", position, reason)
             }
-            MerkleError::TamperingDetected { position, expected, computed } => {
-                write!(f, "Tampering detected at position {}: expected hash {}, computed {}",
-                    position, expected, computed)
+            MerkleError::TamperingDetected {
+                position,
+                expected,
+                computed,
+            } => {
+                write!(
+                    f,
+                    "Tampering detected at position {}: expected hash {}, computed {}",
+                    position, expected, computed
+                )
             }
         }
     }

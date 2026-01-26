@@ -10,8 +10,8 @@
 //! - L1-L6: 10x size multiplier per level
 //! - Streaming merge to handle large files without RAM pressure
 
-use std::collections::BinaryHeap;
 use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -98,7 +98,7 @@ impl Compactor {
     pub fn pick_compaction(&self, sstables: &[SSTableManifestEntry]) -> Option<CompactionJob> {
         // Priority 1: L0 compaction (keeps write path fast)
         let l0_tables: Vec<_> = sstables.iter().filter(|s| s.level == 0).cloned().collect();
-        
+
         if l0_tables.len() >= self.config.l0_compaction_trigger {
             let output_path = self.new_sstable_path();
             return Some(CompactionJob {
@@ -110,7 +110,11 @@ impl Compactor {
 
         // Priority 2: Level compaction (when level exceeds size budget)
         for level in 1..self.config.max_levels {
-            let level_tables: Vec<_> = sstables.iter().filter(|s| s.level == level).cloned().collect();
+            let level_tables: Vec<_> = sstables
+                .iter()
+                .filter(|s| s.level == level)
+                .cloned()
+                .collect();
             let level_size: u64 = level_tables.iter().map(|s| s.size).sum();
             let max_size = self.max_level_size(level);
 
@@ -119,7 +123,7 @@ impl Compactor {
                 let mut sorted = level_tables;
                 sorted.sort_by_key(|s| s.creation_time);
                 let to_compact: Vec<_> = sorted.into_iter().take(4).collect();
-                
+
                 let output_path = self.new_sstable_path();
                 return Some(CompactionJob {
                     input_sstables: to_compact,
@@ -165,7 +169,11 @@ impl Compactor {
         for (idx, iter) in iterators.iter_mut().enumerate() {
             if let Some(result) = iter.next() {
                 let (key, value) = result?;
-                heap.push(Reverse(MergeEntry { key, value, source: idx }));
+                heap.push(Reverse(MergeEntry {
+                    key,
+                    value,
+                    source: idx,
+                }));
             }
         }
 
@@ -175,7 +183,7 @@ impl Compactor {
         while let Some(Reverse(entry)) = heap.pop() {
             // Deduplicate: keep only the newest version of each key
             let is_duplicate = last_key.as_ref().map(|k| k == &entry.key).unwrap_or(false);
-            
+
             if is_duplicate {
                 entries_dropped += 1;
             } else {
@@ -195,7 +203,11 @@ impl Compactor {
             // Advance the iterator that provided this entry
             if let Some(result) = iterators[entry.source].next() {
                 let (key, value) = result?;
-                heap.push(Reverse(MergeEntry { key, value, source: entry.source }));
+                heap.push(Reverse(MergeEntry {
+                    key,
+                    value,
+                    source: entry.source,
+                }));
             }
         }
 
@@ -205,15 +217,27 @@ impl Compactor {
 
         // Create manifest entry for output
         let output_entry = SSTableManifestEntry {
-            id: self.next_sstable_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            id: self
+                .next_sstable_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             level: job.output_level,
             path: job.output_path,
             size: output_info.file_size,
             entry_count: output_info.entry_count,
             min_key: output_info.min_key,
             max_key: output_info.max_key,
-            min_sequence: job.input_sstables.iter().map(|s| s.min_sequence).min().unwrap_or(0),
-            max_sequence: job.input_sstables.iter().map(|s| s.max_sequence).max().unwrap_or(0),
+            min_sequence: job
+                .input_sstables
+                .iter()
+                .map(|s| s.min_sequence)
+                .min()
+                .unwrap_or(0),
+            max_sequence: job
+                .input_sstables
+                .iter()
+                .map(|s| s.max_sequence)
+                .max()
+                .unwrap_or(0),
             creation_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -261,7 +285,9 @@ impl Compactor {
     }
 
     fn new_sstable_path(&self) -> PathBuf {
-        let id = self.next_sstable_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = self
+            .next_sstable_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

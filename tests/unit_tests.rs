@@ -1,6 +1,8 @@
 //! Unit tests for TurboKV core types
 
-use turbokv::core::types::{DbConfig, WriteBatch, BatchOp, Compression, CompactionStyle, StorageStats, CompactionResult};
+use turbokv::core::types::{
+    BatchOp, CompactionResult, CompactionStyle, Compression, DbConfig, StorageStats, WriteBatch,
+};
 
 mod types_tests {
     use super::*;
@@ -82,7 +84,7 @@ mod types_tests {
 }
 
 mod utils_tests {
-    use turbokv::core::utils::{next_power_of_two, is_power_of_two, align_to, format_bytes};
+    use turbokv::core::utils::{align_to, format_bytes, is_power_of_two, next_power_of_two};
 
     #[test]
     fn test_power_of_two() {
@@ -158,7 +160,9 @@ mod error_tests {
 
     #[test]
     fn test_error_display() {
-        let err = Error::Internal { message: "test error".to_string() };
+        let err = Error::Internal {
+            message: "test error".to_string(),
+        };
         assert!(err.to_string().contains("test error"));
     }
 
@@ -167,7 +171,9 @@ mod error_tests {
         let ok_result: Result<i32> = Ok(42);
         assert_eq!(ok_result.unwrap(), 42);
 
-        let err_result: Result<i32> = Err(Error::Internal { message: "test".to_string() });
+        let err_result: Result<i32> = Err(Error::Internal {
+            message: "test".to_string(),
+        });
         assert!(err_result.is_err());
     }
 

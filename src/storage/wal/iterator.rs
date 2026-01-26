@@ -36,10 +36,7 @@ impl WalEntryIterator {
 
             if let Ok(file) = File::open(path) {
                 let mut reader = BufReader::new(file);
-                if reader
-                    .seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))
-                    .is_ok()
-                {
+                if reader.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64)).is_ok() {
                     self.reader = Some(reader);
                     return Ok(true);
                 }

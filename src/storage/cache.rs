@@ -1,10 +1,10 @@
 //! Sharded LRU cache for frequently accessed SSTable blocks.
 //! Reduces lock contention by partitioning cache across multiple shards.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
 
 use bytes::Bytes;
 use lru::LruCache;
@@ -19,7 +19,10 @@ pub struct CacheKey {
 
 impl CacheKey {
     pub fn new(file_id: u64, block_offset: u64) -> Self {
-        Self { file_id, block_offset }
+        Self {
+            file_id,
+            block_offset,
+        }
     }
 }
 
@@ -58,10 +61,13 @@ impl BlockCache {
 
     /// Create cache with custom shard count (must be power of 2)
     pub fn with_shards(max_size_bytes: usize, num_shards: usize) -> Self {
-        assert!(num_shards.is_power_of_two(), "shard count must be power of 2");
-        
+        assert!(
+            num_shards.is_power_of_two(),
+            "shard count must be power of 2"
+        );
+
         let per_shard_entries = std::cmp::max(16, max_size_bytes / num_shards / 4096); // ~4KB per block
-        
+
         let shards: Vec<_> = (0..num_shards)
             .map(|_| CacheShard {
                 lru: Mutex::new(LruCache::new(NonZeroUsize::new(per_shard_entries).unwrap())),
@@ -91,7 +97,7 @@ impl BlockCache {
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
         let shard = self.shard_for(key);
         let mut lru = shard.lru.lock();
-        
+
         match lru.get(key) {
             Some(value) => {
                 shard.hits.fetch_add(1, Ordering::Relaxed);
@@ -110,15 +116,19 @@ impl BlockCache {
         let value_len = value.len() as u64;
         let shard = self.shard_for(&key);
         let mut lru = shard.lru.lock();
-        
+
         // Evict old entry if exists
         if let Some(old) = lru.pop(&key) {
-            shard.size_bytes.fetch_sub(old.len() as u64, Ordering::Relaxed);
+            shard
+                .size_bytes
+                .fetch_sub(old.len() as u64, Ordering::Relaxed);
         }
-        
+
         // Insert new entry (LRU handles eviction of oldest)
         if let Some((_, evicted)) = lru.push(key, value) {
-            shard.size_bytes.fetch_sub(evicted.len() as u64, Ordering::Relaxed);
+            shard
+                .size_bytes
+                .fetch_sub(evicted.len() as u64, Ordering::Relaxed);
         }
         shard.size_bytes.fetch_add(value_len, Ordering::Relaxed);
     }
@@ -128,7 +138,9 @@ impl BlockCache {
         let shard = self.shard_for(key);
         let mut lru = shard.lru.lock();
         if let Some(old) = lru.pop(key) {
-            shard.size_bytes.fetch_sub(old.len() as u64, Ordering::Relaxed);
+            shard
+                .size_bytes
+                .fetch_sub(old.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -144,7 +156,7 @@ impl BlockCache {
     /// Get cache statistics
     pub fn stats(&self) -> CacheStats {
         let mut stats = CacheStats::default();
-        
+
         for shard in &self.shards {
             let lru = shard.lru.lock();
             stats.entries += lru.len();
@@ -152,14 +164,14 @@ impl BlockCache {
             stats.hits += shard.hits.load(Ordering::Relaxed);
             stats.misses += shard.misses.load(Ordering::Relaxed);
         }
-        
+
         let total = stats.hits + stats.misses;
         stats.hit_rate = if total > 0 {
             stats.hits as f64 / total as f64
         } else {
             0.0
         };
-        
+
         stats
     }
 }

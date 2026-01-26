@@ -1,8 +1,8 @@
 //! SSTable types and configuration
 
-use std::path::PathBuf;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub const SSTABLE_MAGIC: &[u8; 8] = b"HANSHIRO";
 pub const SSTABLE_VERSION: u32 = 1;
@@ -46,7 +46,7 @@ impl SSTableInfo {
     pub fn min_key_bytes(&self) -> Bytes {
         Bytes::copy_from_slice(&self.min_key)
     }
-    
+
     pub fn max_key_bytes(&self) -> Bytes {
         Bytes::copy_from_slice(&self.max_key)
     }
