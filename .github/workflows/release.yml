@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Required for gxhash on x86_64
+  RUSTFLAGS: "-C target-feature=+aes,+sse2"
 
 jobs:
   test:

@@ -10,13 +10,13 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0
+  # Required for gxhash on x86_64
+  RUSTFLAGS: "-C target-feature=+aes,+sse2"
 
 jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: "-C target-feature=+aes,+sse2"
     steps:
       - uses: actions/checkout@v4
 
@@ -41,8 +41,6 @@ jobs:
     name: Test (Linux)
     needs: check
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: "-C target-feature=+aes,+sse2"
     steps:
       - uses: actions/checkout@v4
 
@@ -62,6 +60,9 @@ jobs:
     name: Test (macOS)
     needs: check
     runs-on: macos-latest
+    env:
+      # Override global RUSTFLAGS - ARM has AES by default
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -80,8 +81,6 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: "-C target-feature=+aes,+sse2"
     steps:
       - uses: actions/checkout@v4
 
