@@ -279,7 +279,7 @@ impl SSTableReader {
     }
 
     /// Create iterator over all entries
-    pub fn iter(&self) -> SSTableIterator {
+    pub fn iter(&self) -> SSTableIterator<'_> {
         SSTableIterator::new(self)
     }
 
