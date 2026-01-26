@@ -1,6 +1,6 @@
 //! # TurboKV
 //!
-//! A fast, embedded key-value store with BTreeMap-like API.
+//! A fast, embedded key-value store with a BTreeMap-like API.
 //!
 //! TurboKV achieves **2x faster** durable writes than RocksDB and fjall through
 //! careful optimization. See the [`optimizations`] module for details.
@@ -11,47 +11,37 @@
 //! use turbokv::{Db, DbOptions};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Open with default options (durable)
 //! let db = Db::open("./my_data").await?;
 //!
-//! // Insert key-value pairs
 //! db.insert(b"hello", b"world").await?;
 //! db.insert(b"foo", b"bar").await?;
 //!
-//! // Get values
 //! if let Some(value) = db.get(b"hello").await? {
 //!     println!("Got: {:?}", String::from_utf8_lossy(&value));
 //! }
 //!
-//! // Delete keys
 //! db.remove(b"hello").await?;
 //!
-//! // Range scan
 //! for (key, value) in db.range(b"a", b"z").await? {
-//!     println!("{:?} -> {:?}", key, value);
-//! }
-//!
-//! // Prefix scan
-//! for (key, value) in db.scan_prefix(b"user:").await? {
 //!     println!("{:?} -> {:?}", key, value);
 //! }
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! ## Configuration
+//! ## Durability Modes
 //!
 //! ```rust,no_run
 //! use turbokv::{Db, DbOptions};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Fast mode - no WAL, no fsync (for benchmarks/non-critical data)
+//! // Fast: no WAL, no fsync (for caches, temporary data)
 //! let db = Db::open_with_options("./data", DbOptions::fast()).await?;
 //!
-//! // Durable mode - WAL enabled, no sync per write (survives process crash)
+//! // Durable: WAL enabled, periodic sync (survives process crash)
 //! let db = Db::open_with_options("./data", DbOptions::durable()).await?;
 //!
-//! // Paranoid mode - WAL enabled, fsync on every write (survives power loss)
+//! // Paranoid: WAL + fsync every write (survives power loss)
 //! let db = Db::open_with_options("./data", DbOptions::paranoid()).await?;
 //! # Ok(())
 //! # }
@@ -60,12 +50,11 @@
 //! ## Batch Operations
 //!
 //! ```rust,no_run
-//! use turbokv::{Db, DbOptions, WriteBatch};
+//! use turbokv::{Db, WriteBatch};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let db = Db::open("./data").await?;
 //!
-//! // Atomic batch write
 //! let mut batch = WriteBatch::new();
 //! batch.put(b"key1", b"value1");
 //! batch.put(b"key2", b"value2");
@@ -75,50 +64,21 @@
 //! # }
 //! ```
 
-// Core types and traits
 pub mod core;
-
-// Storage engine implementation
+pub mod optimizations;
 pub mod storage;
 
-// Performance optimization documentation
-pub mod optimizations;
-
-// ============================================================================
-// Public API - Primary exports
-// ============================================================================
-
-// Database API (main interface)
+// Primary API
+pub use core::types::{CompactionStyle, Compression, DbConfig, WriteBatch};
 pub use storage::db::{Db, DbError, DbOptions, DbStats};
 
-// Write batch for atomic operations
-pub use core::types::WriteBatch;
-
-// Configuration
-pub use core::types::{CompactionStyle, Compression, DbConfig};
-
-// ============================================================================
-// Advanced API - For power users
-// ============================================================================
-
-// Storage engine (low-level)
-pub use storage::engine::Result as StorageResult;
-pub use storage::engine::{Engine, StorageConfig, StorageError};
-
-// WAL
+// Advanced API
+pub use core::crypto::{crc32_checksum, MerkleChain, MerkleNode};
+pub use storage::compaction::CompactionConfig;
+pub use storage::engine::{Engine, Result as StorageResult, StorageConfig, StorageError};
+pub use storage::memtable::{MemTableConfig, MemTableManager};
+pub use storage::sstable::{SSTableConfig, SSTableInfo};
 pub use storage::wal::{WalConfig, WriteAheadLog};
 
-// MemTable
-pub use storage::memtable::{MemTableConfig, MemTableManager};
-
-// SSTable
-pub use storage::sstable::{SSTableConfig, SSTableInfo};
-
-// Compaction
-pub use storage::compaction::CompactionConfig;
-
-// Cryptographic utilities
-pub use core::crypto::{crc32_checksum, MerkleChain, MerkleNode};
-
-/// Library version
+/// Library version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -1,29 +1,10 @@
-//! # TurboKV Storage Engine
-//!
 //! LSM-tree based storage engine optimized for high write throughput.
 //!
-//! ## Architecture Overview
+//! ## Architecture
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                      Write Path                              │
-//! │                                                              │
-//! │  Incoming Write ──> WAL (Optional) ──> MemTable             │
-//! │                      │                       │               │
-//! │                      ▼                       ▼               │
-//! │                   Persist                 Flush to           │
-//! │                   to Disk                 SSTable            │
-//! └─────────────────────────────────────────────────────────────┘
-//!
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                      Read Path                               │
-//! │                                                              │
-//! │  Query ──> Check MemTable ──> Check SSTables (newest first) │
-//! │              │                    │                          │
-//! │              ▼                    ▼                          │
-//! │           Hot Data            Bloom Filters                  │
-//! │           (Fast)              (Skip files)                   │
-//! └─────────────────────────────────────────────────────────────┘
+//! Write Path: Incoming Write -> WAL (Optional) -> MemTable -> SSTable
+//! Read Path:  Query -> MemTable -> SSTables (newest first, with Bloom filters)
 //! ```
 
 pub mod buffer_pool;
@@ -40,35 +21,14 @@ pub mod partitioning;
 pub mod sstable;
 pub mod wal;
 
-// Primary API - use this for most applications
-pub use db::{Db, DbError, DbOptions, DbStats, Result as DbResult};
-
-// Engine exports (lower-level API)
-pub use engine::{Engine, Result as StorageResult, StorageConfig, StorageError};
-
-// WAL exports
-pub use wal::{WalConfig, WalEntry, WalError, WriteAheadLog};
-
-// MemTable exports
-pub use memtable::{MemTable, MemTableConfig, MemTableEntry, MemTableManager};
-
-// SSTable exports
-pub use sstable::{SSTableConfig, SSTableInfo, SSTableReader, SSTableWriter};
-
-// Compaction exports
-pub use compaction::{CompactionConfig, Compactor};
-
-// Cache exports
-pub use cache::{BlockCache, CacheKey, CacheStats};
-
-// FD management exports
-pub use fd::{FdConfig, FdMonitor, FdStats, SSTablePool};
-
-// Buffer pool exports (optimization for high-throughput writes)
 pub use buffer_pool::{BufferPool, PooledBuffer};
-
-// Direct I/O exports (bypass OS cache)
+pub use cache::{BlockCache, CacheKey, CacheStats};
+pub use compaction::{CompactionConfig, Compactor};
+pub use db::{Db, DbError, DbOptions, DbStats, Result as DbResult};
 pub use direct_io::{AlignedBuffer, DirectIoConfig, DirectIoWriter};
-
-// Prefix bloom filter exports
+pub use engine::{Engine, Result as StorageResult, StorageConfig, StorageError};
+pub use fd::{FdConfig, FdMonitor, FdStats, SSTablePool};
+pub use memtable::{MemTable, MemTableConfig, MemTableEntry, MemTableManager};
 pub use sstable::bloom::PrefixBloomFilter;
+pub use sstable::{SSTableConfig, SSTableInfo, SSTableReader, SSTableWriter};
+pub use wal::{WalConfig, WalEntry, WalError, WriteAheadLog};

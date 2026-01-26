@@ -1,4 +1,4 @@
-//! Unit tests for TurboKV core types
+//! Unit tests for TurboKV core types.
 
 use turbokv::core::types::{
     BatchOp, CompactionResult, CompactionStyle, Compression, DbConfig, StorageStats, WriteBatch,
@@ -132,11 +132,9 @@ mod crypto_tests {
         let node2 = chain.add(b"data2");
         let node3 = chain.add(b"data3");
 
-        // Each hash should be different
         assert_ne!(node1.hash, node2.hash);
         assert_ne!(node2.hash, node3.hash);
 
-        // Chain should link properly
         assert!(node1.prev_hash.is_none());
         assert_eq!(node2.prev_hash, Some(node1.hash.clone()));
         assert_eq!(node3.prev_hash, Some(node2.hash.clone()));
@@ -150,7 +148,6 @@ mod crypto_tests {
         let node1a = chain1.add(b"same data");
         let node1b = chain2.add(b"same data");
 
-        // Same input should produce same output
         assert_eq!(node1a.data_hash, node1b.data_hash);
     }
 }
@@ -179,7 +176,9 @@ mod error_tests {
 
     #[test]
     fn test_error_is_recoverable() {
-        let recoverable = Error::QueryTimeout { seconds: 30 };
+        let recoverable = Error::ResourceExhausted {
+            resource: "memory".to_string(),
+        };
         assert!(recoverable.is_recoverable());
 
         let non_recoverable = Error::TamperingDetected { position: 0 };
