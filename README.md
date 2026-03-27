@@ -3,7 +3,7 @@
 
 **A fast, embedded key-value store in Rust**
 
-[![Build Status](https://github.com/hanshiro-dev/turbokv/workflows/CI/badge.svg)](https://github.com/hanshiro-dev/turbokv/actions)
+[![Codeberg](https://img.shields.io/badge/repo-Codeberg-blue.svg)](https://codeberg.org/hanshiro-dev/turbokv)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
