@@ -94,7 +94,7 @@ impl DbOptions {
             sync_writes: false,
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
-            compression: Compression::Snappy,
+            compression: Compression::Lz4,
         }
     }
 
@@ -113,7 +113,7 @@ impl DbOptions {
             sync_writes: false,
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
-            compression: Compression::Snappy,
+            compression: Compression::Lz4,
         }
     }
 
@@ -132,7 +132,7 @@ impl DbOptions {
             sync_writes: true,
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
-            compression: Compression::Snappy,
+            compression: Compression::Lz4,
         }
     }
 
