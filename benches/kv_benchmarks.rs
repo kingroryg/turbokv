@@ -97,7 +97,7 @@ fn bench_turbokv_sequential_writes(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(120)); // Allow 2 min per benchmark
 
-    // Fast mode - no WAL, no sync (10K writes)
+    // Fast mode - no WAL, no sync (10M writes)
     group.throughput(Throughput::Elements(WRITE_COUNT as u64));
     group.bench_function("fast", |b| {
         b.iter(|| {
@@ -115,7 +115,7 @@ fn bench_turbokv_sequential_writes(c: &mut Criterion) {
         });
     });
 
-    // Durable mode - WAL enabled, no sync (1K writes)
+    // Durable mode - WAL enabled, no sync (10M writes)
     group.throughput(Throughput::Elements(WRITE_COUNT_WAL as u64));
     group.bench_function("durable", |b| {
         b.iter(|| {
@@ -168,7 +168,7 @@ fn bench_turbokv_random_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("turbokv_random_writes");
     group.sample_size(10);
 
-    // Fast mode - random order writes (10K)
+    // Fast mode - random order writes (10M)
     group.throughput(Throughput::Elements(WRITE_COUNT as u64));
     group.bench_function("fast", |b| {
         b.iter(|| {
@@ -186,7 +186,7 @@ fn bench_turbokv_random_writes(c: &mut Criterion) {
         });
     });
 
-    // Durable mode - random order writes (1K)
+    // Durable mode - random order writes (10M)
     group.throughput(Throughput::Elements(WRITE_COUNT_WAL as u64));
     group.bench_function("durable", |b| {
         b.iter(|| {
