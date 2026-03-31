@@ -140,11 +140,19 @@ pub fn open_with_direct_io<P: AsRef<Path>>(
 /// Aligned buffer for direct I/O writes
 ///
 /// Direct I/O requires memory buffers to be aligned to the filesystem's
-/// block size (typically 4KB).
+/// block size (typically 4KB). Memory is manually managed to ensure the
+/// deallocation layout matches the allocation layout exactly.
 pub struct AlignedBuffer {
-    data: Vec<u8>,
+    ptr: *mut u8,
+    len: usize,
+    capacity: usize,
+    layout: std::alloc::Layout,
     alignment: usize,
 }
+
+// Safety: The buffer owns its allocation and access is governed by &/&mut references.
+unsafe impl Send for AlignedBuffer {}
+unsafe impl Sync for AlignedBuffer {}
 
 impl AlignedBuffer {
     /// Create a new aligned buffer with the specified capacity
@@ -152,19 +160,23 @@ impl AlignedBuffer {
         // Round up capacity to alignment
         let aligned_capacity = (capacity + alignment - 1) & !(alignment - 1);
 
-        // Allocate with extra space for alignment
-        let layout =
-            std::alloc::Layout::from_size_align(aligned_capacity + alignment, alignment).unwrap();
+        let layout = std::alloc::Layout::from_size_align(aligned_capacity, alignment).unwrap();
 
-        let data = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout);
-            if ptr.is_null() {
+        let ptr = unsafe {
+            let p = std::alloc::alloc_zeroed(layout);
+            if p.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            Vec::from_raw_parts(ptr, 0, aligned_capacity)
+            p
         };
 
-        Self { data, alignment }
+        Self {
+            ptr,
+            len: 0,
+            capacity: aligned_capacity,
+            layout,
+            alignment,
+        }
     }
 
     /// Get the alignment
@@ -174,46 +186,90 @@ impl AlignedBuffer {
 
     /// Check if the buffer's data pointer is properly aligned
     pub fn is_aligned(&self) -> bool {
-        self.data.as_ptr() as usize % self.alignment == 0
-    }
-
-    /// Get a mutable reference to the inner Vec
-    pub fn as_mut_vec(&mut self) -> &mut Vec<u8> {
-        &mut self.data
+        self.ptr as usize % self.alignment == 0
     }
 
     /// Get the data as a slice
     pub fn as_slice(&self) -> &[u8] {
-        &self.data
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
     /// Clear the buffer
     pub fn clear(&mut self) {
-        self.data.clear();
+        self.len = 0;
     }
 
-    /// Extend the buffer, padding to alignment if needed
+    /// Extend the buffer with data, growing if necessary
     pub fn extend_aligned(&mut self, data: &[u8]) {
-        self.data.extend_from_slice(data);
+        let new_len = self.len + data.len();
+        if new_len > self.capacity {
+            self.grow(new_len);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(self.len), data.len());
+        }
+        self.len = new_len;
     }
 
     /// Pad buffer to alignment boundary with zeros
     pub fn pad_to_alignment(&mut self) {
-        let remainder = self.data.len() % self.alignment;
+        let remainder = self.len % self.alignment;
         if remainder != 0 {
             let padding = self.alignment - remainder;
-            self.data.extend(std::iter::repeat(0u8).take(padding));
+            let new_len = self.len + padding;
+            if new_len > self.capacity {
+                self.grow(new_len);
+            }
+            unsafe {
+                std::ptr::write_bytes(self.ptr.add(self.len), 0, padding);
+            }
+            self.len = new_len;
         }
     }
 
     /// Get the length (including any padding)
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.len
     }
 
     /// Check if empty
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.len == 0
+    }
+
+    /// Grow the buffer to accommodate at least `min_capacity` bytes.
+    fn grow(&mut self, min_capacity: usize) {
+        // Double the capacity or use min_capacity, whichever is larger
+        let new_capacity = std::cmp::max(self.capacity * 2, min_capacity);
+        // Round up to alignment
+        let new_capacity = (new_capacity + self.alignment - 1) & !(self.alignment - 1);
+
+        let new_layout =
+            std::alloc::Layout::from_size_align(new_capacity, self.alignment).unwrap();
+
+        let new_ptr = unsafe {
+            let p = std::alloc::alloc_zeroed(new_layout);
+            if p.is_null() {
+                std::alloc::handle_alloc_error(new_layout);
+            }
+            // Copy existing data
+            std::ptr::copy_nonoverlapping(self.ptr, p, self.len);
+            // Free old allocation
+            std::alloc::dealloc(self.ptr, self.layout);
+            p
+        };
+
+        self.ptr = new_ptr;
+        self.capacity = new_capacity;
+        self.layout = new_layout;
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            std::alloc::dealloc(self.ptr, self.layout);
+        }
     }
 }
 
