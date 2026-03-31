@@ -1,12 +1,12 @@
 [package]
 name = "turbokv"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["kingroryg"]
 edition = "2021"
 rust-version = "1.80.0"
 license = "Apache-2.0"
-repository = "https://codeberg.org/hanshiro-dev/turbokv"
-homepage = "https://codeberg.org/hanshiro-dev/turbokv"
+repository = "https://codeberg.org/kingroryg/turbokv"
+homepage = "https://codeberg.org/kingroryg/turbokv"
 documentation = "https://docs.rs/turbokv"
 readme = "README.md"
 description = "A fast, embedded key-value store with BTreeMap-like API."

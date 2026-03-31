@@ -3,7 +3,7 @@
 
 **A fast, embedded key-value store in Rust**
 
-[![Codeberg](https://img.shields.io/badge/repo-Codeberg-blue.svg)](https://codeberg.org/hanshiro-dev/turbokv)
+[![Codeberg](https://img.shields.io/badge/repo-Codeberg-blue.svg)](https://codeberg.org/kingroryg/turbokv)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
@@ -49,7 +49,7 @@ Add TurboKV to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-turbokv = "0.2"
+turbokv = "0.4"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -207,7 +207,7 @@ TurboKV is optimized for high write throughput and outperforms both RocksDB and 
 | `scan_prefix(prefix)` | Scan all keys with prefix |
 | `range_iter(start, end)` | Range scan with guard-based value access |
 | `scan_prefix_iter(prefix)` | Prefix scan with guard-based value access |
-| `write_batch(batch)` | Atomic batch write |
+| `write_batch(batch)` | Batch write operations |
 | `flush()` | Flush memtable to disk |
 | `compact()` | Trigger manual compaction |
 | `stats()` | Get database statistics |
