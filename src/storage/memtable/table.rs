@@ -98,23 +98,24 @@ impl MemTable {
 
         let entry = MemTableEntry::new(value.to_vec(), sequence);
 
-        // Check if we're overwriting an existing entry
-        let was_tombstone = self
-            .data
-            .get(key)
-            .map(|e| e.value().is_tombstone())
-            .unwrap_or(false);
+        // Check if key already exists BEFORE inserting
+        let existing = self.data.get(key);
+        let was_existing = existing.is_some();
+        let was_tombstone = existing.map(|e| e.value().is_tombstone()).unwrap_or(false);
 
         self.data.insert(key.to_vec(), entry);
 
         self.size_bytes.fetch_add(entry_size, Ordering::Relaxed);
 
-        // Only increment entry count if this is a new key
-        if self.data.get(key).is_some() && was_tombstone {
+        if was_tombstone {
+            // Replacing a tombstone: reduce tombstone count, add to entry count
             self.tombstone_count.fetch_sub(1, Ordering::Relaxed);
-        } else {
+            self.entry_count.fetch_add(1, Ordering::Relaxed);
+        } else if !was_existing {
+            // New key: increment entry count
             self.entry_count.fetch_add(1, Ordering::Relaxed);
         }
+        // Overwrite of existing non-tombstone: don't change counts
 
         Ok(sequence)
     }

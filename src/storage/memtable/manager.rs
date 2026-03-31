@@ -123,15 +123,17 @@ impl MemTableManager {
 
     /// Flush thread-local buffer to main memtable
     fn flush_buffer(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let mut start_idx = 0;
         for _ in 0..5 {
             let active = self.active.read();
 
-            // Try to insert all entries
+            // Try to insert remaining entries
             let mut success = true;
-            for (key, value) in entries {
+            for (i, (key, value)) in entries[start_idx..].iter().enumerate() {
                 match active.insert(key, value) {
                     Ok(_) => {}
                     Err(MemTableError::Full) => {
+                        start_idx += i;
                         success = false;
                         break;
                     }
