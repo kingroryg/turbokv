@@ -66,7 +66,7 @@ pub struct DbOptions {
     pub memtable_size: usize,
     /// Block cache size in bytes (default: 64MB, 0 to disable)
     pub block_cache_size: usize,
-    /// Compression algorithm for SSTables (default: Snappy)
+    /// Compression algorithm for SSTables (default: Lz4)
     pub compression: Compression,
 }
 
@@ -74,10 +74,10 @@ impl Default for DbOptions {
     fn default() -> Self {
         Self {
             wal_enabled: true,
-            sync_writes: true,
+            sync_writes: false,  // Durable mode (periodic sync, not per-write)
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
-            compression: Compression::Snappy,
+            compression: Compression::Lz4,  // Match README
         }
     }
 }
