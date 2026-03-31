@@ -23,6 +23,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::core::crypto::crc32_checksum;
 use crate::core::error::{Error, Result};
 
 const MANIFEST_MAGIC: &[u8; 8] = b"HNSHMNFT";
@@ -82,11 +83,40 @@ impl Manifest {
 
     /// Load manifest from file
     pub fn load(path: &Path) -> Result<Self> {
+        // Read entire file into memory for checksum verification
         let file = File::open(path).map_err(|e| Error::Io {
             message: format!("Failed to open manifest: {:?}", path),
             source: e,
         })?;
         let mut reader = BufReader::new(file);
+        let mut file_data = Vec::new();
+        reader.read_to_end(&mut file_data)?;
+
+        if file_data.len() < 4 {
+            return Err(Error::Internal {
+                message: "Manifest file too small".to_string(),
+            });
+        }
+
+        // Verify checksum: last 4 bytes are the CRC32, rest is the payload
+        let (payload, checksum_bytes) = file_data.split_at(file_data.len() - 4);
+        let stored_checksum = u32::from_le_bytes(
+            checksum_bytes
+                .try_into()
+                .expect("checksum slice is exactly 4 bytes"),
+        );
+        let computed_checksum = crc32_checksum(payload);
+        if stored_checksum != computed_checksum {
+            return Err(Error::Internal {
+                message: format!(
+                    "Manifest checksum mismatch: stored={:#010x}, computed={:#010x}",
+                    stored_checksum, computed_checksum
+                ),
+            });
+        }
+
+        // Now parse the payload
+        let mut reader = std::io::Cursor::new(payload);
 
         // Read and verify magic
         let mut magic = [0u8; 8];
@@ -128,10 +158,6 @@ impl Manifest {
             sstables.push(entry);
         }
 
-        // Read and verify checksum
-        let _stored_checksum = reader.read_u32::<LittleEndian>()?;
-        // TODO: Verify checksum
-
         info!(
             "Loaded manifest: version={}, wal_checkpoint={}, sstables={}",
             version,
@@ -152,44 +178,48 @@ impl Manifest {
         let manifest_path = data_dir.join("MANIFEST");
         let temp_path = data_dir.join("MANIFEST.tmp");
 
-        // Write to temp file
+        // Write all content to a buffer, compute CRC32, then write to file
         {
+            let mut buf: Vec<u8> = Vec::new();
+
+            // Write magic
+            buf.write_all(MANIFEST_MAGIC)?;
+
+            // Write version
+            buf.write_u32::<LittleEndian>(MANIFEST_VERSION)?;
+
+            // Write WAL checkpoint
+            buf.write_u64::<LittleEndian>(self.wal_checkpoint)?;
+
+            // Write checkpoint hash
+            if let Some(ref hash) = self.checkpoint_hash {
+                let hash_bytes = hash.as_bytes();
+                buf.write_u32::<LittleEndian>(hash_bytes.len() as u32)?;
+                buf.write_all(hash_bytes)?;
+            } else {
+                buf.write_u32::<LittleEndian>(0)?;
+            }
+
+            // Write SSTable count
+            buf.write_u32::<LittleEndian>(self.sstables.len() as u32)?;
+
+            // Write SSTable entries
+            for entry in &self.sstables {
+                Self::write_sstable_entry(&mut buf, entry)?;
+            }
+
+            // Compute CRC32 over all content and append it
+            let checksum = crc32_checksum(&buf);
+            buf.write_u32::<LittleEndian>(checksum)?;
+
+            // Write the complete buffer to the temp file
             let file = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .open(&temp_path)?;
             let mut writer = BufWriter::new(file);
-
-            // Write magic
-            writer.write_all(MANIFEST_MAGIC)?;
-
-            // Write version
-            writer.write_u32::<LittleEndian>(MANIFEST_VERSION)?;
-
-            // Write WAL checkpoint
-            writer.write_u64::<LittleEndian>(self.wal_checkpoint)?;
-
-            // Write checkpoint hash
-            if let Some(ref hash) = self.checkpoint_hash {
-                let hash_bytes = hash.as_bytes();
-                writer.write_u32::<LittleEndian>(hash_bytes.len() as u32)?;
-                writer.write_all(hash_bytes)?;
-            } else {
-                writer.write_u32::<LittleEndian>(0)?;
-            }
-
-            // Write SSTable count
-            writer.write_u32::<LittleEndian>(self.sstables.len() as u32)?;
-
-            // Write SSTable entries
-            for entry in &self.sstables {
-                Self::write_sstable_entry(&mut writer, entry)?;
-            }
-
-            // Write checksum (placeholder)
-            writer.write_u32::<LittleEndian>(0)?;
-
+            writer.write_all(&buf)?;
             writer.flush()?;
         }
 

@@ -99,7 +99,25 @@ impl SSTableReader {
             });
         }
 
-        let _checksum = cursor.read_u32::<LittleEndian>()?;
+        // Verify footer checksum
+        let stored_checksum = cursor.read_u32::<LittleEndian>()?;
+        let mut footer_hasher = crc32fast::Hasher::new();
+        footer_hasher.update(&index_offset.to_le_bytes());
+        footer_hasher.update(&index_size.to_le_bytes());
+        footer_hasher.update(&bloom_offset.to_le_bytes());
+        footer_hasher.update(&bloom_size.to_le_bytes());
+        footer_hasher.update(&magic);
+        footer_hasher.update(&version.to_le_bytes());
+        let computed_checksum = footer_hasher.finalize();
+        if stored_checksum != computed_checksum {
+            return Err(Error::SSTable {
+                message: format!(
+                    "Footer checksum mismatch: stored={:#010x}, computed={:#010x}",
+                    stored_checksum, computed_checksum
+                ),
+                source: None,
+            });
+        }
 
         // Load index
         let index_data = &mmap[index_offset as usize..(index_offset + index_size as u64) as usize];

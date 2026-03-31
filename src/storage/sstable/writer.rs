@@ -161,8 +161,15 @@ impl SSTableWriter {
         self.writer.write_all(SSTABLE_MAGIC)?;
         self.writer.write_u32::<LittleEndian>(SSTABLE_VERSION)?;
 
-        // Write checksum
-        let checksum = 0u32; // TODO: Calculate actual checksum over entire file
+        // Compute CRC32 over the footer fields (excluding the checksum itself)
+        let mut footer_hasher = crc32fast::Hasher::new();
+        footer_hasher.update(&index_offset.to_le_bytes());
+        footer_hasher.update(&index_size.to_le_bytes());
+        footer_hasher.update(&bloom_offset.to_le_bytes());
+        footer_hasher.update(&bloom_size.to_le_bytes());
+        footer_hasher.update(SSTABLE_MAGIC);
+        footer_hasher.update(&SSTABLE_VERSION.to_le_bytes());
+        let checksum = footer_hasher.finalize();
         self.writer.write_u32::<LittleEndian>(checksum)?;
 
         let file_size = self.file_offset + FOOTER_SIZE as u64;
