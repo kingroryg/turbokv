@@ -765,9 +765,12 @@ impl Engine {
                 .map_err(|e| StorageError::SSTable(format!("Failed to write entry: {}", e)))?;
         }
 
-        let info = writer
+        let mut info = writer
             .finish()
             .map_err(|e| StorageError::SSTable(format!("Failed to finish SSTable: {}", e)))?;
+
+        // Set the proper id (writer returns id: 0 as placeholder)
+        info.id = id;
 
         // Update manifest
         {
