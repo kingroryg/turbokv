@@ -321,10 +321,10 @@ impl PartialOrd for MergeEntry {
 
 impl Ord for MergeEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Compare by key, then by source (lower source = newer data in our case)
+        // Compare by key first, then by source index (higher source = newer data)
         match self.key.cmp(&other.key) {
-            std::cmp::Ordering::Equal => self.source.cmp(&other.source),
-            other => other,
+            std::cmp::Ordering::Equal => other.source.cmp(&self.source),
+            other_ord => other_ord,
         }
     }
 }
