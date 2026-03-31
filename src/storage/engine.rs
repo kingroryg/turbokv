@@ -643,10 +643,10 @@ impl Engine {
             if let Some((key, value)) = entry.decode_kv() {
                 match value {
                     Some(v) => {
-                        let _ = memtable_manager.insert(key, v);
+                        memtable_manager.insert(key, v).map_err(StorageError::MemTable)?;
                     }
                     None => {
-                        let _ = memtable_manager.delete(key);
+                        memtable_manager.delete(key).map_err(StorageError::MemTable)?;
                     }
                 }
                 count += 1;
