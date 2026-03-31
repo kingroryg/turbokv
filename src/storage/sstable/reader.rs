@@ -120,13 +120,34 @@ impl SSTableReader {
         }
 
         // Load index
-        let index_data = &mmap[index_offset as usize..(index_offset + index_size as u64) as usize];
+        let index_end = (index_offset + index_size as u64) as usize;
+        if index_end > mmap.len() {
+            return Err(Error::SSTable {
+                message: format!(
+                    "Index offset/size exceeds file: end={}, file_len={}",
+                    index_end,
+                    mmap.len()
+                ),
+                source: None,
+            });
+        }
+        let index_data = &mmap[index_offset as usize..index_end];
         let index = SSTableIndex::load(index_data)?;
 
         // Load bloom filter
         let bloom_filter = if bloom_size > 0 {
-            let bloom_data =
-                &mmap[bloom_offset as usize..(bloom_offset + bloom_size as u64) as usize];
+            let bloom_end = (bloom_offset + bloom_size as u64) as usize;
+            if bloom_end > mmap.len() {
+                return Err(Error::SSTable {
+                    message: format!(
+                        "Bloom filter offset/size exceeds file: end={}, file_len={}",
+                        bloom_end,
+                        mmap.len()
+                    ),
+                    source: None,
+                });
+            }
+            let bloom_data = &mmap[bloom_offset as usize..bloom_end];
             Some(Self::deserialize_bloom_filter(bloom_data)?)
         } else {
             None
@@ -218,6 +239,17 @@ impl SSTableReader {
 
         // Cache miss - read from mmap
         let block_end = offset + size as u64 - 5; // -5 for footer
+        let footer_end = (block_end + 5) as usize;
+        if footer_end > self.mmap.len() {
+            return Err(Error::SSTable {
+                message: format!(
+                    "Block offset/size exceeds file: end={}, file_len={}",
+                    footer_end,
+                    self.mmap.len()
+                ),
+                source: None,
+            });
+        }
         let block_data = &self.mmap[offset as usize..block_end as usize];
 
         // Read footer

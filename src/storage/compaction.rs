@@ -216,10 +216,17 @@ impl Compactor {
         let bytes_written = output_info.file_size;
 
         // Create manifest entry for output
+        // Extract the ID from the output path filename (already allocated by new_sstable_path)
+        // Filename format: {id}_{timestamp}.sst
+        let id = job
+            .output_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.split('_').next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
         let output_entry = SSTableManifestEntry {
-            id: self
-                .next_sstable_id
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            id,
             level: job.output_level,
             path: job.output_path,
             size: output_info.file_size,
