@@ -363,20 +363,18 @@ impl SSTableIndex {
             return None;
         }
 
-        // Find the first block whose last key is >= the search key
-        // Since blocks are sorted and non-overlapping, if key <= last_key of block i,
-        // then the key must be in block i (if it exists at all)
-        for entry in &self.entries {
-            if key <= entry.last_key.as_ref() {
-                return Some(BlockInfo {
-                    offset: entry.block_offset,
-                    size: entry.block_size,
-                });
-            }
-        }
+        // Binary search: find first block whose last_key >= key
+        let idx = self.entries.partition_point(|entry| entry.last_key.as_ref() < key);
 
-        // Key is larger than all block last keys
-        None
+        if idx < self.entries.len() {
+            let entry = &self.entries[idx];
+            Some(BlockInfo {
+                offset: entry.block_offset,
+                size: entry.block_size,
+            })
+        } else {
+            None
+        }
     }
 
     /// Get all entries (for iterator)
