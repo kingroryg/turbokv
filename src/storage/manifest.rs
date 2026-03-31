@@ -221,10 +221,19 @@ impl Manifest {
             let mut writer = BufWriter::new(file);
             writer.write_all(&buf)?;
             writer.flush()?;
+
+            // Fsync the temp file before rename to ensure data is durable
+            let file = writer.into_inner().map_err(|e| e.into_error())?;
+            file.sync_all()?;
         }
 
         // Atomic rename
         std::fs::rename(&temp_path, &manifest_path)?;
+
+        // Fsync directory to ensure the rename is durable
+        if let Ok(dir) = std::fs::File::open(data_dir) {
+            let _ = dir.sync_all();
+        }
 
         info!(
             "Saved manifest: wal_checkpoint={}, sstables={}",

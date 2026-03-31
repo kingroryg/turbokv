@@ -605,7 +605,7 @@ impl Engine {
         StorageStats {
             total_keys: memtable_keys + sstable_keys,
             total_bytes: memtable_bytes + sstable_bytes,
-            wal_size: 0, // Would need async for WAL size
+            wal_size: self.wal.as_ref().map(|w| w.current_size()).unwrap_or(0),
             sstable_count,
             memtable_size: memtable_stats.active.size_bytes as u64,
             compaction_pending: !memtable_stats.immutable.is_empty(),

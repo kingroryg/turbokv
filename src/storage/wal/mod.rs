@@ -414,6 +414,12 @@ impl WriteAheadLog {
         self.sequence.load(Ordering::SeqCst)
     }
 
+    /// Returns the current WAL file size in bytes (synchronous).
+    pub fn current_size(&self) -> u64 {
+        let file = self.current_file.read();
+        file.size
+    }
+
     // ========================================
     // Private methods
     // ========================================
