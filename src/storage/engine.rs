@@ -822,6 +822,14 @@ impl Engine {
 
         info!("Flushed memtable to SSTable: {:?}", path);
 
+        // Truncate old WAL files
+        if let Some(ref wal) = self.wal {
+            let checkpoint = wal.current_sequence();
+            if let Err(e) = wal.truncate(checkpoint).await {
+                tracing::warn!("Failed to truncate WAL: {}", e);
+            }
+        }
+
         Ok(info)
     }
 
