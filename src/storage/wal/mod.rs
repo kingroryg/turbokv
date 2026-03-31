@@ -194,7 +194,6 @@ impl WriteAheadLog {
             // Single write to file
             let mut file = self.current_file.write();
             file.file.write_all(&buf)?;
-            file.file.flush()?; // Ensure data reaches OS (survives process crash)
             file.size += entry_bytes;
             file.entry_count += 1;
             file.last_sequence = sequence;
@@ -221,14 +220,13 @@ impl WriteAheadLog {
 
         let mut file = self.current_file.write();
         write_entry(&mut file.file, entry)?;
-        file.file.flush()?; // Ensure data reaches OS (survives process crash)
         file.size += entry_bytes;
         file.entry_count += 1;
         file.last_sequence = entry.sequence;
 
         if sync {
-            // Paranoid mode: also fsync to disk (survives power loss)
-            file.file.get_ref().sync_all()?;
+            // Paranoid mode: fsync to disk (survives power loss)
+            file.file.sync_all()?;
         }
         Ok(())
     }
@@ -336,9 +334,8 @@ impl WriteAheadLog {
     }
 
     pub async fn flush(&self) -> Result<()> {
-        let mut file = self.current_file.write();
-        file.file.flush()?;
-        file.file.get_ref().sync_all()?;
+        let file = self.current_file.write();
+        file.file.sync_all()?;
         Ok(())
     }
 
@@ -499,8 +496,7 @@ impl WriteAheadLog {
         }
 
         if self.config.sync_on_write {
-            f.file.flush()?;
-            f.file.get_ref().sync_all()?;
+            f.file.sync_all()?;
         }
         Ok(())
     }
@@ -658,8 +654,7 @@ fn write_batch_sync(
     }
 
     if config.sync_on_write {
-        f.file.flush()?;
-        f.file.get_ref().sync_all()?;
+        f.file.sync_all()?;
     }
     Ok(())
 }

@@ -4,7 +4,7 @@
 //!
 //! - **write_entries_batch()** - Vectorized batch write that pre-allocates buffer
 //!   and writes all entries in a single syscall
-//! - **BufWriter::with_capacity()** - Configurable write buffering
+//! - **Direct File I/O** - Writes go straight to kernel buffer (no userspace buffering)
 //!
 //! ## WAL Entry Format (v3)
 //!
@@ -19,7 +19,7 @@
 //! Payload: variable length
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -33,7 +33,7 @@ use super::types::*;
 /// In-memory representation of an open WAL file
 pub(crate) struct WalFile {
     pub path: PathBuf,
-    pub file: BufWriter<File>,
+    pub file: File,
     pub size: u64,
     pub entry_count: u64,
     #[allow(dead_code)]
@@ -42,7 +42,7 @@ pub(crate) struct WalFile {
 }
 
 /// Create a new WAL file
-pub(crate) fn create_file(wal_dir: &Path, sequence: u64, config: &WalConfig) -> Result<WalFile> {
+pub(crate) fn create_file(wal_dir: &Path, sequence: u64, _config: &WalConfig) -> Result<WalFile> {
     let filename = format!("{:020}.wal", sequence);
     let path = wal_dir.join(&filename);
 
@@ -52,27 +52,26 @@ pub(crate) fn create_file(wal_dir: &Path, sequence: u64, config: &WalConfig) -> 
         .read(true)
         .open(&path)?;
 
-    let mut writer = BufWriter::with_capacity(config.buffer_size, file);
+    let mut file = file;
 
     // Write header
-    writer.write_all(WAL_MAGIC)?;
-    writer.write_u32::<LittleEndian>(WAL_VERSION)?;
-    writer.write_u64::<LittleEndian>(
+    file.write_all(WAL_MAGIC)?;
+    file.write_u32::<LittleEndian>(WAL_VERSION)?;
+    file.write_u64::<LittleEndian>(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
     )?;
-    writer.write_u64::<LittleEndian>(sequence)?; // First sequence
-    writer.write_u64::<LittleEndian>(sequence)?; // Last sequence (updated on finalize)
-    writer.write_u64::<LittleEndian>(0)?; // Entry count
-    writer.write_u32::<LittleEndian>(0)?; // Checksum placeholder
-    writer.write_all(&[0u8; 16])?; // Reserved
-    writer.flush()?;
+    file.write_u64::<LittleEndian>(sequence)?; // First sequence
+    file.write_u64::<LittleEndian>(sequence)?; // Last sequence (updated on finalize)
+    file.write_u64::<LittleEndian>(0)?; // Entry count
+    file.write_u32::<LittleEndian>(0)?; // Checksum placeholder
+    file.write_all(&[0u8; 16])?; // Reserved
 
     Ok(WalFile {
         path,
-        file: writer,
+        file,
         size: WAL_HEADER_SIZE as u64,
         entry_count: 0,
         first_sequence: sequence,
@@ -81,7 +80,7 @@ pub(crate) fn create_file(wal_dir: &Path, sequence: u64, config: &WalConfig) -> 
 }
 
 /// Recover a WAL file, returning the file handle and last sequence
-pub(crate) fn recover_file(path: &Path, config: &WalConfig) -> Result<(WalFile, u64)> {
+pub(crate) fn recover_file(path: &Path, _config: &WalConfig) -> Result<(WalFile, u64)> {
     info!("Recovering from WAL file: {:?}", path);
 
     let file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -134,12 +133,10 @@ pub(crate) fn recover_file(path: &Path, config: &WalConfig) -> Result<(WalFile, 
     let file_size = reader.seek(SeekFrom::End(0))?;
     let mut file = reader.into_inner();
     file.seek(SeekFrom::End(0))?;
-    let writer = BufWriter::with_capacity(config.buffer_size, file);
-
     Ok((
         WalFile {
             path: path.to_path_buf(),
-            file: writer,
+            file,
             size: file_size,
             entry_count,
             first_sequence,
@@ -151,8 +148,7 @@ pub(crate) fn recover_file(path: &Path, config: &WalConfig) -> Result<(WalFile, 
 
 /// Update header with final sequence/count before rotation
 pub(crate) fn finalize_header(wal_file: &mut WalFile) -> Result<()> {
-    wal_file.file.flush()?;
-    let file = wal_file.file.get_mut();
+    let file = &mut wal_file.file;
 
     file.seek(SeekFrom::Start(28))?; // Offset of last_sequence
     file.write_u64::<LittleEndian>(wal_file.last_sequence)?;
