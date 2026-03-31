@@ -18,7 +18,7 @@ TurboKV is a high-performance, embedded key-value database written in Rust. It p
 - **Configurable Durability**: Choose between fast, durable, or paranoid modes
 - **LSM-Tree Architecture**: Optimized for write-heavy workloads
 - **Async/Await**: Built on Tokio for modern async Rust
-- **Batch Operations**: Atomic write batches for transactional writes
+- **Batch Operations**: Write batches for grouped operations
 - **Range Scans**: Efficient prefix and range queries
 - **Block Cache**: Configurable caching for read performance
 - **Bloom Filters**: Fast negative lookups

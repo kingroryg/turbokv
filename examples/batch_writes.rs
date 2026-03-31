@@ -1,9 +1,9 @@
 #![allow(clippy::all, clippy::pedantic)]
-//! Atomic batch writes with TurboKV.
+//! Batch writes with TurboKV.
 //!
-//! WriteBatch allows multiple operations to be applied atomically -
-//! either all succeed or none do. This is essential for maintaining
-//! data consistency.
+//! WriteBatch groups multiple operations into a single write.
+//! The batch is written atomically to the WAL, but operations
+//! are applied sequentially to the memtable.
 //!
 //! Run with: `cargo run --example batch_writes`
 
@@ -24,9 +24,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     batch.put(b"user:1:email", b"alice@example.com");
     batch.put(b"user:1:role", b"admin");
 
-    // All three writes happen atomically
+    // All three writes are applied as a group
     db.write_batch(&batch).await?;
-    println!("Wrote user:1 data atomically ({} operations)", batch.len());
+    println!("Wrote user:1 data in a single batch ({} operations)", batch.len());
 
     // Verify
     for key in &[
@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     batch.delete(b"user:1:email");
 
     db.write_batch(&batch).await?;
-    println!("Updated and deleted fields atomically");
+    println!("Updated and deleted fields in a single batch");
 
     // Verify role was updated
     if let Some(value) = db.get(b"user:1:role").await? {
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     db.write_batch(&batch).await?;
-    println!("Wrote 100 items in a single atomic batch");
+    println!("Wrote 100 items in a single batch");
 
     // ============================================
     // Batch Reuse (clear and reuse)
@@ -114,21 +114,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================
     // Use Case: Transfer (Debit + Credit)
     // ============================================
-    println!("\n=== Use Case: Atomic Transfer ===");
+    println!("\n=== Use Case: Batched Transfer ===");
 
     // Initial balances
     db.insert(b"balance:alice", b"1000").await?;
     db.insert(b"balance:bob", b"500").await?;
 
     // Transfer $200 from Alice to Bob
-    // This must be atomic - we can't have money disappear!
+    // Batch ensures all writes go to the WAL together
     let mut transfer = WriteBatch::new();
     transfer.put(b"balance:alice", b"800"); // 1000 - 200
     transfer.put(b"balance:bob", b"700"); // 500 + 200
     transfer.put(b"tx:001", b"alice->bob:200"); // Audit trail
 
     db.write_batch(&transfer).await?;
-    println!("Transferred $200 from Alice to Bob atomically");
+    println!("Transferred $200 from Alice to Bob in a single batch");
 
     // Verify
     if let Some(alice) = db.get(b"balance:alice").await? {

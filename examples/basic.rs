@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // INSERT - Add key-value pairs
     // ============================================
     db.insert(b"name", b"TurboKV").await?;
-    db.insert(b"version", b"0.2.1").await?;
+    db.insert(b"version", b"0.4.0").await?;
     db.insert(b"language", b"Rust").await?;
     println!("Inserted 3 key-value pairs");
 
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================
     // UPDATE - Overwrite existing values
     // ============================================
-    db.insert(b"version", b"0.3.0").await?;
+    db.insert(b"version", b"0.4.1").await?;
     if let Some(value) = db.get(b"version").await? {
         println!("Updated version = {}", String::from_utf8_lossy(&value));
     }
