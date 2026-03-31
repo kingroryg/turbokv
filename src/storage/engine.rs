@@ -680,6 +680,14 @@ impl Engine {
         start: &[u8],
         end: &[u8],
     ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        // Skip SSTable if its key range doesn't overlap with query range
+        if !sst.min_key.is_empty() && sst.min_key.as_slice() >= end {
+            return Ok(Vec::new());
+        }
+        if !sst.max_key.is_empty() && sst.max_key.as_slice() < start {
+            return Ok(Vec::new());
+        }
+
         let reader = self
             .sstable_pool
             .get(&sst.path)
@@ -710,6 +718,11 @@ impl Engine {
         sst: &SSTableInfo,
         prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        // Skip SSTable if all its keys are before the prefix range
+        if !sst.max_key.is_empty() && sst.max_key.as_slice() < prefix {
+            return Ok(Vec::new());
+        }
+
         let reader = self
             .sstable_pool
             .get(&sst.path)
