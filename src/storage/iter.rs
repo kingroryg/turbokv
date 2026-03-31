@@ -1,12 +1,15 @@
 //! # Guard Iterators for TurboKV
 //!
-//! Provides lazy value loading through guard-based iteration.
+//! Provides guard-based iteration over scan results.
 //!
 //! ## Benefits
 //!
-//! - **Scan keys without loading values**: Count keys, filter by key pattern
-//! - **Selective value loading**: Only load values you need
-//! - **Reduced I/O**: Skip expensive blob/SSTable reads for filtered keys
+//! - **Scan keys without consuming values**: Count keys, filter by key pattern
+//! - **Selective value access**: Only access values you need
+//! - **Efficient filtering**: Skip entries by key pattern without allocating
+//!
+//! Note: Values are currently pre-loaded. Future versions may implement
+//! true lazy loading from disk for large value workloads.
 //!
 //! ## Example
 //!

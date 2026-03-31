@@ -205,8 +205,8 @@ TurboKV is optimized for high write throughput and outperforms both RocksDB and 
 | `contains_key(key)` | Check if key exists |
 | `range(start, end)` | Scan keys in range [start, end) |
 | `scan_prefix(prefix)` | Scan all keys with prefix |
-| `range_iter(start, end)` | Range scan with lazy value loading |
-| `scan_prefix_iter(prefix)` | Prefix scan with lazy value loading |
+| `range_iter(start, end)` | Range scan with guard-based value access |
+| `scan_prefix_iter(prefix)` | Prefix scan with guard-based value access |
 | `write_batch(batch)` | Atomic batch write |
 | `flush()` | Flush memtable to disk |
 | `compact()` | Trigger manual compaction |
