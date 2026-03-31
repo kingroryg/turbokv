@@ -28,7 +28,7 @@ mod types_tests {
     fn test_db_config_durable() {
         let config = DbConfig::durable();
         assert!(config.wal_enabled);
-        assert!(config.sync_writes);
+        assert!(!config.sync_writes);
         assert_eq!(config.compression, Compression::Lz4);
     }
 

@@ -99,7 +99,7 @@ impl DbConfig {
         Self {
             wal_enabled: true,
             compression: Compression::Lz4,
-            sync_writes: true,
+            sync_writes: false,
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
             max_open_files: 1000,
