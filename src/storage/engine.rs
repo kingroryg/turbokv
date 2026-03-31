@@ -770,6 +770,9 @@ impl Engine {
             .join("L0")
             .join(format!("{:010}.sst", id));
 
+        // Snapshot WAL sequence before flush (not live counter which advances during flush)
+        let flush_checkpoint = self.wal.as_ref().map(|w| w.current_sequence()).unwrap_or(0);
+
         // Get all entries from memtable
         let entries = memtable.get_all_kv();
 
@@ -807,11 +810,7 @@ impl Engine {
                 creation_time: info.creation_time,
                 level: 0,
             });
-            manifest.wal_checkpoint = if let Some(ref wal) = self.wal {
-                wal.current_sequence()
-            } else {
-                0
-            };
+            manifest.wal_checkpoint = flush_checkpoint;
             manifest
                 .save(&self.config.data_dir)
                 .map_err(|e| StorageError::Manifest(e.to_string()))?;
@@ -831,8 +830,7 @@ impl Engine {
 
         // Truncate old WAL files
         if let Some(ref wal) = self.wal {
-            let checkpoint = wal.current_sequence();
-            if let Err(e) = wal.truncate(checkpoint).await {
+            if let Err(e) = wal.truncate(flush_checkpoint).await {
                 tracing::warn!("Failed to truncate WAL: {}", e);
             }
         }
@@ -1050,6 +1048,9 @@ impl BackgroundEngine {
             .join("L0")
             .join(format!("{:010}.sst", id));
 
+        // Snapshot WAL sequence before flush (not live counter which advances during flush)
+        let flush_checkpoint = self.wal.as_ref().map(|w| w.current_sequence()).unwrap_or(0);
+
         let entries = memtable.get_all_kv();
 
         let mut writer =
@@ -1084,11 +1085,7 @@ impl BackgroundEngine {
                 creation_time: info.creation_time,
                 level: 0,
             });
-            manifest.wal_checkpoint = if let Some(ref wal) = self.wal {
-                wal.current_sequence()
-            } else {
-                0
-            };
+            manifest.wal_checkpoint = flush_checkpoint;
             manifest
                 .save(&self.config.data_dir)
                 .map_err(|e| StorageError::Manifest(e.to_string()))?;
@@ -1107,8 +1104,7 @@ impl BackgroundEngine {
 
         // Truncate old WAL files
         if let Some(ref wal) = self.wal {
-            let checkpoint = wal.current_sequence();
-            if let Err(e) = wal.truncate(checkpoint).await {
+            if let Err(e) = wal.truncate(flush_checkpoint).await {
                 tracing::warn!("Failed to truncate WAL: {}", e);
             }
         }

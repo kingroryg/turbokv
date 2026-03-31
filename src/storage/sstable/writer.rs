@@ -175,6 +175,8 @@ impl SSTableWriter {
         let file_size = self.file_offset + FOOTER_SIZE as u64;
 
         self.writer.flush()?;
+        // Fsync to ensure SSTable data is on disk before manifest references it
+        self.writer.get_ref().sync_all()?;
 
         info!(
             "Finished writing SSTable: {} entries, {} bytes",
