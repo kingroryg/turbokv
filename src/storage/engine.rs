@@ -1063,9 +1063,12 @@ impl BackgroundEngine {
                 .map_err(|e| StorageError::SSTable(format!("Failed to write entry: {}", e)))?;
         }
 
-        let info = writer
+        let mut info = writer
             .finish()
             .map_err(|e| StorageError::SSTable(format!("Failed to finish SSTable: {}", e)))?;
+
+        // Set the proper id (writer returns id: 0 as placeholder)
+        info.id = id;
 
         {
             let mut manifest = self.manifest.lock();
@@ -1101,6 +1104,14 @@ impl BackgroundEngine {
         self.sstable_count.fetch_add(1, Ordering::Relaxed);
 
         info!("Background flushed memtable to SSTable: {:?}", path);
+
+        // Truncate old WAL files
+        if let Some(ref wal) = self.wal {
+            let checkpoint = wal.current_sequence();
+            if let Err(e) = wal.truncate(checkpoint).await {
+                tracing::warn!("Failed to truncate WAL: {}", e);
+            }
+        }
 
         Ok(info)
     }
