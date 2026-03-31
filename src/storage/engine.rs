@@ -412,19 +412,19 @@ impl Engine {
 
         let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
 
-        // Get from memtable
-        for (key, value) in self.memtable_manager.range(start, end) {
-            merged.insert(key, Some(value));
-        }
-
-        // Get from SSTables (oldest first, newer overrides)
+        // Get from SSTables first (older data)
         let sstables = self.sstables.read().await;
         for sst in sstables.iter() {
-            if let Ok(entries) = self.range_from_sstable(sst, start, end).await {
-                for (key, value) in entries {
-                    merged.insert(key, value);
-                }
+            let entries = self.range_from_sstable(sst, start, end).await?;
+            for (key, value) in entries {
+                merged.insert(key, value);
             }
+        }
+        drop(sstables);
+
+        // Get from memtable last (newer data overrides SSTables)
+        for (key, value) in self.memtable_manager.range(start, end) {
+            merged.insert(key, Some(value));
         }
 
         // Filter out tombstones
@@ -447,19 +447,19 @@ impl Engine {
 
         let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
 
-        // Get from memtable
-        for (key, value) in self.memtable_manager.scan_prefix(prefix) {
-            merged.insert(key, Some(value));
-        }
-
-        // Get from SSTables
+        // Get from SSTables first (older data)
         let sstables = self.sstables.read().await;
         for sst in sstables.iter() {
-            if let Ok(entries) = self.prefix_from_sstable(sst, prefix).await {
-                for (key, value) in entries {
-                    merged.insert(key, value);
-                }
+            let entries = self.prefix_from_sstable(sst, prefix).await?;
+            for (key, value) in entries {
+                merged.insert(key, value);
             }
+        }
+        drop(sstables);
+
+        // Get from memtable last (newer data overrides SSTables)
+        for (key, value) in self.memtable_manager.scan_prefix(prefix) {
+            merged.insert(key, Some(value));
         }
 
         // Filter out tombstones
