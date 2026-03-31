@@ -667,7 +667,14 @@ impl Engine {
             .map_err(|e| StorageError::SSTable(e.to_string()))?;
 
         match reader.get(key) {
-            Ok(Some(value)) => Ok(Some(value.to_vec())),
+            Ok(Some(value)) => {
+                if value.is_empty() {
+                    // Empty value = tombstone in SSTable
+                    Ok(None)
+                } else {
+                    Ok(Some(value.to_vec()))
+                }
+            }
             Ok(None) => Ok(None),
             Err(e) => Err(StorageError::SSTable(e.to_string())),
         }
