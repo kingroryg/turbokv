@@ -3,7 +3,7 @@
 //! Tests with 10M keys, 400-byte values (4GB total)
 //! Comparable to RocksDB benchmark methodology
 //!
-//! Run with: cargo run --release --bin large_scale_bench
+//! Run with: cargo bench --bench large_scale_bench
 
 use fjall::{Config, PersistMode};
 use std::time::Instant;

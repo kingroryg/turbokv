@@ -60,7 +60,7 @@ pub enum DbError {
 pub struct DbOptions {
     /// Enable WAL for durability (default: true)
     pub wal_enabled: bool,
-    /// Sync writes immediately (default: true for durability)
+    /// Sync writes immediately (default: false for durable mode)
     pub sync_writes: bool,
     /// MemTable size in bytes before flush (default: 64MB)
     pub memtable_size: usize,

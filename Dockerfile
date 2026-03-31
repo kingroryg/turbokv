@@ -1,7 +1,7 @@
 # TurboKV Development Container
 # Used for CI testing and development
 
-FROM rust:1.75-slim
+FROM rust:1.80-slim
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \

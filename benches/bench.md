@@ -1,7 +1,7 @@
 # TurboKV Benchmark Results
 
 **System:** Apple Silicon M4 Mac (darwin 24.3.0) 16GB Memory
-**Rust:** 1.75+
+**Rust:** 1.80+
 
 ## Durability Modes
 
