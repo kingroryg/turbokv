@@ -100,7 +100,7 @@ use turbokv::{Db, WriteBatch};
 
 let db = Db::open("./my_data").await?;
 
-// Atomic batch write
+// Batch write (atomic in WAL, applied sequentially to memtable)
 let mut batch = WriteBatch::new();
 batch.put(b"key1", b"value1");
 batch.put(b"key2", b"value2");
