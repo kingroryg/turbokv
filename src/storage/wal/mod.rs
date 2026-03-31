@@ -677,7 +677,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    #[ignore = "WAL read-back timing issue under investigation - write path works correctly"]
     async fn test_wal_append_and_read() {
         let temp_dir = TempDir::new().unwrap();
         let config = WalConfig {
@@ -707,7 +706,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "WAL read-back timing issue under investigation - write path works correctly"]
     async fn test_wal_batch() {
         let temp_dir = TempDir::new().unwrap();
         let config = WalConfig {

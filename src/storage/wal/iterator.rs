@@ -62,13 +62,18 @@ impl Iterator for WalEntryIterator {
                     }
                     return Some(Ok(entry));
                 }
-                Err(_) => {
+                Err(ref e) if matches!(e, super::types::WalError::Eof) => {
+                    // End of this file, try next
                     if let Err(e) = self.open_next_file() {
                         return Some(Err(e));
                     }
                     if self.reader.is_none() {
                         return None;
                     }
+                }
+                Err(e) => {
+                    // Corrupted entry — report error to caller
+                    return Some(Err(e));
                 }
             }
         }

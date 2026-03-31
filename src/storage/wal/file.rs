@@ -124,7 +124,10 @@ pub(crate) fn recover_file(path: &Path, config: &WalConfig) -> Result<(WalFile, 
                 last_sequence = entry.sequence;
             }
             Err(WalError::Eof) => break,
-            Err(_) => break,
+            Err(e) => {
+                tracing::warn!("WAL recovery stopped at corrupted entry: {}", e);
+                break;
+            }
         }
     }
 
