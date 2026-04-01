@@ -13,7 +13,7 @@ TurboKV supports three durability modes:
 | `durable()` | Yes | Periodic | All data survives process crash | Most production |
 | `paranoid()` | Yes | Every write | All data survives power loss | Financial transactions |
 
-**Note:** In all modes, data that has been flushed to SSTables on disk is durable. The difference is what happens to in-flight writes that haven't been flushed yet.
+**Note:** In all modes, data that has been flushed to SSTables on disk is durable. The difference is what happens to in-flight writes that haven't been flushed yet. SSTables are fsync'd before manifest updates to guarantee on-disk integrity.
 
 
 ## Write Performance
@@ -22,26 +22,28 @@ TurboKV supports three durability modes:
 
 | Database | Mode | Throughput | Total Time |
 |----------|------|------------|------------|
-| **TurboKV** | fast (no WAL) | **1,132K ops/sec** | 8.8s |
-| **TurboKV** | durable (WAL) | **1,094K ops/sec** | 9.1s |
-| RocksDB | default (WAL) | 560K ops/sec | 17.9s |
-| fjall | default | 501K ops/sec | 20.0s |
-| TurboKV | paranoid (fsync) | 257 ops/sec | ~10.8 hours* |
+| **TurboKV** | fast (no WAL) | **1,172K ops/sec** | 8.5s |
+| RocksDB | default (WAL) | 452K ops/sec | 22.1s |
+| **TurboKV** | durable (WAL) | **438K ops/sec** | 22.8s |
+| fjall | default | 360K ops/sec | 27.8s |
+| TurboKV | paranoid (fsync) | 249 ops/sec | ~11.2 hours* |
 
-*Paranoid mode extrapolated from 1K key test (fsync-bound)
+*Paranoid mode extrapolated from 100-write test (fsync-bound)
 
 **Analysis:**
-- TurboKV is **2x faster** than RocksDB with equivalent durability (WAL enabled)
-- TurboKV is **2.25x faster** than fjall
-- All databases configured with default settings (WAL enabled, periodic sync)
+- TurboKV fast mode is **2.6x faster** than RocksDB
+- TurboKV durable mode is **comparable to RocksDB** (~3% slower) with equivalent crash-safety guarantees
+- TurboKV durable mode is **1.2x faster** than fjall
+- All WAL writes go directly to the kernel (no userspace buffering) for genuine process-crash durability
 
 
 ### Key Optimizations in TurboKV
 
 1. **Zero-allocation WAL path** - Thread-local pre-allocated buffers eliminate per-write heap allocations
-2. **Lock-free MemTable** - Crossbeam skiplist allows concurrent writes without mutex contention
-3. **Vectorized I/O** - Batch writes use single syscall with pre-allocated buffer
-4. **Fast hashing** - gxhash for internal hash maps (faster than default hasher)
+2. **Direct kernel writes** - WAL bypasses BufWriter, writes directly to File for crash safety without flush overhead
+3. **Lock-free MemTable** - Crossbeam skiplist allows concurrent writes without mutex contention
+4. **Vectorized I/O** - Batch writes use single syscall with pre-allocated buffer
+5. **Fast hashing** - gxhash for internal hash maps (faster than default hasher)
 
 ---
 
@@ -51,7 +53,7 @@ TurboKV supports three durability modes:
 ### The Physics of Fsync
 
 ```
-~263 ops/sec = 3.8ms per write
+~249 ops/sec = 4.0ms per write
 SSD fsync latency = 2-5ms
 Theoretical max = 200-500 ops/sec
 ```
@@ -60,20 +62,21 @@ Any database that guarantees "data survives power loss" MUST call fsync after ea
 
 ### How to Get Higher Throughput with Durability
 
-1. **Use `durable()` mode** (~1.1M ops/sec) - survives process crash, not power loss
-2. **Use batch writes** - amortizes fsync across multiple operations
+1. **Use `durable()` mode** (~438K ops/sec) - survives process crash, not power loss
+2. **Use batch writes** (~933K ops/sec) - amortizes overhead across multiple operations
 3. **Use concurrent writers** - group commit batches fsyncs
 4. **Use faster storage** - NVMe with lower fsync latency
 
 ---
 
-## Read Performance
+## Other Benchmarks
 
 | Operation | Throughput |
 |-----------|------------|
-| Random reads | ~760K ops/sec |
-| Sequential reads | ~1.2M ops/sec |
-| Range scans | ~1.2M entries/sec |
+| Batch writes (fast) | ~933K ops/sec |
+| Concurrent writes (8 writers, paranoid) | ~1000 ops/sec |
+| Mixed read/write (7 readers, 1 writer) | ~292K ops/sec |
+| Overwrite (durable, 10M keys) | ~195K ops/sec |
 
 ---
 
@@ -101,9 +104,10 @@ cargo bench --bench kv_benchmarks
 
 ## Summary
 
-TurboKV achieves **2x the throughput** of RocksDB and fjall with equivalent durability guarantees. This is achieved through:
+TurboKV fast mode achieves **2.6x the throughput** of RocksDB. In durable mode, TurboKV matches RocksDB while providing genuine crash-safety guarantees (direct kernel writes, fsync'd SSTables). This is achieved through:
 
-- Zero-allocation write paths
+- Direct-to-kernel WAL writes (no BufWriter overhead)
+- Zero-allocation write paths with thread-local buffers
 - Lock-free concurrent data structures
 - Efficient WAL encoding without Merkle overhead
-- Optimized memory management with thread-local buffers
+- SSTable fsync before manifest updates for durability

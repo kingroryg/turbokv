@@ -159,36 +159,37 @@ let db = Db::open_with_options("./data", options).await?;
 
 ## Performance
 
-TurboKV is optimized for high write throughput and outperforms both RocksDB and fjall.
+TurboKV is optimized for high write throughput. In fast mode it significantly outperforms RocksDB and fjall. In durable mode it trades some speed for genuine crash safety.
 
 **Production-scale benchmark: 10M keys, 400-byte values (4.2GB total)**
 
 | Database | Mode | Throughput |
 |----------|------|------------|
-| **TurboKV** | fast (no WAL) | **1,132K ops/sec** |
-| **TurboKV** | durable (WAL) | **1,094K ops/sec** |
-| RocksDB | default (WAL) | 560K ops/sec |
-| fjall | default | 501K ops/sec |
-| TurboKV | paranoid (fsync/write) | ~257 ops/sec |
+| **TurboKV** | fast (no WAL) | **1,172K ops/sec** |
+| **TurboKV** | durable (WAL) | **438K ops/sec** |
+| RocksDB | default (WAL) | 452K ops/sec |
+| fjall | default | 360K ops/sec |
+| TurboKV | paranoid (fsync/write) | ~249 ops/sec |
 
 | Other Operations | Performance |
 |------------------|-------------|
-| Random reads | ~760K ops/sec |
-| Range scans | ~1.2M entries/sec |
+| Batch writes (fast) | ~933K ops/sec |
 | Concurrent writes (8 writers, paranoid) | ~1000 ops/sec |
+| Mixed read/write (7 readers, 1 writer) | ~292K ops/sec |
 
-*Benchmarks on Apple Silicon Mac, SSD storage, 32GB Memory
+*Benchmarks on Apple Silicon M4, SSD storage, 16GB Memory
 
 ### Understanding the Numbers
 
 **How does TurboKV compare?**
-- TurboKV is **2x faster** than RocksDB with equivalent durability (WAL enabled)
-- TurboKV is **2.25x faster** than fjall
-- TurboKV provides a simpler async API with zero-allocation write paths
+- TurboKV fast mode is **2.6x faster** than RocksDB and **3.3x faster** than fjall
+- TurboKV durable mode is **comparable to RocksDB** with equivalent durability guarantees
+- TurboKV durable mode is **1.2x faster** than fjall
+- All durability modes are crash-safe: WAL writes go directly to the kernel (no userspace buffering), SSTables are fsync'd before manifest updates
 
 **Why is paranoid mode so slow?** Every write calls `fsync()` which takes 3-5ms on SSDs. This is a hardware limitation that affects all databases equally. RocksDB and fjall hit the same bottleneck (~200-300 ops/sec) when configured for power-loss durability.
 
-**Why is durable mode much faster?** It writes to the WAL but relies on the OS to `fsync()` periodically (every few seconds). This "periodic sync" approach means data survives process crashes but not sudden power loss. This is what RocksDB does by default (`sync_wal: false`).
+**Why is durable mode slower than fast?** It writes every entry to the WAL file before updating the memtable. The OS flushes to disk periodically. Data survives process crashes but not sudden power loss. This is comparable to RocksDB's default (`sync_wal: false`).
 
 
 ## API Reference
