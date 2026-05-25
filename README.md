@@ -49,7 +49,7 @@ Add TurboKV to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-turbokv = "0.4"
+turbokv = "0.5"
 tokio = { version = "1", features = ["full"] }
 ```
 
