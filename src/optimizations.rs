@@ -1,14 +1,17 @@
 //! # Performance Optimizations
 //!
-//! This module documents the key optimizations that make TurboKV 2x faster than RocksDB and fjall.
+//! This module documents implementation choices that keep TurboKV's write path
+//! competitive with RocksDB and fjall while preserving configurable durability.
 //!
 //! ## Overview
 //!
-//! TurboKV achieves **1.1M ops/sec** for durable writes (WAL enabled), compared to:
-//! - RocksDB: 560K ops/sec
-//! - fjall: 501K ops/sec
+//! Current benchmark notes in the README separate fast mode (no WAL) from
+//! durable mode (WAL enabled):
+//! - Fast mode is tuned for maximum throughput when recent writes can be lost.
+//! - Durable mode uses the WAL for process-crash recovery and remains in the
+//!   same performance class as RocksDB's default WAL configuration.
 //!
-//! This is a **2x improvement** with equivalent durability guarantees.
+//! Always compare modes with equivalent durability settings.
 //!
 //! ---
 //!
@@ -74,11 +77,10 @@
 //! Rust's default hasher (SipHash) is designed for security, not speed.
 //!
 //! ### Solution
-//! TurboKV uses `gxhash` for internal hash maps:
+//! TurboKV uses `gxhash` in Bloom filters:
 //!
 //! ```rust,ignore
-//! use gxhash::GxBuildHasher;
-//! type FastHashMap<K, V> = HashMap<K, V, GxBuildHasher>;
+//! let h = gxhash::gxhash64(key, seed);
 //! ```
 //!
 //! Benefits:
@@ -87,7 +89,7 @@
 //! - Still provides good hash distribution
 //!
 //! ### Impact
-//! Faster internal lookups in index structures.
+//! Faster Bloom filter probes on the SSTable read path.
 //!
 //! ---
 //!

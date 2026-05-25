@@ -5,7 +5,6 @@
 //! ## Key Optimizations (PRESERVED)
 //!
 //! - **crossbeam_skiplist::SkipMap** - Lock-free concurrent skip list
-//! - **gxhash::GxBuildHasher** - Fast hash function (used in auxiliary structures)
 //! - **Atomic counters** - Lock-free size_bytes, entry_count, sequence tracking
 //! - **Inline size estimation** - Fast path avoids function call overhead
 //! - **Read-only flag** - Atomic coordination for flush without blocking writes
@@ -211,20 +210,21 @@ impl MemTable {
     ///
     /// Returns key-value pairs in sorted order. Tombstones are excluded.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        // Create end bound by incrementing the last byte of prefix
-        let mut end = prefix.to_vec();
-        if let Some(last) = end.last_mut() {
-            if *last < 255 {
-                *last += 1;
-            } else {
-                // Prefix ends with 0xFF, need to extend
-                end.push(0);
-            }
-        }
+        let start = prefix.to_vec();
+        let end = prefix_upper_bound(prefix);
 
-        self.data
-            .range(prefix.to_vec()..end)
+        let entries: Vec<_> = match end {
+            Some(end) => self.data.range(start..end).collect(),
+            None => self.data.range(start..).collect(),
+        };
+
+        entries
+            .into_iter()
             .filter_map(|entry| {
+                if !entry.key().starts_with(prefix) {
+                    return None;
+                }
+
                 let e = entry.value();
                 if e.is_tombstone() {
                     None
@@ -281,17 +281,6 @@ impl MemTable {
             .collect()
     }
 
-    /// Clear all entries (after successful flush)
-    pub fn clear(&self) {
-        // Note: SkipMap doesn't have a clear() method, but we can use a new instance
-        // For now, we'll iterate and remove - this is only called after flush
-        // In practice, we typically just drop the old memtable
-        self.size_bytes.store(0, Ordering::Relaxed);
-        self.entry_count.store(0, Ordering::Relaxed);
-        self.tombstone_count.store(0, Ordering::Relaxed);
-        info!("MemTable cleared after flush");
-    }
-
     /// Get the current sequence number
     pub fn current_sequence(&self) -> u64 {
         self.sequence.load(Ordering::Relaxed)
@@ -341,6 +330,13 @@ impl MemTable {
     pub fn is_empty(&self) -> bool {
         self.entry_count.load(Ordering::Relaxed) == 0
     }
+}
+
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last_incrementable = prefix.iter().rposition(|byte| *byte != u8::MAX)?;
+    let mut end = prefix[..=last_incrementable].to_vec();
+    end[last_incrementable] += 1;
+    Some(end)
 }
 
 #[cfg(test)]
@@ -407,6 +403,31 @@ mod tests {
 
         let posts = table.scan_prefix(b"post:");
         assert_eq!(posts.len(), 1);
+    }
+
+    #[test]
+    fn test_prefix_scan_empty_prefix_returns_all_entries() {
+        let table = MemTable::new(test_config());
+
+        table.insert(b"a", b"1").unwrap();
+        table.insert(b"b", b"2").unwrap();
+
+        let entries = table.scan_prefix(b"");
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_prefix_scan_with_ff_byte() {
+        let table = MemTable::new(test_config());
+
+        table.insert(&[0xff, 0x01], b"first").unwrap();
+        table.insert(&[0xff, 0x02], b"second").unwrap();
+        table.insert(&[0xfe], b"other").unwrap();
+
+        let entries = table.scan_prefix(&[0xff]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (vec![0xff, 0x01], b"first".to_vec()));
+        assert_eq!(entries[1], (vec![0xff, 0x02], b"second".to_vec()));
     }
 
     #[test]

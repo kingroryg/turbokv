@@ -182,17 +182,14 @@ impl WriteAheadLog {
 
             // Check rotation and write
             let entry_bytes = buf.len() as u64;
-            let needs_rotation = {
-                let file = self.current_file.read();
-                file.size + entry_bytes > self.config.max_file_size
-            };
-
-            if needs_rotation {
-                rotate_sync(&self.current_file, &self.wal_dir, &self.config)?;
-            }
-
             // Single write to file
             let mut file = self.current_file.write();
+            if file.size + entry_bytes > self.config.max_file_size {
+                finalize_header(&mut file)?;
+                let new_seq = file.last_sequence + 1;
+                *file = create_file(&self.wal_dir, new_seq, &self.config)?;
+                info!("Rotated WAL file, new sequence: {}", new_seq);
+            }
             file.file.write_all(&buf)?;
             file.size += entry_bytes;
             file.entry_count += 1;
@@ -300,16 +297,13 @@ impl WriteAheadLog {
 
             // Check rotation and write
             let entry_bytes = buf.len() as u64;
-            let needs_rotation = {
-                let file = self.current_file.read();
-                file.size + entry_bytes > self.config.max_file_size
-            };
-
-            if needs_rotation {
-                rotate_sync(&self.current_file, &self.wal_dir, &self.config)?;
-            }
-
             let mut file = self.current_file.write();
+            if file.size + entry_bytes > self.config.max_file_size {
+                finalize_header(&mut file)?;
+                let new_seq = file.last_sequence + 1;
+                *file = create_file(&self.wal_dir, new_seq, &self.config)?;
+                info!("Rotated WAL file, new sequence: {}", new_seq);
+            }
             file.file.write_all(&buf)?;
             file.size += entry_bytes;
             file.entry_count += 1;
@@ -325,10 +319,9 @@ impl WriteAheadLog {
             return Ok(vec![]);
         }
 
-        let wal_entries = self.create_entries_batch(entries)?;
-        let sequences: Vec<u64> = wal_entries.iter().map(|e| e.sequence).collect();
-
-        self.write_batch(&wal_entries).await?;
+        let (sequences, encoded, last_sequence) = self.encode_entries_batch(entries)?;
+        self.write_encoded_batch(&encoded, entries.len() as u64, last_sequence)
+            .await?;
 
         Ok(sequences)
     }
@@ -447,38 +440,64 @@ impl WriteAheadLog {
         })
     }
 
-    fn create_entries_batch(&self, entries: &[(&[u8], Option<&[u8]>)]) -> Result<Vec<WalEntry>> {
-        use rayon::prelude::*;
-
+    fn encode_entries_batch(
+        &self,
+        entries: &[(&[u8], Option<&[u8]>)],
+    ) -> Result<(Vec<u64>, Vec<u8>, u64)> {
         let start_sequence = self
             .sequence
             .fetch_add(entries.len() as u64, Ordering::SeqCst);
         let timestamp = super::cached_time::now_ms();
+        let total_size: usize = entries
+            .iter()
+            .map(|(key, value)| ENTRY_HEADER_SIZE + 4 + key.len() + value.map_or(0, <[u8]>::len))
+            .sum();
 
-        // Parallel encoding (CPU-bound, parallelizable)
-        let wal_entries: Vec<WalEntry> = entries
-            .par_iter()
-            .enumerate()
-            .map(|(i, (key, value))| {
-                let sequence = start_sequence + i as u64;
-                let (data, entry_type) = match value {
-                    Some(v) => (encode_kv(key, v), EntryType::Data),
-                    None => (encode_delete(key), EntryType::Delete),
-                };
-                WalEntry {
-                    sequence,
-                    timestamp,
-                    entry_type,
-                    data: Bytes::from(data),
-                }
-            })
-            .collect();
+        let mut sequences = Vec::with_capacity(entries.len());
+        let mut encoded = Vec::with_capacity(total_size);
 
-        Ok(wal_entries)
+        for (i, (key, value)) in entries.iter().enumerate() {
+            let sequence = start_sequence + i as u64;
+            let entry_type = if value.is_some() {
+                EntryType::Data
+            } else {
+                EntryType::Delete
+            };
+            let data_len = 4 + key.len() + value.map_or(0, <[u8]>::len);
+
+            encoded.extend_from_slice(&(data_len as u32).to_le_bytes());
+            encoded.extend_from_slice(&sequence.to_le_bytes());
+            encoded.extend_from_slice(&timestamp.to_le_bytes());
+            encoded.push(entry_type as u8);
+            encoded.push(0);
+
+            let crc_offset = encoded.len();
+            encoded.extend_from_slice(&[0u8; 4]);
+            encoded.extend_from_slice(&[0u8; 6]);
+
+            let data_start = encoded.len();
+            encoded.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            encoded.extend_from_slice(key);
+            if let Some(value) = value {
+                encoded.extend_from_slice(value);
+            }
+
+            let crc = crc32_checksum(&encoded[data_start..]);
+            encoded[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
+            sequences.push(sequence);
+        }
+
+        let last_sequence = sequences.last().copied().unwrap_or(start_sequence);
+        Ok((sequences, encoded, last_sequence))
     }
 
-    async fn write_batch(&self, entries: &[WalEntry]) -> Result<()> {
-        let total_batch_size: u64 = entries.iter().map(|e| entry_size(e) as u64).sum();
+    async fn write_encoded_batch(
+        &self,
+        encoded: &[u8],
+        entry_count: u64,
+        last_sequence: u64,
+    ) -> Result<()> {
+        let total_batch_size = encoded.len() as u64;
         let needs_rotation = {
             let f = self.current_file.read();
             f.size + total_batch_size > self.config.max_file_size
@@ -488,12 +507,10 @@ impl WriteAheadLog {
         }
 
         let mut f = self.current_file.write();
-        write_entries_batch(&mut f.file, entries)?;
+        f.file.write_all(encoded)?;
         f.size += total_batch_size;
-        f.entry_count += entries.len() as u64;
-        if let Some(last_entry) = entries.last() {
-            f.last_sequence = last_entry.sequence;
-        }
+        f.entry_count += entry_count;
+        f.last_sequence = last_sequence;
 
         if self.config.sync_on_write {
             f.file.sync_all()?;

@@ -26,7 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // All three writes are applied as a group
     db.write_batch(&batch).await?;
-    println!("Wrote user:1 data in a single batch ({} operations)", batch.len());
+    println!(
+        "Wrote user:1 data in a single batch ({} operations)",
+        batch.len()
+    );
 
     // Verify
     for key in &[

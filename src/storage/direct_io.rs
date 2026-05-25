@@ -9,13 +9,8 @@
 //!
 //! ## Usage
 //!
-//! Enable via `DbOptions`:
-//! ```ignore
-//! let options = DbOptions {
-//!     direct_io: true,
-//!     ..DbOptions::default()
-//! };
-//! ```
+//! This module exposes the low-level building blocks. The public `DbOptions`
+//! type does not currently wire direct I/O into the main engine.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -244,8 +239,7 @@ impl AlignedBuffer {
         // Round up to alignment
         let new_capacity = (new_capacity + self.alignment - 1) & !(self.alignment - 1);
 
-        let new_layout =
-            std::alloc::Layout::from_size_align(new_capacity, self.alignment).unwrap();
+        let new_layout = std::alloc::Layout::from_size_align(new_capacity, self.alignment).unwrap();
 
         let new_ptr = unsafe {
             let p = std::alloc::alloc_zeroed(new_layout);

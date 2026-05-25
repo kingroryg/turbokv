@@ -10,12 +10,8 @@
 //! │  │                    Data Blocks                      │    │
 //! │  │  ┌──────────────────────────────────────────────┐   │    │
 //! │  │  │ Block 1 (Default: 16KB)                      │   │    │
-//! │  │  │ ┌─────────────────────────────────────────┐  │   │    │
-//! │  │  │ │ Entry 1: [key_len][key][value_len][val] │  │   │    │
-//! │  │  │ │ Entry 2: [key_len][key][value_len][val] │  │   │    │
-//! │  │  │ │ ...                                     │  │   │    │
-//! │  │  │ │ Entry N: [key_len][key][value_len][val] │  │   │    │
-//! │  │  │ └─────────────────────────────────────────┘  │   │    │
+//! │  │  │ Entries: [key_len][key][tag][val_len][val]   │   │    │
+//! │  │  │ Offsets: [entry_offset ...][entry_count]     │   │    │
 //! │  │  │ Block Footer: [compression][crc32]           │   │    │
 //! │  │  └──────────────────────────────────────────────┘   │    │
 //! │  │  Block 2...                                         │    │
@@ -56,5 +52,6 @@ pub use builder::{BlockBuilder, IndexBuilder};
 pub use compression::{compress_block, decompress_block, CompressionType};
 pub use iterator::SSTableIterator;
 pub use reader::SSTableReader;
+pub(crate) use reader::SSTableValue;
 pub use types::{SSTableConfig, SSTableInfo, FOOTER_SIZE, SSTABLE_MAGIC, SSTABLE_VERSION};
 pub use writer::SSTableWriter;

@@ -126,6 +126,22 @@ pub struct StorageStats {
     pub memtable_size: u64,
     /// Whether compaction is pending
     pub compaction_pending: bool,
+    /// Total WAL bytes written by this process
+    pub wal_bytes_written: u64,
+    /// Total SSTable bytes written by memtable flushes
+    pub sstable_flush_bytes_written: u64,
+    /// Total bytes read by compaction jobs
+    pub compaction_bytes_read: u64,
+    /// Total bytes written by compaction jobs
+    pub compaction_bytes_written: u64,
+    /// Immutable memtables waiting to be flushed
+    pub immutable_memtables: u64,
+    /// Number of level-0 SSTables
+    pub l0_sstable_count: u64,
+    /// Number of controlled write stalls
+    pub write_stall_count: u64,
+    /// Total controlled write stall time in microseconds
+    pub write_stall_micros: u64,
 }
 
 /// Compaction result

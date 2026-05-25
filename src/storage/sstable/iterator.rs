@@ -5,6 +5,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use byteorder::{LittleEndian, ReadBytesExt};
 use bytes::Bytes;
 
+use super::reader::SSTableValue;
 use super::SSTableReader;
 use crate::core::error::Result;
 
@@ -87,15 +88,17 @@ impl<'a> SSTableIterator<'a> {
     }
 
     /// Read next key-value pair from current block
-    fn read_next_entry(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+    fn read_next_entry(&mut self) -> Result<Option<(Bytes, Option<Bytes>)>> {
         if self.current_entry_idx >= self.current_block_entries.len() {
             return Ok(None);
         }
 
-        let block_data = self.current_block_data.as_ref().unwrap();
+        let Some(block_data) = self.current_block_data.as_ref() else {
+            return Ok(None);
+        };
         let key_offset = self.current_block_entries[self.current_entry_idx];
 
-        let mut cursor = Cursor::new(block_data);
+        let mut cursor = Cursor::new(block_data.as_slice());
 
         // Read key
         cursor.seek(SeekFrom::Start(key_offset as u64))?;
@@ -104,18 +107,19 @@ impl<'a> SSTableIterator<'a> {
         cursor.read_exact(&mut key)?;
 
         // Read value - no need to seek, we're already positioned after the key
-        let value_len = cursor.read_u32::<LittleEndian>()? as usize;
-        let mut value = vec![0u8; value_len];
-        cursor.read_exact(&mut value)?;
+        let value = match self.reader.read_value(&mut cursor)? {
+            SSTableValue::Value(value) => Some(value),
+            SSTableValue::Tombstone => None,
+        };
 
         self.current_entry_idx += 1;
 
-        Ok(Some((Bytes::from(key), Bytes::from(value))))
+        Ok(Some((Bytes::from(key), value)))
     }
 }
 
 impl<'a> Iterator for SSTableIterator<'a> {
-    type Item = Result<(Bytes, Bytes)>;
+    type Item = Result<(Bytes, Option<Bytes>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {

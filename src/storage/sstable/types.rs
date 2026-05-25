@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const SSTABLE_MAGIC: &[u8; 8] = b"HANSHIRO";
-pub const SSTABLE_VERSION: u32 = 1;
+pub const SSTABLE_VERSION_V1: u32 = 1;
+pub const SSTABLE_VERSION: u32 = 2;
 pub const DEFAULT_BLOCK_SIZE: usize = 16 * 1024; // 16KB, better for larger security events
 pub const FOOTER_SIZE: usize = 40;
 

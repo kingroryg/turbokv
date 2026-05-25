@@ -103,6 +103,12 @@ pub struct StorageConfig {
     pub block_cache_size: usize,
     /// Enable WAL for durability
     pub wal_enabled: bool,
+    /// Immutable memtable count that triggers controlled write stalls
+    pub max_immutable_memtables_before_stall: usize,
+    /// L0 SSTable count that triggers controlled write stalls
+    pub max_l0_files_before_stall: u64,
+    /// Controlled stall duration when thresholds are exceeded
+    pub write_stall_micros: u64,
 }
 
 impl Default for StorageConfig {
@@ -118,6 +124,9 @@ impl Default for StorageConfig {
             compaction_interval: Duration::from_secs(30),
             block_cache_size: 64 * 1024 * 1024, // 64MB
             wal_enabled: true,
+            max_immutable_memtables_before_stall: 8,
+            max_l0_files_before_stall: 24,
+            write_stall_micros: 250,
         }
     }
 }
@@ -189,6 +198,13 @@ pub struct Engine {
     sstable_total_keys: Arc<AtomicU64>,
     sstable_total_bytes: Arc<AtomicU64>,
     sstable_count: Arc<AtomicU64>,
+    l0_sstable_count: Arc<AtomicU64>,
+    wal_bytes_written: Arc<AtomicU64>,
+    sstable_flush_bytes_written: Arc<AtomicU64>,
+    compaction_bytes_read: Arc<AtomicU64>,
+    compaction_bytes_written: Arc<AtomicU64>,
+    write_stall_count: Arc<AtomicU64>,
+    write_stall_micros: Arc<AtomicU64>,
 }
 
 impl Engine {
@@ -291,6 +307,7 @@ impl Engine {
         let initial_sstable_keys: u64 = sstables.iter().map(|s| s.entry_count).sum();
         let initial_sstable_bytes: u64 = sstables.iter().map(|s| s.file_size).sum();
         let initial_sstable_count = sstables.len() as u64;
+        let initial_l0_sstable_count = sstables.iter().filter(|s| s.level == 0).count() as u64;
 
         let engine = Self {
             config,
@@ -306,6 +323,13 @@ impl Engine {
             sstable_total_keys: Arc::new(AtomicU64::new(initial_sstable_keys)),
             sstable_total_bytes: Arc::new(AtomicU64::new(initial_sstable_bytes)),
             sstable_count: Arc::new(AtomicU64::new(initial_sstable_count)),
+            l0_sstable_count: Arc::new(AtomicU64::new(initial_l0_sstable_count)),
+            wal_bytes_written: Arc::new(AtomicU64::new(0)),
+            sstable_flush_bytes_written: Arc::new(AtomicU64::new(0)),
+            compaction_bytes_read: Arc::new(AtomicU64::new(0)),
+            compaction_bytes_written: Arc::new(AtomicU64::new(0)),
+            write_stall_count: Arc::new(AtomicU64::new(0)),
+            write_stall_micros: Arc::new(AtomicU64::new(0)),
         };
 
         // Start background tasks
@@ -320,9 +344,13 @@ impl Engine {
     /// - No WAL: Sync path with thread-local buffering (faster)
     /// - With WAL: Async path for durability
     pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.maybe_stall_writes().await;
+
         if let Some(ref wal) = self.wal {
             // Durable path: WAL write then memtable
             wal.append(key, value).await?;
+            self.wal_bytes_written
+                .fetch_add(wal_data_entry_size(key, value), Ordering::Relaxed);
             self.memtable_manager
                 .insert(key, value)
                 .map_err(StorageError::MemTable)?;
@@ -332,6 +360,35 @@ impl Engine {
                 .insert_buffered(key, value)
                 .map_err(StorageError::MemTable)?;
         }
+
+        Ok(())
+    }
+
+    /// Insert multiple key-value pairs.
+    pub async fn insert_many(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        self.maybe_stall_writes().await;
+
+        if let Some(ref wal) = self.wal {
+            let wal_entries: Vec<(&[u8], Option<&[u8]>)> = entries
+                .iter()
+                .map(|(key, value)| (key.as_slice(), Some(value.as_slice())))
+                .collect();
+            wal.append_batch(&wal_entries).await?;
+            let wal_bytes = entries
+                .iter()
+                .map(|(key, value)| wal_data_entry_size(key, value))
+                .sum();
+            self.wal_bytes_written
+                .fetch_add(wal_bytes, Ordering::Relaxed);
+        }
+
+        self.memtable_manager
+            .insert_many(entries)
+            .map_err(StorageError::MemTable)?;
 
         Ok(())
     }
@@ -349,9 +406,13 @@ impl Engine {
 
     /// Delete a key
     pub async fn delete(&self, key: &[u8]) -> Result<()> {
+        self.maybe_stall_writes().await;
+
         // Write to WAL first (if enabled)
         if let Some(ref wal) = self.wal {
             wal.append_delete(key).await?;
+            self.wal_bytes_written
+                .fetch_add(wal_delete_entry_size(key), Ordering::Relaxed);
         }
 
         // Insert tombstone into memtable
@@ -487,6 +548,10 @@ impl Engine {
 
     /// Write a batch of operations atomically
     pub async fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
+        if !batch.is_empty() {
+            self.maybe_stall_writes().await;
+        }
+
         // Convert to WAL batch format
         let ops: Vec<(&[u8], Option<&[u8]>)> = batch
             .ops()
@@ -502,6 +567,16 @@ impl Engine {
         // Write to WAL (if enabled)
         if let Some(ref wal) = self.wal {
             wal.append_batch(&ops).await?;
+            let wal_bytes = batch
+                .ops()
+                .iter()
+                .map(|op| match op {
+                    crate::core::BatchOp::Put { key, value } => wal_data_entry_size(key, value),
+                    crate::core::BatchOp::Delete { key } => wal_delete_entry_size(key),
+                })
+                .sum();
+            self.wal_bytes_written
+                .fetch_add(wal_bytes, Ordering::Relaxed);
         }
 
         // Apply to memtable
@@ -609,6 +684,14 @@ impl Engine {
             sstable_count,
             memtable_size: memtable_stats.active.size_bytes as u64,
             compaction_pending: !memtable_stats.immutable.is_empty(),
+            wal_bytes_written: self.wal_bytes_written.load(Ordering::Relaxed),
+            sstable_flush_bytes_written: self.sstable_flush_bytes_written.load(Ordering::Relaxed),
+            compaction_bytes_read: self.compaction_bytes_read.load(Ordering::Relaxed),
+            compaction_bytes_written: self.compaction_bytes_written.load(Ordering::Relaxed),
+            immutable_memtables: memtable_stats.immutable.len() as u64,
+            l0_sstable_count: self.l0_sstable_count.load(Ordering::Relaxed),
+            write_stall_count: self.write_stall_count.load(Ordering::Relaxed),
+            write_stall_micros: self.write_stall_micros.load(Ordering::Relaxed),
         }
     }
 
@@ -643,10 +726,14 @@ impl Engine {
             if let Some((key, value)) = entry.decode_kv() {
                 match value {
                     Some(v) => {
-                        memtable_manager.insert(key, v).map_err(StorageError::MemTable)?;
+                        memtable_manager
+                            .insert(key, v)
+                            .map_err(StorageError::MemTable)?;
                     }
                     None => {
-                        memtable_manager.delete(key).map_err(StorageError::MemTable)?;
+                        memtable_manager
+                            .delete(key)
+                            .map_err(StorageError::MemTable)?;
                     }
                 }
                 count += 1;
@@ -654,6 +741,20 @@ impl Engine {
         }
 
         Ok(count)
+    }
+
+    async fn maybe_stall_writes(&self) {
+        let immutable_count = self.memtable_manager.immutable_count();
+        let l0_count = self.l0_sstable_count.load(Ordering::Relaxed);
+        let should_stall = immutable_count >= self.config.max_immutable_memtables_before_stall
+            || l0_count >= self.config.max_l0_files_before_stall;
+
+        if should_stall && self.config.write_stall_micros > 0 {
+            self.write_stall_count.fetch_add(1, Ordering::Relaxed);
+            self.write_stall_micros
+                .fetch_add(self.config.write_stall_micros, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_micros(self.config.write_stall_micros)).await;
+        }
     }
 
     /// Read a key from an SSTable
@@ -666,15 +767,9 @@ impl Engine {
             .get(&sst.path)
             .map_err(|e| StorageError::SSTable(e.to_string()))?;
 
-        match reader.get(key) {
-            Ok(Some(value)) => {
-                if value.is_empty() {
-                    // Empty value = tombstone in SSTable
-                    Ok(None)
-                } else {
-                    Ok(Some(value.to_vec()))
-                }
-            }
+        match reader.get_entry(key) {
+            Ok(Some(super::sstable::SSTableValue::Value(value))) => Ok(Some(value.to_vec())),
+            Ok(Some(super::sstable::SSTableValue::Tombstone)) => Ok(None),
             Ok(None) => Ok(None),
             Err(e) => Err(StorageError::SSTable(e.to_string())),
         }
@@ -705,13 +800,7 @@ impl Engine {
         for entry in reader.iter() {
             let (key, value) = entry.map_err(|e| StorageError::SSTable(e.to_string()))?;
             if key.as_ref() >= start && key.as_ref() < end {
-                // Empty value means tombstone
-                let val = if value.is_empty() {
-                    None
-                } else {
-                    Some(value.to_vec())
-                };
-                results.push((key.to_vec(), val));
+                results.push((key.to_vec(), value.map(|v| v.to_vec())));
             } else if key.as_ref() >= end {
                 break;
             }
@@ -740,13 +829,7 @@ impl Engine {
         for entry in reader.iter() {
             let (key, value) = entry.map_err(|e| StorageError::SSTable(e.to_string()))?;
             if key.starts_with(prefix) {
-                // Empty value means tombstone
-                let val = if value.is_empty() {
-                    None
-                } else {
-                    Some(value.to_vec())
-                };
-                results.push((key.to_vec(), val));
+                results.push((key.to_vec(), value.map(|v| v.to_vec())));
             } else if key.as_ref() > prefix && !key.starts_with(prefix) {
                 // Past the prefix range, can stop
                 break;
@@ -825,6 +908,9 @@ impl Engine {
         self.sstable_total_bytes
             .fetch_add(info.file_size, Ordering::Relaxed);
         self.sstable_count.fetch_add(1, Ordering::Relaxed);
+        self.l0_sstable_count.fetch_add(1, Ordering::Relaxed);
+        self.sstable_flush_bytes_written
+            .fetch_add(info.file_size, Ordering::Relaxed);
 
         info!("Flushed memtable to SSTable: {:?}", path);
 
@@ -848,6 +934,7 @@ impl Engine {
         let removed_keys: u64 = job.input_sstables.iter().map(|s| s.entry_count).sum();
         let removed_bytes: u64 = job.input_sstables.iter().map(|s| s.size).sum();
         let removed_count = job.input_sstables.len() as u64;
+        let removed_l0_count = job.input_sstables.iter().filter(|s| s.level == 0).count() as u64;
 
         let result = self
             .compactor
@@ -867,6 +954,8 @@ impl Engine {
             .fetch_sub(removed_bytes, Ordering::Relaxed);
         self.sstable_count
             .fetch_sub(removed_count, Ordering::Relaxed);
+        self.l0_sstable_count
+            .fetch_sub(removed_l0_count, Ordering::Relaxed);
 
         // Add new file if compaction produced output
         if let Some(ref output) = result.output_sstable {
@@ -887,7 +976,15 @@ impl Engine {
             self.sstable_total_bytes
                 .fetch_add(output.size, Ordering::Relaxed);
             self.sstable_count.fetch_add(1, Ordering::Relaxed);
+            if output.level == 0 {
+                self.l0_sstable_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
+
+        self.compaction_bytes_read
+            .fetch_add(result.bytes_read, Ordering::Relaxed);
+        self.compaction_bytes_written
+            .fetch_add(result.bytes_written, Ordering::Relaxed);
 
         // Update manifest
         {
@@ -975,6 +1072,10 @@ impl Engine {
             sstable_total_keys: self.sstable_total_keys.clone(),
             sstable_total_bytes: self.sstable_total_bytes.clone(),
             sstable_count: self.sstable_count.clone(),
+            l0_sstable_count: self.l0_sstable_count.clone(),
+            sstable_flush_bytes_written: self.sstable_flush_bytes_written.clone(),
+            compaction_bytes_read: self.compaction_bytes_read.clone(),
+            compaction_bytes_written: self.compaction_bytes_written.clone(),
         }
     }
 }
@@ -992,6 +1093,10 @@ struct BackgroundEngine {
     sstable_total_keys: Arc<AtomicU64>,
     sstable_total_bytes: Arc<AtomicU64>,
     sstable_count: Arc<AtomicU64>,
+    l0_sstable_count: Arc<AtomicU64>,
+    sstable_flush_bytes_written: Arc<AtomicU64>,
+    compaction_bytes_read: Arc<AtomicU64>,
+    compaction_bytes_written: Arc<AtomicU64>,
 }
 
 impl BackgroundEngine {
@@ -1099,6 +1204,9 @@ impl BackgroundEngine {
         self.sstable_total_bytes
             .fetch_add(info.file_size, Ordering::Relaxed);
         self.sstable_count.fetch_add(1, Ordering::Relaxed);
+        self.l0_sstable_count.fetch_add(1, Ordering::Relaxed);
+        self.sstable_flush_bytes_written
+            .fetch_add(info.file_size, Ordering::Relaxed);
 
         info!("Background flushed memtable to SSTable: {:?}", path);
 
@@ -1120,6 +1228,7 @@ impl BackgroundEngine {
         let removed_keys: u64 = job.input_sstables.iter().map(|s| s.entry_count).sum();
         let removed_bytes: u64 = job.input_sstables.iter().map(|s| s.size).sum();
         let removed_count = job.input_sstables.len() as u64;
+        let removed_l0_count = job.input_sstables.iter().filter(|s| s.level == 0).count() as u64;
 
         let result = self
             .compactor
@@ -1136,6 +1245,8 @@ impl BackgroundEngine {
             .fetch_sub(removed_bytes, Ordering::Relaxed);
         self.sstable_count
             .fetch_sub(removed_count, Ordering::Relaxed);
+        self.l0_sstable_count
+            .fetch_sub(removed_l0_count, Ordering::Relaxed);
 
         if let Some(ref output) = result.output_sstable {
             sstables.push(SSTableInfo {
@@ -1155,7 +1266,15 @@ impl BackgroundEngine {
             self.sstable_total_bytes
                 .fetch_add(output.size, Ordering::Relaxed);
             self.sstable_count.fetch_add(1, Ordering::Relaxed);
+            if output.level == 0 {
+                self.l0_sstable_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
+
+        self.compaction_bytes_read
+            .fetch_add(result.bytes_read, Ordering::Relaxed);
+        self.compaction_bytes_written
+            .fetch_add(result.bytes_written, Ordering::Relaxed);
 
         {
             let mut manifest = self.manifest.lock();
@@ -1176,6 +1295,16 @@ impl BackgroundEngine {
 
         Ok(())
     }
+}
+
+fn wal_data_entry_size(key: &[u8], value: &[u8]) -> u64 {
+    const WAL_ENTRY_HEADER_SIZE: usize = 32;
+    (WAL_ENTRY_HEADER_SIZE + 4 + key.len() + value.len()) as u64
+}
+
+fn wal_delete_entry_size(key: &[u8]) -> u64 {
+    const WAL_ENTRY_HEADER_SIZE: usize = 32;
+    (WAL_ENTRY_HEADER_SIZE + 4 + key.len()) as u64
 }
 
 #[cfg(test)]
@@ -1228,6 +1357,27 @@ mod tests {
 
         let range = engine.range(b"b", b"d").await.unwrap();
         assert_eq!(range.len(), 2);
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_stall_counters_trigger_at_threshold() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            data_dir: temp_dir.path().to_path_buf(),
+            wal_enabled: false,
+            max_l0_files_before_stall: 0,
+            write_stall_micros: 1,
+            ..Default::default()
+        };
+
+        let engine = Engine::open(config).await.unwrap();
+        engine.insert(b"stall-key", b"stall-value").await.unwrap();
+
+        let stats = engine.stats();
+        assert_eq!(stats.write_stall_count, 1);
+        assert_eq!(stats.write_stall_micros, 1);
 
         engine.shutdown().await.unwrap();
     }

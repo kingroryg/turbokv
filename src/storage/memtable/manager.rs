@@ -121,6 +121,11 @@ impl MemTableManager {
         Ok(0) // Sequence number not meaningful for buffered writes
     }
 
+    /// Insert multiple key-value pairs while rotating at batch boundaries.
+    pub fn insert_many(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        self.flush_buffer(entries)
+    }
+
     /// Flush thread-local buffer to main memtable
     fn flush_buffer(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
         let mut start_idx = 0;
@@ -270,7 +275,7 @@ impl MemTableManager {
         // Add from immutable tables (oldest first)
         for table in self.immutable.read().iter() {
             for (key, entry) in table.get_all_entries() {
-                if key >= start.to_vec() && key < end.to_vec() {
+                if key.as_slice() >= start && key.as_slice() < end {
                     merged.insert(key, entry.value);
                 }
             }
@@ -278,7 +283,7 @@ impl MemTableManager {
 
         // Add from active table (newest, overrides all)
         for (key, entry) in self.active.read().get_all_entries() {
-            if key >= start.to_vec() && key < end.to_vec() {
+            if key.as_slice() >= start && key.as_slice() < end {
                 merged.insert(key, entry.value);
             }
         }

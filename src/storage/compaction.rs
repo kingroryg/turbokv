@@ -187,14 +187,7 @@ impl Compactor {
             if is_duplicate {
                 entries_dropped += 1;
             } else {
-                // Convert Bytes value to Option<&[u8]>
-                // Empty values are treated as tombstones
-                let value_opt = if entry.value.is_empty() {
-                    None
-                } else {
-                    Some(entry.value.as_ref())
-                };
-                writer.add(&entry.key, value_opt)?;
+                writer.add(&entry.key, entry.value.as_deref())?;
                 live_keys.push(entry.key.to_vec());
                 entries_merged += 1;
                 last_key = Some(entry.key.clone());
@@ -308,7 +301,7 @@ impl Compactor {
 /// Entry for k-way merge heap
 struct MergeEntry {
     key: Bytes,
-    value: Bytes,
+    value: Option<Bytes>,
     source: usize,
 }
 

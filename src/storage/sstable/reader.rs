@@ -4,7 +4,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -12,24 +12,20 @@ use bytes::Bytes;
 use memmap2::{Mmap, MmapOptions};
 
 use super::super::cache::{BlockCache, CacheKey};
+use super::types::SSTABLE_VERSION_V1;
 use super::{
-    decompress_block, BloomFilter, CompressionType, SSTableConfig, SSTableInfo, SSTableIterator,
-    FOOTER_SIZE, SSTABLE_MAGIC, SSTABLE_VERSION,
+    decompress_block, BloomFilter, CompressionType, SSTableIterator, FOOTER_SIZE, SSTABLE_MAGIC,
+    SSTABLE_VERSION,
 };
 use crate::core::error::{Error, Result};
 
 /// SSTable reader
 pub struct SSTableReader {
-    #[allow(dead_code)]
-    path: PathBuf,
     file_id: u64,
     mmap: Mmap,
-    #[allow(dead_code)]
-    info: SSTableInfo,
+    format_version: u32,
     index: SSTableIndex,
     bloom_filter: Option<BloomFilter>,
-    #[allow(dead_code)]
-    config: SSTableConfig,
     cache: Option<Arc<BlockCache>>,
 }
 
@@ -49,6 +45,12 @@ pub(crate) struct IndexEntry {
 pub(crate) struct BlockInfo {
     pub offset: u64,
     pub size: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SSTableValue {
+    Value(Bytes),
+    Tombstone,
 }
 
 impl SSTableReader {
@@ -92,7 +94,7 @@ impl SSTableReader {
         }
 
         let version = cursor.read_u32::<LittleEndian>()?;
-        if version != SSTABLE_VERSION {
+        if version != SSTABLE_VERSION && version != SSTABLE_VERSION_V1 {
             return Err(Error::SSTable {
                 message: format!("Unsupported SSTable version: {}", version),
                 source: None,
@@ -153,41 +155,17 @@ impl SSTableReader {
             None
         };
 
-        // Extract min/max keys from index
-        let (min_key, max_key) = if index.entries.is_empty() {
-            (vec![], vec![])
-        } else {
-            // For min key, we need to read the first entry of the first block
-            let first_key = Self::read_first_key(&mmap, &index)?;
-            let last_key = index.entries.last().unwrap().last_key.to_vec();
-            (first_key.to_vec(), last_key)
-        };
-
-        // Create info
-        let info = SSTableInfo {
-            id: 0, // Will be set by caller
-            path: path.clone(),
-            file_size,
-            entry_count: 0, // Could be stored in footer or calculated
-            min_key,
-            max_key,
-            creation_time: 0, // Could be stored in footer
-            level: 0,
-        };
-
         // Compute file_id from path hash
         let mut hasher = DefaultHasher::new();
         path.hash(&mut hasher);
         let file_id = hasher.finish();
 
         Ok(Self {
-            path,
             file_id,
             mmap,
-            info,
+            format_version: version,
             index,
             bloom_filter,
-            config: SSTableConfig::default(),
             cache: None,
         })
     }
@@ -206,6 +184,14 @@ impl SSTableReader {
 
     /// Get value by key
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        Ok(match self.get_entry(key)? {
+            Some(SSTableValue::Value(value)) => Some(value),
+            Some(SSTableValue::Tombstone) | None => None,
+        })
+    }
+
+    /// Get raw SSTable entry by key, preserving tombstones.
+    pub(crate) fn get_entry(&self, key: &[u8]) -> Result<Option<SSTableValue>> {
         // Check bloom filter first
         if let Some(ref bloom) = self.bloom_filter {
             if !bloom.contains(key) {
@@ -223,7 +209,7 @@ impl SSTableReader {
         let block_data = self.read_block(block_info.offset, block_info.size)?;
 
         // Search within block
-        self.search_block(&block_data, key)
+        self.search_block_entry(&block_data, key)
     }
 
     /// Read and decompress a block (with cache)
@@ -277,7 +263,11 @@ impl SSTableReader {
     }
 
     /// Search for key within a block
-    fn search_block(&self, block_data: &[u8], target_key: &[u8]) -> Result<Option<Bytes>> {
+    fn search_block_entry(
+        &self,
+        block_data: &[u8],
+        target_key: &[u8],
+    ) -> Result<Option<SSTableValue>> {
         let mut cursor = Cursor::new(block_data);
 
         // First, read the footer to get entry count and offsets
@@ -315,10 +305,7 @@ impl SSTableReader {
             match key.as_slice().cmp(target_key) {
                 std::cmp::Ordering::Equal => {
                     // Found it, read value
-                    let value_len = cursor.read_u32::<LittleEndian>()? as usize;
-                    let mut value = vec![0u8; value_len];
-                    cursor.read_exact(&mut value)?;
-                    return Ok(Some(Bytes::from(value)));
+                    return self.read_value(&mut cursor).map(Some);
                 }
                 std::cmp::Ordering::Less => left = mid + 1,
                 std::cmp::Ordering::Greater => right = mid,
@@ -328,31 +315,41 @@ impl SSTableReader {
         Ok(None)
     }
 
+    pub(crate) fn read_value(&self, cursor: &mut Cursor<&[u8]>) -> Result<SSTableValue> {
+        if self.format_version == SSTABLE_VERSION_V1 {
+            let value_len = cursor.read_u32::<LittleEndian>()? as usize;
+            let mut value = vec![0u8; value_len];
+            cursor.read_exact(&mut value)?;
+            return Ok(if value.is_empty() {
+                SSTableValue::Tombstone
+            } else {
+                SSTableValue::Value(Bytes::from(value))
+            });
+        }
+
+        let marker = cursor.read_u8()?;
+        let value_len = cursor.read_u32::<LittleEndian>()? as usize;
+        let mut value = vec![0u8; value_len];
+        cursor.read_exact(&mut value)?;
+
+        match marker {
+            0 => Ok(SSTableValue::Tombstone),
+            1 => Ok(SSTableValue::Value(Bytes::from(value))),
+            other => Err(Error::SSTable {
+                message: format!("Invalid SSTable value marker: {}", other),
+                source: None,
+            }),
+        }
+    }
+
     /// Create iterator over all entries
     pub fn iter(&self) -> SSTableIterator<'_> {
         SSTableIterator::new(self)
     }
 
-    /// Get reference to internal mmap
-    #[allow(dead_code)]
-    pub(crate) fn mmap(&self) -> &Mmap {
-        &self.mmap
-    }
-
     /// Get reference to index
     pub(crate) fn index(&self) -> &SSTableIndex {
         &self.index
-    }
-
-    /// Read first key from the first block
-    fn read_first_key(_mmap: &Mmap, index: &SSTableIndex) -> Result<Bytes> {
-        if index.entries.is_empty() {
-            return Ok(Bytes::new());
-        }
-
-        // For now, just return empty bytes - we'll read it properly after initialization
-        // Reading the first key requires decompressing the block which needs the compression type
-        Ok(Bytes::new())
     }
 
     /// Deserialize bloom filter from raw data
@@ -414,7 +411,9 @@ impl SSTableIndex {
         }
 
         // Binary search: find first block whose last_key >= key
-        let idx = self.entries.partition_point(|entry| entry.last_key.as_ref() < key);
+        let idx = self
+            .entries
+            .partition_point(|entry| entry.last_key.as_ref() < key);
 
         if idx < self.entries.len() {
             let entry = &self.entries[idx];

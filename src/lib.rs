@@ -2,8 +2,9 @@
 //!
 //! A fast, embedded key-value store with a BTreeMap-like API.
 //!
-//! TurboKV achieves **2x faster** durable writes than RocksDB and fjall through
-//! careful optimization. See the [`optimizations`] module for details.
+//! TurboKV is optimized for high write throughput, with fast mode tuned for
+//! benchmark-heavy workloads and durable mode using a WAL for crash recovery.
+//! See the [`optimizations`] module for implementation notes.
 //!
 //! ## Quick Start
 //!

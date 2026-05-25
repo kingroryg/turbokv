@@ -19,8 +19,10 @@ impl BlockBuilder {
         }
     }
 
-    pub fn add(&mut self, key: &[u8], value: &[u8]) -> bool {
-        let entry_size = 4 + key.len() + 4 + value.len(); // key_len + key + value_len + value
+    pub fn add(&mut self, key: &[u8], value: Option<&[u8]>) -> bool {
+        let value_len = value.map_or(0, <[u8]>::len);
+        // key_len + key + value_marker + value_len + value
+        let entry_size = 4 + key.len() + 1 + 4 + value_len;
 
         // Check if adding this entry would exceed max size
         // Always allow at least one entry
@@ -35,9 +37,14 @@ impl BlockBuilder {
         self.buffer.put_u32_le(key.len() as u32);
         self.buffer.put_slice(key);
 
+        // Write value marker: 0 = tombstone, 1 = present value.
+        self.buffer.put_u8(u8::from(value.is_some()));
+
         // Write value length and value
-        self.buffer.put_u32_le(value.len() as u32);
-        self.buffer.put_slice(value);
+        self.buffer.put_u32_le(value_len as u32);
+        if let Some(value) = value {
+            self.buffer.put_slice(value);
+        }
 
         // Update last key
         self.last_key = Some(Bytes::copy_from_slice(key));
@@ -89,7 +96,6 @@ impl BlockBuilder {
 /// Builder for SSTable index
 pub struct IndexBuilder {
     entries: Vec<IndexEntry>,
-    pending_key: Option<Bytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,18 +110,7 @@ impl IndexBuilder {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            pending_key: None,
         }
-    }
-
-    /// Set a pending key for the next block
-    pub fn set_pending_key(&mut self, key: &[u8]) {
-        self.pending_key = Some(Bytes::copy_from_slice(key));
-    }
-
-    /// Check if there's a pending key
-    pub fn has_pending_key(&self) -> bool {
-        self.pending_key.is_some()
     }
 
     /// Add an index entry
@@ -125,7 +120,6 @@ impl IndexBuilder {
             block_offset,
             block_size,
         });
-        self.pending_key = None;
         Ok(())
     }
 

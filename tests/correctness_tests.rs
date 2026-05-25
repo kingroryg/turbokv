@@ -37,31 +37,37 @@ async fn test_tombstone_point_get() {
 // 2. Empty-value handling
 // ---------------------------------------------------------------------------
 
-/// Known limitation: empty values are treated as tombstones at the SSTable
-/// level because SSTable readers interpret `value.is_empty()` as a delete
-/// marker.  At the memtable level (before any flush) the empty value is
-/// distinguishable from a tombstone.
 #[tokio::test]
 async fn test_empty_value_handling() {
     let tmp = TempDir::new().unwrap();
+    let path = tmp.path().to_path_buf();
+
     let db = Db::open_with_options(tmp.path(), DbOptions::durable())
         .await
         .unwrap();
 
-    // Before flush: empty value is returned as-is from the memtable.
     db.insert(b"key_empty", b"").await.unwrap();
     assert_eq!(
         db.get(b"key_empty").await.unwrap(),
         Some(b"".to_vec()),
-        "Empty value should be returned from the memtable layer"
+        "Empty value should be returned from the memtable"
     );
 
-    // After flush: the SSTable treats the empty value as a tombstone.
     db.flush().await.unwrap();
     assert_eq!(
         db.get(b"key_empty").await.unwrap(),
-        None,
-        "Known limitation: empty values become tombstones after flush to SSTable"
+        Some(b"".to_vec()),
+        "Empty value should survive flush to SSTable"
+    );
+    drop(db);
+
+    let reopened = Db::open_with_options(&path, DbOptions::durable())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.get(b"key_empty").await.unwrap(),
+        Some(b"".to_vec()),
+        "Empty value should survive reopen from SSTable"
     );
 }
 
@@ -136,6 +142,62 @@ async fn test_batch_write_recovery() {
         assert_eq!(db.get(b"batch_b").await.unwrap(), Some(b"val_b".to_vec()));
         assert_eq!(db.get(b"batch_c").await.unwrap(), Some(b"val_c".to_vec()));
     }
+}
+
+// ---------------------------------------------------------------------------
+// 4b. Bulk insert recovery
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_insert_many_persists_after_reopen() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().to_path_buf();
+
+    {
+        let db = Db::open_with_options(&path, DbOptions::durable())
+            .await
+            .unwrap();
+        db.insert_many([
+            (b"bulk:a".as_slice(), b"1".as_slice()),
+            (b"bulk:b".as_slice(), b"2".as_slice()),
+            (b"bulk:empty".as_slice(), b"".as_slice()),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+    }
+
+    let reopened = Db::open_with_options(&path, DbOptions::durable())
+        .await
+        .unwrap();
+    assert_eq!(reopened.get(b"bulk:a").await.unwrap(), Some(b"1".to_vec()));
+    assert_eq!(reopened.get(b"bulk:b").await.unwrap(), Some(b"2".to_vec()));
+    assert_eq!(reopened.get(b"bulk:empty").await.unwrap(), Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn test_insert_many_overwrites_existing_values() {
+    let tmp = TempDir::new().unwrap();
+    let db = Db::open_with_options(tmp.path(), DbOptions::durable())
+        .await
+        .unwrap();
+
+    db.insert(b"bulk:overwrite", b"old").await.unwrap();
+    db.insert_many([
+        (b"bulk:overwrite".as_slice(), b"new".as_slice()),
+        (b"bulk:other".as_slice(), b"value".as_slice()),
+    ])
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db.get(b"bulk:overwrite").await.unwrap(),
+        Some(b"new".to_vec())
+    );
+    assert_eq!(
+        db.get(b"bulk:other").await.unwrap(),
+        Some(b"value".to_vec())
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -486,10 +548,16 @@ async fn test_scan_empty_db() {
         .unwrap();
 
     let range_results = db.range(b"a", b"z").await.unwrap();
-    assert!(range_results.is_empty(), "Range scan on empty DB should return empty vec");
+    assert!(
+        range_results.is_empty(),
+        "Range scan on empty DB should return empty vec"
+    );
 
     let prefix_results = db.scan_prefix(b"anything").await.unwrap();
-    assert!(prefix_results.is_empty(), "Prefix scan on empty DB should return empty vec");
+    assert!(
+        prefix_results.is_empty(),
+        "Prefix scan on empty DB should return empty vec"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -523,7 +591,11 @@ async fn test_reopen_preserves_deletes() {
             .unwrap();
 
         assert_eq!(db.get(b"x").await.unwrap(), Some(b"1".to_vec()));
-        assert_eq!(db.get(b"y").await.unwrap(), None, "Deleted key y should remain deleted after reopen");
+        assert_eq!(
+            db.get(b"y").await.unwrap(),
+            None,
+            "Deleted key y should remain deleted after reopen"
+        );
         assert_eq!(db.get(b"z").await.unwrap(), Some(b"3".to_vec()));
     }
 }
@@ -551,7 +623,11 @@ async fn test_batch_mixed_operations() {
 
     assert_eq!(db.get(b"a").await.unwrap(), Some(b"1".to_vec()));
     assert_eq!(db.get(b"b").await.unwrap(), Some(b"2".to_vec()));
-    assert_eq!(db.get(b"c").await.unwrap(), None, "Batch-deleted key should be None");
+    assert_eq!(
+        db.get(b"c").await.unwrap(),
+        None,
+        "Batch-deleted key should be None"
+    );
     assert_eq!(db.get(b"d").await.unwrap(), Some(b"4".to_vec()));
 }
 
@@ -632,7 +708,33 @@ async fn test_stats_basic() {
 }
 
 // ---------------------------------------------------------------------------
-// 20. Fast mode basic
+// 20. Durable bulkload stats
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_stats_include_durable_bulkload_counters() {
+    let tmp = TempDir::new().unwrap();
+    let db = Db::open_with_options(tmp.path(), DbOptions::durable())
+        .await
+        .unwrap();
+
+    db.insert_many((0..128).map(|i| (format!("bulk-stats:{i:04}").into_bytes(), vec![b'x'; 128])))
+        .await
+        .unwrap();
+
+    let before_flush = db.stats();
+    assert!(before_flush.wal_bytes_written > 0);
+    assert_eq!(before_flush.immutable_memtables, 0);
+
+    db.flush().await.unwrap();
+    let after_flush = db.stats();
+    assert!(after_flush.sstable_flush_bytes_written > 0);
+    assert!(after_flush.l0_sstable_count >= 1);
+    assert_eq!(after_flush.write_stall_count, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 21. Fast mode basic
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

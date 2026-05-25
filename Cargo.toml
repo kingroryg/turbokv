@@ -161,3 +161,7 @@ harness = false
 [[bench]]
 name = "large_scale_bench"
 harness = false
+
+[[bench]]
+name = "durable_bulkload"
+harness = false

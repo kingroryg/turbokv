@@ -55,7 +55,7 @@ impl SSTableWriter {
         })
     }
 
-    /// Add key-value pair (None value represents a tombstone/deletion)
+    /// Add key-value pair (`None` represents a tombstone/deletion).
     pub fn add(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         // Update min/max keys
         if self.min_key.is_none() {
@@ -66,17 +66,13 @@ impl SSTableWriter {
         // Add to bloom filter
         self.bloom_filter.insert(key);
 
-        // For tombstones, use empty value with a marker in the block
-        // We use an empty slice to represent tombstones - reader distinguishes via length
-        let value_bytes = value.unwrap_or(&[]);
-
         // Add to current block
-        if !self.current_block.add(key, value_bytes) {
+        if !self.current_block.add(key, value) {
             // Block is full, flush it
             self.flush_block()?;
 
             // Try again with new block
-            if !self.current_block.add(key, value_bytes) {
+            if !self.current_block.add(key, value) {
                 return Err(Error::SSTable {
                     message: "Entry too large for block".to_string(),
                     source: None,

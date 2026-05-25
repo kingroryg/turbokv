@@ -74,10 +74,10 @@ impl Default for DbOptions {
     fn default() -> Self {
         Self {
             wal_enabled: true,
-            sync_writes: false,  // Durable mode (periodic sync, not per-write)
+            sync_writes: false, // Durable mode (periodic sync, not per-write)
             memtable_size: 64 * 1024 * 1024,
             block_cache_size: 64 * 1024 * 1024,
-            compression: Compression::Lz4,  // Match README
+            compression: Compression::Lz4, // Match README
         }
     }
 }
@@ -198,6 +198,25 @@ impl Db {
         Ok(())
     }
 
+    /// Insert multiple key-value pairs.
+    ///
+    /// With WAL enabled, all entries are appended to the WAL before any entry
+    /// is made visible in the memtable.
+    pub async fn insert_many<I, K, V>(&self, entries: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = entries
+            .into_iter()
+            .map(|(key, value)| (key.as_ref().to_vec(), value.as_ref().to_vec()))
+            .collect();
+
+        self.engine.insert_many(&entries).await?;
+        Ok(())
+    }
+
     /// Get a value by key
     ///
     /// Returns `None` if the key doesn't exist.
@@ -312,6 +331,14 @@ impl Db {
             wal_size: stats.wal_size,
             sstable_count: stats.sstable_count as u64,
             memtable_size: stats.memtable_size,
+            wal_bytes_written: stats.wal_bytes_written,
+            sstable_flush_bytes_written: stats.sstable_flush_bytes_written,
+            compaction_bytes_read: stats.compaction_bytes_read,
+            compaction_bytes_written: stats.compaction_bytes_written,
+            immutable_memtables: stats.immutable_memtables,
+            l0_sstable_count: stats.l0_sstable_count,
+            write_stall_count: stats.write_stall_count,
+            write_stall_micros: stats.write_stall_micros,
         }
     }
 }
@@ -329,6 +356,22 @@ pub struct DbStats {
     pub sstable_count: u64,
     /// Current memtable size
     pub memtable_size: u64,
+    /// Total WAL bytes written by this process
+    pub wal_bytes_written: u64,
+    /// Total SSTable bytes written by memtable flushes
+    pub sstable_flush_bytes_written: u64,
+    /// Total bytes read by compaction jobs
+    pub compaction_bytes_read: u64,
+    /// Total bytes written by compaction jobs
+    pub compaction_bytes_written: u64,
+    /// Immutable memtables waiting to be flushed
+    pub immutable_memtables: u64,
+    /// Number of level-0 SSTables
+    pub l0_sstable_count: u64,
+    /// Number of controlled write stalls
+    pub write_stall_count: u64,
+    /// Total controlled write stall time in microseconds
+    pub write_stall_micros: u64,
 }
 
 #[cfg(test)]
