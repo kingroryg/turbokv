@@ -45,6 +45,9 @@ pub type Result<T> = std::result::Result<T, DbError>;
 /// Database errors
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
+    #[error("Invalid database options: {0}")]
+    InvalidOptions(String),
+
     #[error("Storage error: {0}")]
     Storage(#[from] StorageError),
 
@@ -55,12 +58,18 @@ pub enum DbError {
     Other(String),
 }
 
-/// Configuration options for the database
+/// Configuration options for the database.
+///
+/// Use [`DbOptions::fast`], [`DbOptions::durable`], or
+/// [`DbOptions::paranoid`] to select a supported durability contract. Custom
+/// field combinations are validated by [`Db::open_with_options`].
 #[derive(Debug, Clone)]
 pub struct DbOptions {
-    /// Enable WAL for durability (default: true)
+    /// Append acknowledged mutations to the write-ahead log.
     pub wal_enabled: bool,
-    /// Sync writes immediately (default: false for durable mode)
+    /// Sync each WAL write before acknowledging it.
+    ///
+    /// This requires [`Self::wal_enabled`] and is rejected without it.
     pub sync_writes: bool,
     /// MemTable size in bytes before flush (default: 64MB)
     pub memtable_size: usize,
@@ -83,9 +92,11 @@ impl Default for DbOptions {
 }
 
 impl DbOptions {
-    /// Fast configuration - no WAL, no sync
+    /// In-memory acknowledgement without a write-ahead log.
     ///
-    /// **Durability:** None - data may be lost on process crash
+    /// A successful mutation is immediately visible to this database handle,
+    /// but may be lost if the process exits before [`Db::flush`] or
+    /// [`Db::close`] succeeds.
     ///
     /// Best for: caches, temporary data, benchmarks
     pub fn fast() -> Self {
@@ -98,13 +109,13 @@ impl DbOptions {
         }
     }
 
-    /// Durable configuration - WAL enabled, no sync per write
+    /// Process-crash durability through an unsynced write-ahead log.
     ///
-    /// **Durability:** Survives process crashes (data in WAL is recovered)
-    ///
-    /// The WAL is written but not immediately synced to disk. The OS
-    /// will flush buffers periodically. This provides good durability
-    /// for most use cases with much better performance than paranoid mode.
+    /// A mutation is appended to the WAL before it becomes visible. The WAL is
+    /// not synced for every mutation, so this mode is intended to survive a
+    /// TurboKV or process crash but does not promise power-loss durability for
+    /// the most recent acknowledgements. [`Db::flush`] and [`Db::close`] sync
+    /// pending state.
     ///
     /// Best for: most production workloads
     pub fn durable() -> Self {
@@ -117,13 +128,11 @@ impl DbOptions {
         }
     }
 
-    /// Paranoid configuration - WAL enabled, sync on every write
+    /// Per-mutation synced write-ahead logging.
     ///
-    /// **Durability:** Survives power loss (each write is fsync'd)
-    ///
-    /// Every write is immediately flushed to disk with fsync(). This
-    /// guarantees no data loss even on sudden power failure, but is
-    /// significantly slower than durable mode.
+    /// A mutation is acknowledged only after its WAL write has been synced.
+    /// This is the strongest durability mode and is intended for sudden power
+    /// loss, subject to the filesystem and storage device honoring sync.
     ///
     /// Best for: financial transactions, critical records
     pub fn paranoid() -> Self {
@@ -143,9 +152,37 @@ impl DbOptions {
     }
 }
 
-/// TurboKV database - a fast, embedded key-value store
+/// TurboKV database - a fast, embedded key-value store.
 ///
 /// Provides a BTreeMap-like API for storing and retrieving data.
+///
+/// # Visibility and ordering
+///
+/// Range and prefix results are ordered lexicographically by raw key bytes.
+/// Operations supplied to one bulk or batch call are applied in iterator order,
+/// so the last operation for a duplicate key determines the state observed
+/// immediately after success, subject to the limitations below.
+///
+/// Fast mode currently buffers individual inserts. Mixing buffered inserts
+/// with deletes, batches, or bulk inserts does not yet guarantee program order;
+/// a later direct mutation can be overtaken when the older insert buffer is
+/// drained.
+///
+/// Point, range, and prefix reads in this version can expose an older SSTable
+/// value when a newer tombstone for the same key resides in another storage
+/// layer. Applications that require cross-layer deletion consistency must not
+/// rely on the affected read until that limitation is removed.
+///
+/// Batches guarantee ordered application and all operations are visible after
+/// a successful return. This version does not provide isolation from
+/// concurrent calls or all-or-nothing recovery from a torn WAL tail.
+///
+/// # Operational errors
+///
+/// Except for [`DbError::InvalidOptions`], an error can occur after storage
+/// side effects. Callers must treat a failed mutation, flush, or batch as having
+/// an indeterminate outcome and verify state before a non-idempotent retry.
+/// A failed [`Db::close`] consumes the handle and does not promise persistence.
 pub struct Db {
     engine: Arc<Engine>,
 }
@@ -158,8 +195,17 @@ impl Db {
         Self::open_with_options(path, DbOptions::default()).await
     }
 
-    /// Open a database with custom options
+    /// Open a database with custom options.
+    ///
+    /// Returns [`DbError::InvalidOptions`] before creating database files when
+    /// the requested durability combination is contradictory.
     pub async fn open_with_options<P: AsRef<Path>>(path: P, options: DbOptions) -> Result<Self> {
+        if options.sync_writes && !options.wal_enabled {
+            return Err(DbError::InvalidOptions(
+                "sync_writes requires the write-ahead log to be enabled".to_string(),
+            ));
+        }
+
         let db_config = DbConfig {
             wal_enabled: options.wal_enabled,
             sync_writes: options.sync_writes,
@@ -185,9 +231,12 @@ impl Db {
         })
     }
 
-    /// Insert a key-value pair
+    /// Insert a key-value pair.
     ///
-    /// If the key already exists, the value is overwritten.
+    /// If the key already exists, the value is overwritten. Success means the
+    /// mutation is visible through this database and has reached the durability
+    /// point selected by [`DbOptions`]. Keys and values are arbitrary bytes;
+    /// an empty value is a stored value, not a deletion.
     ///
     /// # Performance
     /// Automatically uses the optimal path based on configuration:
@@ -198,10 +247,11 @@ impl Db {
         Ok(())
     }
 
-    /// Insert multiple key-value pairs.
+    /// Insert multiple key-value pairs in iterator order.
     ///
     /// With WAL enabled, all entries are appended to the WAL before any entry
-    /// is made visible in the memtable.
+    /// is made visible in the memtable. If a key occurs more than once, its last
+    /// value in the iterator is visible after success.
     pub async fn insert_many<I, K, V>(&self, entries: I) -> Result<()>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -217,16 +267,19 @@ impl Db {
         Ok(())
     }
 
-    /// Get a value by key
+    /// Get the latest acknowledged value for a key.
     ///
-    /// Returns `None` if the key doesn't exist.
+    /// Returns `None` if the key is absent or deleted. An existing empty value
+    /// is returned as `Some(Vec::new())`.
     pub async fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<Vec<u8>>> {
         Ok(self.engine.get(key.as_ref()).await?)
     }
 
-    /// Remove a key
+    /// Remove a key.
     ///
-    /// This is a no-op if the key doesn't exist.
+    /// This is a no-op if the key doesn't exist. Success means the tombstone has
+    /// reached the selected durability point. See [`Db`] for the current
+    /// cross-layer deletion visibility limitation.
     pub async fn remove<K: AsRef<[u8]>>(&self, key: K) -> Result<()> {
         self.engine.delete(key.as_ref()).await?;
         Ok(())
@@ -237,12 +290,14 @@ impl Db {
         Ok(self.engine.get(key.as_ref()).await?.is_some())
     }
 
-    /// Scan a range of keys (inclusive start, exclusive end)
+    /// Scan a byte range in lexicographic key order.
+    ///
+    /// The start bound is inclusive and the end bound is exclusive.
     pub async fn range<K: AsRef<[u8]>>(&self, start: K, end: K) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         Ok(self.engine.range(start.as_ref(), end.as_ref()).await?)
     }
 
-    /// Scan all keys with a given prefix
+    /// Scan all keys with a given byte prefix in lexicographic order.
     pub async fn scan_prefix<K: AsRef<[u8]>>(&self, prefix: K) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         Ok(self.engine.scan_prefix(prefix.as_ref()).await?)
     }
@@ -302,17 +357,45 @@ impl Db {
         Ok(self.engine.scan_prefix_iter(prefix.as_ref()).await?)
     }
 
-    /// Write multiple operations atomically
+    /// Apply multiple operations in batch order.
+    ///
+    /// On success, every operation has been applied. With the WAL enabled, the
+    /// full encoded batch is appended before any operation is applied in
+    /// memory. If the same key occurs more than once, its last operation wins.
+    /// See [`Db`] for the current cross-layer deletion visibility limitation.
+    ///
+    /// # Current atomicity limitation
+    ///
+    /// Concurrent calls can currently observe partial in-memory application,
+    /// and recovery from a torn WAL batch can apply a valid prefix. Do not rely
+    /// on isolation or crash atomicity until those guarantees are implemented.
     pub async fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
         self.engine.write_batch(batch).await?;
         Ok(())
     }
 
-    /// Flush all pending writes to disk
+    /// Flush all pending writes to durable storage.
+    ///
+    /// Success means thread-local write buffers have been drained, current
+    /// memtable contents have been installed as SSTables, and the WAL has been
+    /// synced. Concurrent writes that begin after the flush starts may require
+    /// a later flush.
     pub async fn flush(&self) -> Result<()> {
         // First flush ALL thread-local buffers from ALL threads
         self.engine.flush_write_buffers()?;
         self.engine.flush().await?;
+        Ok(())
+    }
+
+    /// Close the database cleanly after persisting pending writes.
+    ///
+    /// This consumes the database handle. Success means buffered writes have
+    /// been flushed to the storage engine and its background tasks have been
+    /// asked to stop. Dropping a [`Db`] does not provide this clean-close
+    /// guarantee; call `close` when pending writes must be persisted.
+    pub async fn close(self) -> Result<()> {
+        self.engine.flush_write_buffers()?;
+        self.engine.shutdown().await?;
         Ok(())
     }
 
