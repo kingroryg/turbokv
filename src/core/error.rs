@@ -32,12 +32,6 @@ pub enum Error {
     #[error("Query error: {message}")]
     QueryError { message: String },
 
-    #[error("Merkle chain validation failed: expected {expected}, got {actual}")]
-    MerkleValidation { expected: String, actual: String },
-
-    #[error("Tampering detected at position {position}")]
-    TamperingDetected { position: u64 },
-
     #[error("IO error: {message}")]
     Io {
         message: String,
@@ -69,8 +63,6 @@ impl Error {
             Error::Compaction { .. } => "COMPACTION_ERROR",
             Error::IndexCorruption { .. } => "INDEX_CORRUPTION",
             Error::QueryError { .. } => "QUERY_ERROR",
-            Error::MerkleValidation { .. } => "MERKLE_VALIDATION_FAILED",
-            Error::TamperingDetected { .. } => "TAMPERING_DETECTED",
             Error::Io { .. } => "IO_ERROR",
             Error::Configuration { .. } => "CONFIG_ERROR",
             Error::ResourceExhausted { .. } => "RESOURCE_EXHAUSTED",

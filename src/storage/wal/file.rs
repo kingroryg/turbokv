@@ -99,7 +99,8 @@ pub(crate) fn recover_file(path: &Path, _config: &WalConfig) -> Result<(WalFile,
     }
 
     let version = reader.read_u32::<LittleEndian>()?;
-    // Support v1, v2 (legacy with Merkle), and v3 (current, no Merkle)
+    // Versions 1 and 2 contain a fixed-width legacy entry extension. Version 3
+    // is the current compact format. Retain read compatibility with both.
     if version != WAL_VERSION && version != 1 && version != 2 {
         return Err(WalError::InvalidFormat(format!(
             "Unsupported WAL version: {}",
@@ -114,11 +115,10 @@ pub(crate) fn recover_file(path: &Path, _config: &WalConfig) -> Result<(WalFile,
     let _checksum = reader.read_u32::<LittleEndian>()?;
     reader.read_exact(&mut [0u8; 16])?;
 
-    // Read entries to find last sequence
-    // Use version to determine format (v2 has Merkle bytes, v3 doesn't)
-    let has_merkle = version <= 2;
+    // Read entries to find last sequence.
+    let has_legacy_extension = version <= 2;
     loop {
-        match read_entry_versioned(&mut reader, has_merkle) {
+        match read_entry_versioned(&mut reader, has_legacy_extension) {
             Ok(entry) => {
                 last_sequence = entry.sequence;
             }
@@ -166,7 +166,7 @@ pub(crate) fn read_header_last_sequence(path: &Path) -> Result<u64> {
     Ok(file.read_u64::<LittleEndian>()?)
 }
 
-/// Write a single entry to the WAL (v3 format - no Merkle)
+/// Write a single entry to the WAL (v3 format).
 #[allow(dead_code)]
 pub(crate) fn write_entry(writer: &mut impl Write, entry: &WalEntry) -> Result<()> {
     writer.write_u32::<LittleEndian>(entry.data.len() as u32)?;
@@ -181,14 +181,19 @@ pub(crate) fn write_entry(writer: &mut impl Write, entry: &WalEntry) -> Result<(
     Ok(())
 }
 
-/// Read a single entry from the WAL (v3 format - no Merkle)
+/// Read a single entry from the WAL (v3 format).
 pub(crate) fn read_entry(reader: &mut impl Read) -> Result<WalEntry> {
     read_entry_versioned(reader, false)
 }
 
-/// Read a single entry with version-aware format
-/// has_merkle: true for v1/v2 format (96 bytes Merkle), false for v3
-pub(crate) fn read_entry_versioned(reader: &mut impl Read, has_merkle: bool) -> Result<WalEntry> {
+/// Read a single entry with version-aware format.
+///
+/// Versions 1 and 2 contain a 96-byte extension between the header and payload;
+/// version 3 does not. The extension is ignored during migration reads.
+pub(crate) fn read_entry_versioned(
+    reader: &mut impl Read,
+    has_legacy_extension: bool,
+) -> Result<WalEntry> {
     let length = match reader.read_u32::<LittleEndian>() {
         Ok(len) => len as usize,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -204,8 +209,7 @@ pub(crate) fn read_entry_versioned(reader: &mut impl Read, has_merkle: bool) -> 
     let crc = reader.read_u32::<LittleEndian>()?;
     reader.read_exact(&mut [0u8; 6])?;
 
-    // Skip Merkle bytes if reading legacy format
-    if has_merkle {
+    if has_legacy_extension {
         reader.read_exact(&mut [0u8; 96])?;
     }
 
@@ -225,7 +229,7 @@ pub(crate) fn read_entry_versioned(reader: &mut impl Read, has_merkle: bool) -> 
     })
 }
 
-/// Calculate the size of an entry on disk (v3 format - no Merkle)
+/// Calculate the size of an entry on disk (v3 format).
 pub(crate) fn entry_size(entry: &WalEntry) -> usize {
     ENTRY_HEADER_SIZE + entry.data.len()
 }
@@ -254,11 +258,39 @@ pub(crate) fn write_entries_batch<T: AsRef<WalEntry>>(
         buffer.extend_from_slice(&crc32_checksum(&entry.data).to_le_bytes());
         buffer.extend_from_slice(&[0u8; 6]); // Reserved
 
-        // Payload (no Merkle overhead in v3)
+        // Payload
         buffer.extend_from_slice(&entry.data);
     }
 
     // Single syscall for all entries
     writer.write_all(&buffer)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_legacy_entry_extension_without_exposing_it() {
+        let payload = b"value";
+        let mut bytes = Vec::new();
+        bytes
+            .write_u32::<LittleEndian>(payload.len() as u32)
+            .unwrap();
+        bytes.write_u64::<LittleEndian>(7).unwrap();
+        bytes.write_u64::<LittleEndian>(11).unwrap();
+        bytes.write_u8(EntryType::Data as u8).unwrap();
+        bytes.write_u8(0).unwrap();
+        bytes
+            .write_u32::<LittleEndian>(crc32_checksum(payload))
+            .unwrap();
+        bytes.extend_from_slice(&[0u8; 6]);
+        bytes.extend_from_slice(&[0xAA; 96]);
+        bytes.extend_from_slice(payload);
+
+        let entry = read_entry_versioned(&mut bytes.as_slice(), true).unwrap();
+        assert_eq!(entry.sequence, 7);
+        assert_eq!(entry.data.as_ref(), payload);
+    }
 }

@@ -27,7 +27,10 @@ use crate::core::crypto::crc32_checksum;
 use crate::core::error::{Error, Result};
 
 const MANIFEST_MAGIC: &[u8; 8] = b"HNSHMNFT";
-const MANIFEST_VERSION: u32 = 1;
+/// Format v2 removed the unused length-prefixed checkpoint extension. Readers
+/// still accept v1 so existing databases can be upgraded in place.
+const MANIFEST_VERSION: u32 = 2;
+const LEGACY_MANIFEST_VERSION: u32 = 1;
 
 /// Database manifest - tracks persistent state
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,8 +40,6 @@ pub struct Manifest {
     /// Last WAL sequence that was flushed to SSTable
     /// On recovery, replay WAL entries > this sequence
     pub wal_checkpoint: u64,
-    /// Merkle hash at checkpoint - used to verify chain continuity
-    pub checkpoint_hash: Option<String>,
     /// All SSTable metadata
     pub sstables: Vec<SSTableManifestEntry>,
 }
@@ -64,7 +65,6 @@ impl Manifest {
         Self {
             version: 0,
             wal_checkpoint: 0,
-            checkpoint_hash: None,
             sstables: Vec::new(),
         }
     }
@@ -129,7 +129,7 @@ impl Manifest {
 
         // Read version
         let version = reader.read_u32::<LittleEndian>()?;
-        if version != MANIFEST_VERSION {
+        if version != MANIFEST_VERSION && version != LEGACY_MANIFEST_VERSION {
             return Err(Error::Internal {
                 message: format!("Unsupported manifest version: {}", version),
             });
@@ -138,15 +138,11 @@ impl Manifest {
         // Read WAL checkpoint
         let wal_checkpoint = reader.read_u64::<LittleEndian>()?;
 
-        // Read checkpoint hash length and data
-        let hash_len = reader.read_u32::<LittleEndian>()? as usize;
-        let checkpoint_hash = if hash_len > 0 {
-            let mut hash_bytes = vec![0u8; hash_len];
-            reader.read_exact(&mut hash_bytes)?;
-            Some(String::from_utf8_lossy(&hash_bytes).to_string())
-        } else {
-            None
-        };
+        if version == LEGACY_MANIFEST_VERSION {
+            let extension_len = reader.read_u32::<LittleEndian>()? as usize;
+            let mut extension = vec![0u8; extension_len];
+            reader.read_exact(&mut extension)?;
+        }
 
         // Read SSTable count
         let sstable_count = reader.read_u32::<LittleEndian>()? as usize;
@@ -168,7 +164,6 @@ impl Manifest {
         Ok(Self {
             version: version as u64,
             wal_checkpoint,
-            checkpoint_hash,
             sstables,
         })
     }
@@ -190,15 +185,6 @@ impl Manifest {
 
             // Write WAL checkpoint
             buf.write_u64::<LittleEndian>(self.wal_checkpoint)?;
-
-            // Write checkpoint hash
-            if let Some(ref hash) = self.checkpoint_hash {
-                let hash_bytes = hash.as_bytes();
-                buf.write_u32::<LittleEndian>(hash_bytes.len() as u32)?;
-                buf.write_all(hash_bytes)?;
-            } else {
-                buf.write_u32::<LittleEndian>(0)?;
-            }
 
             // Write SSTable count
             buf.write_u32::<LittleEndian>(self.sstables.len() as u32)?;
@@ -245,9 +231,8 @@ impl Manifest {
     }
 
     /// Update WAL checkpoint after successful flush
-    pub fn update_checkpoint(&mut self, sequence: u64, hash: Option<String>) {
+    pub fn update_checkpoint(&mut self, sequence: u64) {
         self.wal_checkpoint = sequence;
-        self.checkpoint_hash = hash;
         self.version += 1;
     }
 
@@ -381,6 +366,38 @@ mod tests {
         let manifest = Manifest::load_or_create(temp_dir.path()).unwrap();
 
         assert_eq!(manifest.wal_checkpoint, 0);
+        assert!(manifest.sstables.is_empty());
+    }
+
+    #[test]
+    fn current_manifest_does_not_write_legacy_extension() {
+        let temp_dir = TempDir::new().unwrap();
+        Manifest::new().save(temp_dir.path()).unwrap();
+
+        let bytes = std::fs::read(temp_dir.path().join("MANIFEST")).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 0);
+        assert_eq!(bytes.len(), 28);
+    }
+
+    #[test]
+    fn loads_v1_manifest_with_legacy_extension() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MANIFEST_MAGIC);
+        bytes
+            .write_u32::<LittleEndian>(LEGACY_MANIFEST_VERSION)
+            .unwrap();
+        bytes.write_u64::<LittleEndian>(42).unwrap();
+        bytes.write_u32::<LittleEndian>(6).unwrap();
+        bytes.extend_from_slice(b"legacy");
+        bytes.write_u32::<LittleEndian>(0).unwrap();
+        let checksum = crc32_checksum(&bytes);
+        bytes.write_u32::<LittleEndian>(checksum).unwrap();
+        std::fs::write(temp_dir.path().join("MANIFEST"), bytes).unwrap();
+
+        let manifest = Manifest::load_or_create(temp_dir.path()).unwrap();
+        assert_eq!(manifest.wal_checkpoint, 42);
         assert!(manifest.sstables.is_empty());
     }
 }

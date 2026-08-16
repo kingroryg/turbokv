@@ -4,7 +4,7 @@
 //! - Configuration types ([`DbConfig`], [`Compression`])
 //! - Error handling ([`Error`], [`Result`])
 //! - Storage engine trait ([`StorageEngine`])
-//! - Cryptographic primitives ([`crypto`])
+//! - Data integrity primitives ([`crypto`])
 //! - Serialization utilities ([`serialization`])
 
 pub mod config;
