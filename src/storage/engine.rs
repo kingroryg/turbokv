@@ -31,13 +31,14 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info};
 
@@ -46,9 +47,9 @@ use crate::core::{CompactionResult, DbConfig, StorageStats, WriteBatch};
 use super::{
     compaction::{CompactionConfig, Compactor},
     fd::{FdConfig, FdMonitor, SSTablePool},
-    manifest::{Manifest, SSTableManifestEntry},
+    manifest::{atomic_replace, sync_directory, Manifest, SSTableManifestEntry},
     memtable::{MemTableConfig, MemTableManager},
-    sstable::{SSTableConfig, SSTableInfo, SSTableWriter},
+    sstable::{SSTableConfig, SSTableInfo, SSTableReader, SSTableWriter},
     wal::{WalConfig, WriteAheadLog},
 };
 
@@ -192,6 +193,14 @@ pub struct Engine {
     memtable_manager: Arc<MemTableManager>,
     sstables: Arc<RwLock<Vec<SSTableInfo>>>,
     manifest: Arc<Mutex<Manifest>>,
+    /// Serializes foreground and background ownership of the immutable FIFO.
+    flush_lock: Arc<AsyncMutex<()>>,
+    /// Prevents checkpoint installation from racing sequence allocation/application.
+    mutation_barrier: Arc<RwLock<()>>,
+    /// Conservative floors for WAL applications that did not finish. Floors
+    /// remain until reopen, when WAL replay applies them before this set starts
+    /// empty again.
+    unapplied_wal_sequences: Arc<Mutex<BTreeSet<u64>>>,
     shutdown: tokio::sync::watch::Sender<bool>,
     next_sstable_id: Arc<std::sync::atomic::AtomicU64>,
     sstable_pool: Arc<SSTablePool>,
@@ -335,6 +344,9 @@ impl Engine {
             memtable_manager,
             sstables: Arc::new(RwLock::new(sstables)),
             manifest: Arc::new(Mutex::new(manifest)),
+            flush_lock: Arc::new(AsyncMutex::new(())),
+            mutation_barrier: Arc::new(RwLock::new(())),
+            unapplied_wal_sequences: Arc::new(Mutex::new(BTreeSet::new())),
             shutdown: shutdown_tx,
             next_sstable_id,
             sstable_pool,
@@ -371,9 +383,12 @@ impl Engine {
     /// - With WAL: Async path for durability
     pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.maybe_stall_writes().await;
+        let _mutation = self.mutation_barrier.read().await;
 
         if let Some(ref wal) = self.wal {
             // Durable path: WAL write then memtable
+            let mut pending =
+                PendingWalApplication::new(&self.unapplied_wal_sequences, wal.current_sequence());
             let sequence = wal.append(key, value).await?;
             #[cfg(test)]
             super::failpoints::check(
@@ -385,6 +400,7 @@ impl Engine {
             self.memtable_manager
                 .insert_with_sequence(key, value, sequence)
                 .map_err(StorageError::MemTable)?;
+            pending.disarm();
         } else {
             // Fast path: thread-local buffered insert, no async overhead
             self.memtable_manager
@@ -402,12 +418,15 @@ impl Engine {
         }
 
         self.maybe_stall_writes().await;
+        let _mutation = self.mutation_barrier.read().await;
 
         if let Some(ref wal) = self.wal {
             let wal_entries: Vec<(&[u8], Option<&[u8]>)> = entries
                 .iter()
                 .map(|(key, value)| (key.as_slice(), Some(value.as_slice())))
                 .collect();
+            let mut pending =
+                PendingWalApplication::new(&self.unapplied_wal_sequences, wal.current_sequence());
             let sequences = wal.append_batch(&wal_entries).await?;
             #[cfg(test)]
             super::failpoints::check(
@@ -423,6 +442,7 @@ impl Engine {
             self.memtable_manager
                 .insert_many_with_sequences(entries, &sequences)
                 .map_err(StorageError::MemTable)?;
+            pending.disarm();
         } else {
             self.memtable_manager
                 .insert_many(entries)
@@ -446,9 +466,12 @@ impl Engine {
     /// Delete a key
     pub async fn delete(&self, key: &[u8]) -> Result<()> {
         self.maybe_stall_writes().await;
+        let _mutation = self.mutation_barrier.read().await;
 
         // Write to WAL first (if enabled)
         if let Some(ref wal) = self.wal {
+            let mut pending =
+                PendingWalApplication::new(&self.unapplied_wal_sequences, wal.current_sequence());
             let sequence = wal.append_delete(key).await?;
             #[cfg(test)]
             super::failpoints::check(
@@ -460,6 +483,7 @@ impl Engine {
             self.memtable_manager
                 .delete_with_sequence(key, sequence)
                 .map_err(StorageError::MemTable)?;
+            pending.disarm();
         } else {
             self.memtable_manager
                 .delete(key)
@@ -588,9 +612,12 @@ impl Engine {
 
     /// Write a batch of operations atomically
     pub async fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
-        if !batch.is_empty() {
+        let _mutation = if batch.is_empty() {
+            None
+        } else {
             self.maybe_stall_writes().await;
-        }
+            Some(self.mutation_barrier.read().await)
+        };
 
         // Convert to WAL batch format
         let ops: Vec<(&[u8], Option<&[u8]>)> = batch
@@ -605,7 +632,9 @@ impl Engine {
             .collect();
 
         // Write to WAL (if enabled)
-        let wal_sequences = if let Some(ref wal) = self.wal {
+        let (wal_sequences, mut pending_wal) = if let Some(ref wal) = self.wal {
+            let pending =
+                PendingWalApplication::new(&self.unapplied_wal_sequences, wal.current_sequence());
             let sequences = wal.append_batch(&ops).await?;
             #[cfg(test)]
             super::failpoints::check(
@@ -622,9 +651,9 @@ impl Engine {
                 .sum();
             self.wal_bytes_written
                 .fetch_add(wal_bytes, Ordering::Relaxed);
-            Some(sequences)
+            (Some(sequences), Some(pending))
         } else {
-            None
+            (None, None)
         };
 
         // Apply to memtable
@@ -655,15 +684,24 @@ impl Engine {
             }
         }
 
+        if let Some(pending) = pending_wal.as_mut() {
+            pending.disarm();
+        }
+
         Ok(())
     }
 
     /// Flush memtable to SSTable
     pub async fn flush(&self) -> Result<()> {
-        // Force rotate memtable
-        self.memtable_manager
-            .force_rotate()
-            .map_err(StorageError::MemTable)?;
+        let _flush = self.flush_lock.lock().await;
+        {
+            // Wait for every sequence already allocated by a writer to reach a
+            // memtable before freezing the generation covered by this flush.
+            let _mutations = self.mutation_barrier.write().await;
+            self.memtable_manager
+                .force_rotate()
+                .map_err(StorageError::MemTable)?;
+        }
         #[cfg(test)]
         super::failpoints::check(
             &self.config.data_dir,
@@ -671,8 +709,13 @@ impl Engine {
         )?;
 
         // Flush all immutable memtables
-        while let Some(memtable) = self.memtable_manager.get_immutable_for_flush() {
+        while let Some(memtable) = self.memtable_manager.peek_immutable_for_flush() {
             self.flush_memtable_to_sstable(&memtable).await?;
+            if !self.memtable_manager.complete_immutable_flush(&memtable) {
+                return Err(StorageError::Other(
+                    "completed flush no longer owns the oldest immutable generation".to_string(),
+                ));
+            }
         }
 
         // Flush WAL
@@ -913,103 +956,27 @@ impl Engine {
     /// Flush a memtable to SSTable
     async fn flush_memtable_to_sstable(
         &self,
-        memtable: &super::memtable::MemTable,
+        memtable: &Arc<super::memtable::MemTable>,
     ) -> Result<SSTableInfo> {
-        let id = self
-            .next_sstable_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let path = self
-            .config
-            .data_dir
-            .join("sstables")
-            .join("L0")
-            .join(format!("{:010}.sst", id));
-
-        // Snapshot WAL sequence before flush (not live counter which advances during flush)
-        let flush_checkpoint = self.wal.as_ref().map(|w| w.current_sequence()).unwrap_or(0);
-
-        // Get all entries from memtable
-        let entries = memtable.get_all_entries();
-
-        // Write SSTable
-        let mut writer =
-            SSTableWriter::new(&path, self.config.sstable_config.clone()).map_err(|e| {
-                StorageError::SSTable(format!("Failed to create SSTable writer: {}", e))
-            })?;
-
-        for (key, entry) in &entries {
-            writer
-                .add_versioned(&key, entry.value.as_deref(), entry.sequence)
-                .map_err(|e| StorageError::SSTable(format!("Failed to write entry: {}", e)))?;
-        }
-
-        let mut info = writer
-            .finish()
-            .map_err(|e| StorageError::SSTable(format!("Failed to finish SSTable: {}", e)))?;
-
-        // Set the proper id (writer returns id: 0 as placeholder)
-        info.id = id;
-        #[cfg(test)]
-        super::failpoints::check(
-            &self.config.data_dir,
-            super::failpoints::PersistenceBoundary::SstablePublication,
-        )?;
-
-        // Update manifest
-        {
-            let mut manifest = self.manifest.lock();
-            manifest.sstables.push(SSTableManifestEntry {
-                id,
-                path: info.path.clone(),
-                size: info.file_size,
-                entry_count: info.entry_count,
-                min_key: info.min_key.clone(),
-                max_key: info.max_key.clone(),
-                min_sequence: info.min_sequence,
-                max_sequence: info.max_sequence,
-                creation_time: info.creation_time,
-                level: 0,
-            });
-            manifest.wal_checkpoint = flush_checkpoint;
-            manifest
-                .save(&self.config.data_dir)
-                .map_err(|e| StorageError::Manifest(e.to_string()))?;
-        }
-        #[cfg(test)]
-        super::failpoints::check(
-            &self.config.data_dir,
-            super::failpoints::PersistenceBoundary::ManifestInstallation,
-        )?;
-
-        // Add to SSTable list
-        self.sstables.write().await.push(info.clone());
-
-        // Update atomic stats counters
-        self.sstable_total_keys
-            .fetch_add(info.entry_count, Ordering::Relaxed);
-        self.sstable_total_bytes
-            .fetch_add(info.file_size, Ordering::Relaxed);
-        self.sstable_count.fetch_add(1, Ordering::Relaxed);
-        self.l0_sstable_count.fetch_add(1, Ordering::Relaxed);
-        self.sstable_flush_bytes_written
-            .fetch_add(info.file_size, Ordering::Relaxed);
-
-        info!("Flushed memtable to SSTable: {:?}", path);
-
-        #[cfg(test)]
-        super::failpoints::check(
-            &self.config.data_dir,
-            super::failpoints::PersistenceBoundary::Checkpoint,
-        )?;
-
-        // Truncate old WAL files
-        if let Some(ref wal) = self.wal {
-            if let Err(e) = wal.truncate(flush_checkpoint).await {
-                tracing::warn!("Failed to truncate WAL: {}", e);
-            }
-        }
-
-        Ok(info)
+        flush_memtable_to_sstable(
+            FlushResources {
+                config: &self.config,
+                wal: self.wal.as_ref(),
+                memtable_manager: &self.memtable_manager,
+                sstables: &self.sstables,
+                manifest: &self.manifest,
+                mutation_barrier: &self.mutation_barrier,
+                unapplied_wal_sequences: &self.unapplied_wal_sequences,
+                next_sstable_id: &self.next_sstable_id,
+                sstable_total_keys: &self.sstable_total_keys,
+                sstable_total_bytes: &self.sstable_total_bytes,
+                sstable_count: &self.sstable_count,
+                l0_sstable_count: &self.l0_sstable_count,
+                sstable_flush_bytes_written: &self.sstable_flush_bytes_written,
+            },
+            memtable,
+        )
+        .await
     }
 
     /// Run a compaction job
@@ -1161,6 +1128,9 @@ impl Engine {
             memtable_manager: self.memtable_manager.clone(),
             sstables: self.sstables.clone(),
             manifest: self.manifest.clone(),
+            flush_lock: self.flush_lock.clone(),
+            mutation_barrier: self.mutation_barrier.clone(),
+            unapplied_wal_sequences: self.unapplied_wal_sequences.clone(),
             next_sstable_id: self.next_sstable_id.clone(),
             compactor: self.compactor.clone(),
             config: self.config.clone(),
@@ -1181,6 +1151,9 @@ struct BackgroundEngine {
     memtable_manager: Arc<MemTableManager>,
     sstables: Arc<RwLock<Vec<SSTableInfo>>>,
     manifest: Arc<Mutex<Manifest>>,
+    flush_lock: Arc<AsyncMutex<()>>,
+    mutation_barrier: Arc<RwLock<()>>,
+    unapplied_wal_sequences: Arc<Mutex<BTreeSet<u64>>>,
     next_sstable_id: Arc<std::sync::atomic::AtomicU64>,
     compactor: Arc<Compactor>,
     config: StorageConfig,
@@ -1198,8 +1171,15 @@ struct BackgroundEngine {
 
 impl BackgroundEngine {
     async fn background_flush(&self) -> Result<()> {
-        while let Some(memtable) = self.memtable_manager.get_immutable_for_flush() {
+        let _flush = self.flush_lock.lock().await;
+        while let Some(memtable) = self.memtable_manager.peek_immutable_for_flush() {
             self.flush_memtable_to_sstable(&memtable).await?;
+            if !self.memtable_manager.complete_immutable_flush(&memtable) {
+                return Err(StorageError::Other(
+                    "completed background flush no longer owns the oldest immutable generation"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1239,99 +1219,27 @@ impl BackgroundEngine {
 
     async fn flush_memtable_to_sstable(
         &self,
-        memtable: &super::memtable::MemTable,
+        memtable: &Arc<super::memtable::MemTable>,
     ) -> Result<SSTableInfo> {
-        let id = self
-            .next_sstable_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let path = self
-            .config
-            .data_dir
-            .join("sstables")
-            .join("L0")
-            .join(format!("{:010}.sst", id));
-
-        // Snapshot WAL sequence before flush (not live counter which advances during flush)
-        let flush_checkpoint = self.wal.as_ref().map(|w| w.current_sequence()).unwrap_or(0);
-
-        let entries = memtable.get_all_entries();
-
-        let mut writer =
-            SSTableWriter::new(&path, self.config.sstable_config.clone()).map_err(|e| {
-                StorageError::SSTable(format!("Failed to create SSTable writer: {}", e))
-            })?;
-
-        for (key, entry) in &entries {
-            writer
-                .add_versioned(&key, entry.value.as_deref(), entry.sequence)
-                .map_err(|e| StorageError::SSTable(format!("Failed to write entry: {}", e)))?;
-        }
-
-        let mut info = writer
-            .finish()
-            .map_err(|e| StorageError::SSTable(format!("Failed to finish SSTable: {}", e)))?;
-
-        // Set the proper id (writer returns id: 0 as placeholder)
-        info.id = id;
-        #[cfg(test)]
-        super::failpoints::check(
-            &self.config.data_dir,
-            super::failpoints::PersistenceBoundary::SstablePublication,
-        )?;
-
-        {
-            let mut manifest = self.manifest.lock();
-            manifest.sstables.push(SSTableManifestEntry {
-                id,
-                path: info.path.clone(),
-                size: info.file_size,
-                entry_count: info.entry_count,
-                min_key: info.min_key.clone(),
-                max_key: info.max_key.clone(),
-                min_sequence: info.min_sequence,
-                max_sequence: info.max_sequence,
-                creation_time: info.creation_time,
-                level: 0,
-            });
-            manifest.wal_checkpoint = flush_checkpoint;
-            manifest
-                .save(&self.config.data_dir)
-                .map_err(|e| StorageError::Manifest(e.to_string()))?;
-        }
-        #[cfg(test)]
-        super::failpoints::check(
-            &self.config.data_dir,
-            super::failpoints::PersistenceBoundary::ManifestInstallation,
-        )?;
-
-        self.sstables.write().await.push(info.clone());
-
-        // Update atomic stats counters
-        self.sstable_total_keys
-            .fetch_add(info.entry_count, Ordering::Relaxed);
-        self.sstable_total_bytes
-            .fetch_add(info.file_size, Ordering::Relaxed);
-        self.sstable_count.fetch_add(1, Ordering::Relaxed);
-        self.l0_sstable_count.fetch_add(1, Ordering::Relaxed);
-        self.sstable_flush_bytes_written
-            .fetch_add(info.file_size, Ordering::Relaxed);
-
-        info!("Background flushed memtable to SSTable: {:?}", path);
-
-        #[cfg(test)]
-        super::failpoints::check(
-            &self.config.data_dir,
-            super::failpoints::PersistenceBoundary::Checkpoint,
-        )?;
-
-        // Truncate old WAL files
-        if let Some(ref wal) = self.wal {
-            if let Err(e) = wal.truncate(flush_checkpoint).await {
-                tracing::warn!("Failed to truncate WAL: {}", e);
-            }
-        }
-
-        Ok(info)
+        flush_memtable_to_sstable(
+            FlushResources {
+                config: &self.config,
+                wal: self.wal.as_ref(),
+                memtable_manager: &self.memtable_manager,
+                sstables: &self.sstables,
+                manifest: &self.manifest,
+                mutation_barrier: &self.mutation_barrier,
+                unapplied_wal_sequences: &self.unapplied_wal_sequences,
+                next_sstable_id: &self.next_sstable_id,
+                sstable_total_keys: &self.sstable_total_keys,
+                sstable_total_bytes: &self.sstable_total_bytes,
+                sstable_count: &self.sstable_count,
+                l0_sstable_count: &self.l0_sstable_count,
+                sstable_flush_bytes_written: &self.sstable_flush_bytes_written,
+            },
+            memtable,
+        )
+        .await
     }
 
     async fn run_compaction(&self, job: super::compaction::CompactionJob) -> Result<()> {
@@ -1418,6 +1326,319 @@ impl BackgroundEngine {
     }
 }
 
+struct FlushResources<'a> {
+    config: &'a StorageConfig,
+    wal: Option<&'a Arc<WriteAheadLog>>,
+    memtable_manager: &'a Arc<MemTableManager>,
+    sstables: &'a Arc<RwLock<Vec<SSTableInfo>>>,
+    manifest: &'a Arc<Mutex<Manifest>>,
+    mutation_barrier: &'a Arc<RwLock<()>>,
+    unapplied_wal_sequences: &'a Arc<Mutex<BTreeSet<u64>>>,
+    next_sstable_id: &'a Arc<AtomicU64>,
+    sstable_total_keys: &'a Arc<AtomicU64>,
+    sstable_total_bytes: &'a Arc<AtomicU64>,
+    sstable_count: &'a Arc<AtomicU64>,
+    l0_sstable_count: &'a Arc<AtomicU64>,
+    sstable_flush_bytes_written: &'a Arc<AtomicU64>,
+}
+
+async fn flush_memtable_to_sstable(
+    resources: FlushResources<'_>,
+    memtable: &Arc<super::memtable::MemTable>,
+) -> Result<SSTableInfo> {
+    let id = resources
+        .memtable_manager
+        .reserved_flush_id(memtable)
+        .unwrap_or_else(|| {
+            let proposed = resources.next_sstable_id.fetch_add(1, Ordering::SeqCst);
+            resources
+                .memtable_manager
+                .reserve_flush_id(memtable, proposed)
+        });
+
+    // Cancellation or an injected post-install failure can leave the manifest
+    // durable before the live reader list is updated. Reconcile that state
+    // without rewriting or recounting the generation.
+    let installed_entry = {
+        let manifest = resources.manifest.lock();
+        manifest
+            .sstables
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+    };
+    if let Some(entry) = installed_entry {
+        let info = sstable_info_from_manifest(&entry);
+        let expected = memtable.get_all_entries();
+        if !sstable_contents_match(&info.path, &expected)? {
+            return Err(StorageError::SSTable(format!(
+                "installed SSTable {} does not match its retained immutable generation",
+                info.path.display()
+            )));
+        }
+        install_live_sstable(&resources, &info).await;
+        reclaim_wal_after_checkpoint(&resources).await?;
+        return Ok(info);
+    }
+
+    let level_directory = resources.config.data_dir.join("sstables").join("L0");
+    let final_path = level_directory.join(format!("{:010}.sst", id));
+    let temp_path = level_directory.join(format!(".{:010}.sst.tmp", id));
+    let entries = memtable.get_all_entries();
+    let info = if let Some(info) = reusable_sstable_info(&final_path, id, &entries)? {
+        info
+    } else {
+        let mut writer = SSTableWriter::new(&temp_path, resources.config.sstable_config.clone())
+            .map_err(|error| {
+                StorageError::SSTable(format!("Failed to create SSTable writer: {error}"))
+            })?;
+        for (key, entry) in &entries {
+            writer
+                .add_versioned(key, entry.value.as_deref(), entry.sequence)
+                .map_err(|error| {
+                    StorageError::SSTable(format!("Failed to write entry: {error}"))
+                })?;
+        }
+
+        let mut info = writer
+            .finish()
+            .map_err(|error| StorageError::SSTable(format!("Failed to finish SSTable: {error}")))?;
+        validate_sstable_structure(&temp_path)?;
+
+        #[cfg(test)]
+        super::failpoints::check(
+            &resources.config.data_dir,
+            super::failpoints::PersistenceBoundary::SstablePublication,
+        )?;
+
+        // A mismatched final file can only be an unreferenced orphan because
+        // the manifest-id branch above was absent. Remove it before rename so
+        // publication is retryable on platforms that cannot rename-overwrite.
+        if final_path.exists() {
+            std::fs::remove_file(&final_path)?;
+        }
+        atomic_replace(&temp_path, &final_path)?;
+        info.id = id;
+        info.path.clone_from(&final_path);
+        info
+    };
+    // This also makes a reused final file discoverable before the manifest can
+    // reference it, including a retry after a prior directory-sync failure.
+    sync_directory(&level_directory)?;
+
+    let checkpoint;
+    {
+        // No writer may hold an allocated-but-unapplied sequence while the
+        // safe recovery frontier is computed and installed.
+        let _mutations = resources.mutation_barrier.write().await;
+        let mut live_manifest = resources.manifest.lock();
+        let mut candidate = live_manifest.clone();
+        candidate.sstables.push(SSTableManifestEntry {
+            id,
+            path: info.path.clone(),
+            size: info.file_size,
+            entry_count: info.entry_count,
+            min_key: info.min_key.clone(),
+            max_key: info.max_key.clone(),
+            min_sequence: info.min_sequence,
+            max_sequence: info.max_sequence,
+            creation_time: info.creation_time,
+            level: 0,
+        });
+
+        let minimum_unapplied_wal = resources.unapplied_wal_sequences.lock().first().copied();
+        candidate.wal_checkpoint = safe_flush_checkpoint(
+            &candidate,
+            resources.memtable_manager,
+            memtable,
+            minimum_unapplied_wal,
+        );
+
+        #[cfg(test)]
+        super::failpoints::check(
+            &resources.config.data_dir,
+            super::failpoints::PersistenceBoundary::ManifestInstallation,
+        )?;
+
+        candidate
+            .save(&resources.config.data_dir)
+            .map_err(|error| StorageError::Manifest(error.to_string()))?;
+        checkpoint = candidate.wal_checkpoint;
+        *live_manifest = candidate;
+    }
+
+    install_live_sstable(&resources, &info).await;
+    info!("Flushed memtable to SSTable: {:?}", info.path);
+
+    #[cfg(test)]
+    super::failpoints::check(
+        &resources.config.data_dir,
+        super::failpoints::PersistenceBoundary::Checkpoint,
+    )?;
+
+    truncate_wal(resources.wal, checkpoint).await;
+    Ok(info)
+}
+
+fn safe_flush_checkpoint(
+    manifest: &Manifest,
+    memtable_manager: &MemTableManager,
+    installing: &Arc<super::memtable::MemTable>,
+    minimum_unapplied_wal: Option<u64>,
+) -> u64 {
+    let durable_next_sequence = manifest
+        .sstables
+        .iter()
+        .map(|table| table.max_sequence)
+        .max()
+        .map_or(0, |sequence| sequence.saturating_add(1));
+    let minimum_uninstalled = memtable_manager
+        .minimum_live_sequence_excluding(installing)
+        .into_iter()
+        .chain(minimum_unapplied_wal)
+        .min();
+    let safe_next_sequence = minimum_uninstalled.map_or(durable_next_sequence, |minimum_live| {
+        durable_next_sequence.min(minimum_live)
+    });
+    manifest.wal_checkpoint.max(safe_next_sequence)
+}
+
+fn reusable_sstable_info(
+    path: &std::path::Path,
+    id: u64,
+    expected: &[(Vec<u8>, super::memtable::MemTableEntry)],
+) -> Result<Option<SSTableInfo>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    if !sstable_contents_match(path, expected)? {
+        return Ok(None);
+    }
+
+    let metadata = std::fs::metadata(path)?;
+    let (min_sequence, max_sequence) = expected
+        .iter()
+        .fold((u64::MAX, 0_u64), |(minimum, maximum), (_, entry)| {
+            (minimum.min(entry.sequence), maximum.max(entry.sequence))
+        });
+    Ok(Some(SSTableInfo {
+        id,
+        path: path.to_path_buf(),
+        file_size: metadata.len(),
+        entry_count: expected.len() as u64,
+        min_key: expected
+            .first()
+            .map_or_else(Vec::new, |(key, _)| key.clone()),
+        max_key: expected
+            .last()
+            .map_or_else(Vec::new, |(key, _)| key.clone()),
+        creation_time: metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_secs()),
+        level: 0,
+        min_sequence: if expected.is_empty() { 0 } else { min_sequence },
+        max_sequence,
+    }))
+}
+
+fn validate_sstable_structure(path: &std::path::Path) -> Result<()> {
+    SSTableReader::open(path)
+        .map_err(|error| StorageError::SSTable(format!("Failed to validate SSTable: {error}")))?;
+    Ok(())
+}
+
+fn sstable_contents_match(
+    path: &std::path::Path,
+    expected: &[(Vec<u8>, super::memtable::MemTableEntry)],
+) -> Result<bool> {
+    let reader = match SSTableReader::open(path) {
+        Ok(reader) => reader,
+        Err(_) => return Ok(false),
+    };
+    let mut actual = reader.iter();
+    for (expected_key, expected_entry) in expected {
+        let Some(actual_entry) = actual.next_versioned() else {
+            return Ok(false);
+        };
+        let (actual_key, actual_entry) = match actual_entry {
+            Ok(entry) => entry,
+            Err(_) => return Ok(false),
+        };
+        if actual_key.as_ref() != expected_key
+            || actual_entry.sequence != Some(expected_entry.sequence)
+            || actual_entry.value.into_option().as_deref() != expected_entry.value.as_deref()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(actual.next_versioned().is_none())
+}
+
+fn sstable_info_from_manifest(entry: &SSTableManifestEntry) -> SSTableInfo {
+    SSTableInfo {
+        id: entry.id,
+        path: entry.path.clone(),
+        file_size: entry.size,
+        entry_count: entry.entry_count,
+        min_key: entry.min_key.clone(),
+        max_key: entry.max_key.clone(),
+        creation_time: entry.creation_time,
+        level: entry.level,
+        min_sequence: entry.min_sequence,
+        max_sequence: entry.max_sequence,
+    }
+}
+
+async fn install_live_sstable(resources: &FlushResources<'_>, info: &SSTableInfo) {
+    let inserted = {
+        let mut sstables = resources.sstables.write().await;
+        if sstables.iter().any(|table| table.id == info.id) {
+            false
+        } else {
+            sstables.push(info.clone());
+            true
+        }
+    };
+    if !inserted {
+        return;
+    }
+
+    resources
+        .sstable_total_keys
+        .fetch_add(info.entry_count, Ordering::Relaxed);
+    resources
+        .sstable_total_bytes
+        .fetch_add(info.file_size, Ordering::Relaxed);
+    resources.sstable_count.fetch_add(1, Ordering::Relaxed);
+    if info.level == 0 {
+        resources.l0_sstable_count.fetch_add(1, Ordering::Relaxed);
+    }
+    resources
+        .sstable_flush_bytes_written
+        .fetch_add(info.file_size, Ordering::Relaxed);
+}
+
+async fn reclaim_wal_after_checkpoint(resources: &FlushResources<'_>) -> Result<()> {
+    let checkpoint = resources.manifest.lock().wal_checkpoint;
+    #[cfg(test)]
+    super::failpoints::check(
+        &resources.config.data_dir,
+        super::failpoints::PersistenceBoundary::Checkpoint,
+    )?;
+    truncate_wal(resources.wal, checkpoint).await;
+    Ok(())
+}
+
+async fn truncate_wal(wal: Option<&Arc<WriteAheadLog>>, checkpoint: u64) {
+    if let Some(wal) = wal {
+        if let Err(error) = wal.truncate(checkpoint).await {
+            tracing::warn!("Failed to truncate WAL: {error}");
+        }
+    }
+}
+
 /// A present value or tombstone that remains distinct from a missing key until
 /// the newest physical version has been selected.
 struct VersionedValue {
@@ -1491,6 +1712,38 @@ fn merge_versioned(
             entry.insert(candidate);
         }
         Entry::Occupied(mut entry) => retain_newest_entry(entry.get_mut(), candidate),
+    }
+}
+
+/// Conservatively pins the recovery frontier if a WAL append future is
+/// cancelled, panics, or returns after persistence but before memtable apply.
+/// The normal success path only flips a local boolean and never takes the set
+/// mutex.
+struct PendingWalApplication<'a> {
+    checkpoint_floors: &'a Mutex<BTreeSet<u64>>,
+    floor: u64,
+    armed: bool,
+}
+
+impl<'a> PendingWalApplication<'a> {
+    fn new(checkpoint_floors: &'a Mutex<BTreeSet<u64>>, floor: u64) -> Self {
+        Self {
+            checkpoint_floors,
+            floor,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingWalApplication<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.checkpoint_floors.lock().insert(self.floor);
+        }
     }
 }
 
@@ -1576,6 +1829,108 @@ mod tests {
             assert_eq!(counter.load(Ordering::Acquire), 1);
         }
         assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn pending_wal_guard_records_only_an_unfinished_application() {
+        let floors = Mutex::new(BTreeSet::new());
+        {
+            let _pending = PendingWalApplication::new(&floors, 7);
+        }
+        assert_eq!(floors.lock().iter().copied().collect::<Vec<_>>(), vec![7]);
+
+        {
+            let mut completed = PendingWalApplication::new(&floors, 8);
+            completed.disarm();
+        }
+        assert_eq!(floors.lock().iter().copied().collect::<Vec<_>>(), vec![7]);
+    }
+
+    #[test]
+    fn checkpoint_frontier_stops_before_a_lower_sequence_in_another_generation() {
+        let manager = Arc::new(MemTableManager::new(MemTableConfig::default()));
+        manager
+            .insert_with_sequence(b"installed-later-sequence", b"value", 1)
+            .unwrap();
+        manager.force_rotate().unwrap();
+        let installing = manager.peek_immutable_for_flush().unwrap();
+        manager
+            .insert_with_sequence(b"still-live-earlier-sequence", b"value", 0)
+            .unwrap();
+
+        let mut manifest = Manifest::new();
+        manifest.sstables.push(SSTableManifestEntry {
+            id: 1,
+            level: 0,
+            path: PathBuf::from("unused.sst"),
+            size: 0,
+            entry_count: 1,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            min_sequence: 1,
+            max_sequence: 1,
+            creation_time: 0,
+        });
+
+        assert_eq!(
+            safe_flush_checkpoint(&manifest, &manager, &installing, None),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreground_and_background_flush_share_exactly_one_generation_owner() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), true))
+            .await
+            .unwrap();
+        let background = engine.clone_for_background();
+
+        for generation in 0..25 {
+            let key = format!("generation-{generation}");
+            engine.insert(key.as_bytes(), b"value").await.unwrap();
+            engine.memtable_manager.force_rotate().unwrap();
+
+            let (foreground_result, background_result) =
+                tokio::join!(engine.flush(), background.background_flush());
+            foreground_result.unwrap();
+            background_result.unwrap();
+            assert_eq!(engine.stats().immutable_memtables, 0);
+        }
+
+        assert_eq!(engine.stats().sstable_count, 25);
+        assert_eq!(
+            Manifest::load_or_create(directory.path())
+                .unwrap()
+                .sstables
+                .len(),
+            25
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_flush_failure_retains_read_visibility_and_retries() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), true))
+            .await
+            .unwrap();
+        engine.insert(b"key", b"value").await.unwrap();
+        engine.memtable_manager.force_rotate().unwrap();
+        let background = engine.clone_for_background();
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::SstablePublication,
+        );
+
+        assert!(background.background_flush().await.is_err());
+        failure.assert_hit();
+        assert_eq!(engine.stats().immutable_memtables, 1);
+        assert_eq!(engine.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+
+        background.background_flush().await.unwrap();
+        assert_eq!(engine.stats().immutable_memtables, 0);
+        assert_eq!(engine.stats().sstable_count, 1);
+        assert_eq!(engine.get(b"key").await.unwrap(), Some(b"value".to_vec()));
     }
 
     #[tokio::test]
