@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock as SyncRwLock};
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info};
 
@@ -48,8 +48,10 @@ use crate::core::{
     WalStats, WriteAmplificationStats, WriteBatch, WriteStallStats,
 };
 
+#[cfg(test)]
+use super::InProgressGuard;
 use super::{
-    compaction::{CompactionConfig, Compactor},
+    compaction::{CompactionConfig, CompactionCoordinator},
     directory_lock::{
         AcquireError as DirectoryLockAcquireError, DirectoryLock, LOCKED_DIRECTORY_GUIDANCE,
     },
@@ -60,7 +62,6 @@ use super::{
     sstable::{SSTableConfig, SSTableInfo, SSTableReader, SSTableWriter},
     version::VersionOrder,
     wal::{WalConfig, WriteAheadLog},
-    InProgressGuard,
 };
 
 /// Result type for storage operations
@@ -216,16 +217,16 @@ pub struct Engine {
     directory_lock: Arc<DirectoryLock>,
     wal: Option<Arc<WriteAheadLog>>,
     memtable_manager: Arc<MemTableManager>,
-    sstables: Arc<RwLock<Vec<SSTableInfo>>>,
-    manifest: Arc<Mutex<Manifest>>,
+    sstables: Arc<AsyncRwLock<Vec<SSTableInfo>>>,
+    manifest: Arc<AsyncMutex<Manifest>>,
     /// Serializes foreground and background ownership of the immutable FIFO.
     flush_lock: Arc<AsyncMutex<()>>,
     /// Prevents checkpoint installation from racing sequence allocation/application.
-    mutation_barrier: Arc<RwLock<()>>,
+    mutation_barrier: Arc<AsyncRwLock<()>>,
     /// Preserves sequence/publication order between concurrent atomic batches.
     batch_serialization: Arc<AsyncMutex<()>>,
     /// Publishes atomic batches as one visibility transition to concurrent readers.
-    batch_visibility: Arc<RwLock<()>>,
+    batch_visibility: Arc<AsyncRwLock<()>>,
     /// Conservative floors for WAL applications that did not finish. Floors
     /// remain until reopen, when WAL replay applies them before this set starts
     /// empty again.
@@ -237,7 +238,7 @@ pub struct Engine {
     sstable_pool: Arc<SSTablePool>,
     #[allow(dead_code)]
     fd_monitor: Arc<FdMonitor>,
-    compactor: Arc<Compactor>,
+    compaction_coordinator: Arc<CompactionCoordinator>,
     sstable_stats: Arc<SstableStatistics>,
     logical_bytes_ingested: Arc<AtomicU64>,
     compactions_in_progress: Arc<AtomicU64>,
@@ -247,8 +248,8 @@ pub struct Engine {
 
 /// Related SSTable gauges and maintenance counters shared by foreground and
 /// background paths. The publication lock covers only the short live-gauge
-/// transition; compaction selection and I/O remain independently concurrent.
-struct SstableStatistics {
+/// transition; SSTable and manifest I/O never holds the live-reader-list lock.
+pub(super) struct SstableStatistics {
     versions: AtomicU64,
     bytes: AtomicU64,
     tombstones: AtomicU64,
@@ -273,33 +274,6 @@ struct SstableStatisticsSnapshot {
     compaction_output_bytes: u64,
     versions_reclaimed: u64,
     tombstones_reclaimed: u64,
-}
-
-/// Exclusive ownership of one compaction attempt's output path. Claiming the
-/// path before input I/O prevents stale orphan bytes from a prior process from
-/// being attributed to this process-lifetime attempt counter.
-struct CompactionOutputAttempt {
-    path: PathBuf,
-}
-
-impl CompactionOutputAttempt {
-    fn claim(path: PathBuf) -> Result<Self> {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| {
-                StorageError::Compaction(format!(
-                    "failed to claim compaction output {}: {error}",
-                    path.display()
-                ))
-            })?;
-        Ok(Self { path })
-    }
-
-    fn produced_bytes(&self) -> u64 {
-        std::fs::metadata(&self.path).map_or(0, |metadata| metadata.len())
-    }
 }
 
 impl SstableStatistics {
@@ -345,7 +319,7 @@ impl SstableStatistics {
         self.level_zero_files.load(Ordering::Relaxed)
     }
 
-    fn record_compaction_attempt(&self, input_bytes: u64, output_bytes: u64) {
+    pub(super) fn record_compaction_attempt(&self, input_bytes: u64, output_bytes: u64) {
         self.compaction_input_bytes
             .fetch_add(input_bytes, Ordering::Relaxed);
         self.compaction_output_bytes
@@ -368,7 +342,7 @@ impl SstableStatistics {
         }
     }
 
-    fn publish_compaction(
+    pub(super) fn publish_compaction(
         &self,
         live: &mut Vec<SSTableInfo>,
         inputs: &[SSTableManifestEntry],
@@ -542,26 +516,33 @@ impl Engine {
         ));
         let fd_monitor = Arc::new(FdMonitor::new(config.fd_config.soft_limit_ratio));
 
-        let compactor = Arc::new(Compactor::new(
+        let sstable_stats = Arc::new(SstableStatistics::new(&sstables));
+        let sstables = Arc::new(AsyncRwLock::new(sstables));
+        let manifest = Arc::new(AsyncMutex::new(manifest));
+        let compactions_in_progress = Arc::new(AtomicU64::new(0));
+        let compaction_coordinator = Arc::new(CompactionCoordinator::new(
             config.compaction_config.clone(),
             config.sstable_config.clone(),
             config.data_dir.clone(),
             Arc::clone(&next_sstable_id),
+            Arc::downgrade(&directory_lock),
+            Arc::clone(&sstables),
+            Arc::clone(&manifest),
+            Arc::clone(&sstable_stats),
+            Arc::clone(&compactions_in_progress),
         ));
-
-        let sstable_stats = Arc::new(SstableStatistics::new(&sstables));
 
         let engine = Self {
             config,
             directory_lock,
             wal,
             memtable_manager,
-            sstables: Arc::new(RwLock::new(sstables)),
-            manifest: Arc::new(Mutex::new(manifest)),
+            sstables,
+            manifest,
             flush_lock: Arc::new(AsyncMutex::new(())),
-            mutation_barrier: Arc::new(RwLock::new(())),
+            mutation_barrier: Arc::new(AsyncRwLock::new(())),
             batch_serialization: Arc::new(AsyncMutex::new(())),
-            batch_visibility: Arc::new(RwLock::new(())),
+            batch_visibility: Arc::new(AsyncRwLock::new(())),
             unapplied_wal_sequences: Arc::new(Mutex::new(BTreeSet::new())),
             shutdown: shutdown_tx,
             background_tasks: Mutex::new(Vec::new()),
@@ -569,10 +550,10 @@ impl Engine {
             next_sstable_id,
             sstable_pool,
             fd_monitor,
-            compactor,
+            compaction_coordinator,
             sstable_stats,
             logical_bytes_ingested: Arc::new(AtomicU64::new(0)),
-            compactions_in_progress: Arc::new(AtomicU64::new(0)),
+            compactions_in_progress,
             write_stall_count: Arc::new(AtomicU64::new(0)),
             write_stall_micros: Arc::new(AtomicU64::new(0)),
         };
@@ -874,41 +855,14 @@ impl Engine {
         Ok(())
     }
 
-    /// Trigger compaction
+    /// Trigger compaction.
+    ///
+    /// Manual and background requests share one fair coordinator. Concurrent
+    /// requests serialize and reselect after each preceding publication, so an
+    /// already compacted input set is reported by exactly one request. Once
+    /// shutdown starts, new requests are successful no-ops.
     pub async fn compact(&self) -> Result<CompactionResult> {
-        let _in_progress = InProgressGuard::new(Arc::clone(&self.compactions_in_progress));
-        let sstables = self.sstables.read().await;
-
-        // Convert SSTableInfo to SSTableManifestEntry for compactor
-        let manifest_entries: Vec<SSTableManifestEntry> = sstables
-            .iter()
-            .map(|sst| SSTableManifestEntry {
-                id: sst.id,
-                level: sst.level,
-                path: sst.path.clone(),
-                size: sst.file_size,
-                entry_count: sst.entry_count,
-                tombstone_count: sst.tombstone_count,
-                min_key: sst.min_key.clone(),
-                max_key: sst.max_key.clone(),
-                min_sequence: sst.min_sequence,
-                max_sequence: sst.max_sequence,
-                creation_time: sst.creation_time,
-            })
-            .collect();
-
-        if let Some(job) = self.compactor.pick_compaction(&manifest_entries) {
-            drop(sstables);
-            self.run_compaction(job).await?;
-
-            Ok(CompactionResult {
-                files_compacted: 1,
-                bytes_reclaimed: 0,
-                duration_ms: 0,
-            })
-        } else {
-            Ok(CompactionResult::default())
-        }
+        self.compaction_coordinator.request().await
     }
 
     /// Get legacy mixed physical storage statistics.
@@ -1081,9 +1035,11 @@ impl Engine {
     ///
     /// This stops background tasks and flushes pending writes. Because this
     /// method borrows the still-usable engine, its exclusive directory lock is
-    /// retained until the [`Engine`] is dropped.
+    /// retained until the [`Engine`] is dropped. Shutdown is terminal for the
+    /// compaction coordinator: later compaction requests return no work.
     pub async fn shutdown(&self) -> Result<()> {
         let _shutdown = self.shutdown_lock.lock().await;
+        let compaction_pause = self.compaction_coordinator.pause_requests();
         info!("Shutting down storage engine");
 
         // Signal background tasks to stop
@@ -1096,6 +1052,7 @@ impl Engine {
                 task_failure.get_or_insert(error);
             }
         }
+        compaction_pause.wait_until_idle().await;
 
         // Flush pending writes
         let flush_result = self.flush().await;
@@ -1264,13 +1221,14 @@ impl Engine {
             // Compaction publishes the replacement list before unlinking its
             // inputs. If an input disappeared after capture, discard every
             // partial pin and retry from one new coherent list snapshot.
-            let live_sstables = self.sstables.read().await;
-            let unchanged = live_sstables.len() == snapshot_identity.len()
-                && live_sstables
-                    .iter()
-                    .zip(&snapshot_identity)
-                    .all(|(info, (id, path))| info.id == *id && info.path == *path);
-            drop(live_sstables);
+            let unchanged = {
+                let live_sstables = self.sstables.read().await;
+                live_sstables.len() == snapshot_identity.len()
+                    && live_sstables
+                        .iter()
+                        .zip(&snapshot_identity)
+                        .all(|(info, (id, path))| info.id == *id && info.path == *path)
+            };
             if unchanged {
                 return Err(StorageError::SSTable(error.to_string()));
             }
@@ -1298,65 +1256,6 @@ impl Engine {
             memtable,
         )
         .await
-    }
-
-    /// Run a compaction job
-    async fn run_compaction(&self, job: super::compaction::CompactionJob) -> Result<()> {
-        // Get paths of input files before compaction
-        let input_paths: Vec<PathBuf> = job.input_sstables.iter().map(|s| s.path.clone()).collect();
-        let input_ids: Vec<u64> = job.input_sstables.iter().map(|s| s.id).collect();
-        let input_sstables = job.input_sstables.clone();
-        let selected_input_bytes = input_sstables
-            .iter()
-            .fold(0_u64, |total, table| total.saturating_add(table.size));
-        let output_path = job.output_path.clone();
-
-        let output_attempt = match CompactionOutputAttempt::claim(output_path) {
-            Ok(attempt) => attempt,
-            Err(error) => {
-                self.sstable_stats
-                    .record_compaction_attempt(selected_input_bytes, 0);
-                return Err(error);
-            }
-        };
-        let execution = self.compactor.execute(job);
-        self.sstable_stats
-            .record_compaction_attempt(selected_input_bytes, output_attempt.produced_bytes());
-        let result = execution.map_err(|e| StorageError::Compaction(e.to_string()))?;
-        #[cfg(test)]
-        super::failpoints::check(
-            &self.config.data_dir,
-            super::failpoints::PersistenceBoundary::Compaction,
-        )?;
-
-        let mut sstables = self.sstables.write().await;
-        self.sstable_stats
-            .publish_compaction(&mut sstables, &input_sstables, &result);
-
-        // The live source swap is complete. Manifest I/O and unlinking old
-        // inputs must not hold the global reader-list lock.
-        drop(sstables);
-
-        // Update manifest
-        {
-            let mut manifest = self.manifest.lock();
-            manifest.sstables.retain(|e| !input_ids.contains(&e.id));
-
-            if let Some(ref output) = result.output_sstable {
-                manifest.sstables.push(output.clone());
-            }
-
-            manifest
-                .save(&self.config.data_dir)
-                .map_err(|e| StorageError::Manifest(e.to_string()))?;
-        }
-
-        // Delete old files
-        self.compactor
-            .cleanup_inputs(&input_paths)
-            .map_err(|e| StorageError::Compaction(e.to_string()))?;
-
-        Ok(())
     }
 
     /// Start background flush and compaction tasks
@@ -1426,10 +1325,9 @@ impl Engine {
             mutation_barrier: self.mutation_barrier.clone(),
             unapplied_wal_sequences: self.unapplied_wal_sequences.clone(),
             next_sstable_id: self.next_sstable_id.clone(),
-            compactor: self.compactor.clone(),
+            compaction_coordinator: self.compaction_coordinator.clone(),
             config: self.config.clone(),
             sstable_stats: self.sstable_stats.clone(),
-            compactions_in_progress: self.compactions_in_progress.clone(),
         }
     }
 }
@@ -1447,17 +1345,16 @@ impl Drop for Engine {
 struct BackgroundEngine {
     directory_lock: std::sync::Weak<DirectoryLock>,
     memtable_manager: Arc<MemTableManager>,
-    sstables: Arc<RwLock<Vec<SSTableInfo>>>,
-    manifest: Arc<Mutex<Manifest>>,
+    sstables: Arc<AsyncRwLock<Vec<SSTableInfo>>>,
+    manifest: Arc<AsyncMutex<Manifest>>,
     flush_lock: Arc<AsyncMutex<()>>,
-    mutation_barrier: Arc<RwLock<()>>,
+    mutation_barrier: Arc<AsyncRwLock<()>>,
     unapplied_wal_sequences: Arc<Mutex<BTreeSet<u64>>>,
     next_sstable_id: Arc<std::sync::atomic::AtomicU64>,
-    compactor: Arc<Compactor>,
+    compaction_coordinator: Arc<CompactionCoordinator>,
     config: StorageConfig,
     wal: Option<Arc<WriteAheadLog>>,
     sstable_stats: Arc<SstableStatistics>,
-    compactions_in_progress: Arc<AtomicU64>,
 }
 
 impl BackgroundEngine {
@@ -1482,37 +1379,7 @@ impl BackgroundEngine {
         let Some(_directory_lock) = self.directory_lock.upgrade() else {
             return Ok(CompactionResult::default());
         };
-        let _in_progress = InProgressGuard::new(Arc::clone(&self.compactions_in_progress));
-        let sstables = self.sstables.read().await;
-        let manifest_entries: Vec<SSTableManifestEntry> = sstables
-            .iter()
-            .map(|sst| SSTableManifestEntry {
-                id: sst.id,
-                level: sst.level,
-                path: sst.path.clone(),
-                size: sst.file_size,
-                entry_count: sst.entry_count,
-                tombstone_count: sst.tombstone_count,
-                min_key: sst.min_key.clone(),
-                max_key: sst.max_key.clone(),
-                min_sequence: sst.min_sequence,
-                max_sequence: sst.max_sequence,
-                creation_time: sst.creation_time,
-            })
-            .collect();
-
-        if let Some(job) = self.compactor.pick_compaction(&manifest_entries) {
-            drop(sstables);
-            self.run_compaction(job).await?;
-
-            Ok(CompactionResult {
-                files_compacted: 1,
-                bytes_reclaimed: 0,
-                duration_ms: 0,
-            })
-        } else {
-            Ok(CompactionResult::default())
-        }
+        self.compaction_coordinator.request().await
     }
 
     async fn flush_memtable_to_sstable(
@@ -1535,70 +1402,15 @@ impl BackgroundEngine {
         )
         .await
     }
-
-    async fn run_compaction(&self, job: super::compaction::CompactionJob) -> Result<()> {
-        let input_paths: Vec<PathBuf> = job.input_sstables.iter().map(|s| s.path.clone()).collect();
-        let input_ids: Vec<u64> = job.input_sstables.iter().map(|s| s.id).collect();
-        let input_sstables = job.input_sstables.clone();
-        let selected_input_bytes = input_sstables
-            .iter()
-            .fold(0_u64, |total, table| total.saturating_add(table.size));
-        let output_path = job.output_path.clone();
-
-        let output_attempt = match CompactionOutputAttempt::claim(output_path) {
-            Ok(attempt) => attempt,
-            Err(error) => {
-                self.sstable_stats
-                    .record_compaction_attempt(selected_input_bytes, 0);
-                return Err(error);
-            }
-        };
-        let execution = self.compactor.execute(job);
-        self.sstable_stats
-            .record_compaction_attempt(selected_input_bytes, output_attempt.produced_bytes());
-        let result = execution.map_err(|e| StorageError::Compaction(e.to_string()))?;
-        #[cfg(test)]
-        super::failpoints::check(
-            &self.config.data_dir,
-            super::failpoints::PersistenceBoundary::Compaction,
-        )?;
-
-        let mut sstables = self.sstables.write().await;
-        self.sstable_stats
-            .publish_compaction(&mut sstables, &input_sstables, &result);
-
-        // The live source swap is complete. Manifest I/O and unlinking old
-        // inputs must not hold the global reader-list lock.
-        drop(sstables);
-
-        {
-            let mut manifest = self.manifest.lock();
-            manifest.sstables.retain(|e| !input_ids.contains(&e.id));
-
-            if let Some(ref output) = result.output_sstable {
-                manifest.sstables.push(output.clone());
-            }
-
-            manifest
-                .save(&self.config.data_dir)
-                .map_err(|e| StorageError::Manifest(e.to_string()))?;
-        }
-
-        self.compactor
-            .cleanup_inputs(&input_paths)
-            .map_err(|e| StorageError::Compaction(e.to_string()))?;
-
-        Ok(())
-    }
 }
 
 struct FlushResources<'a> {
     config: &'a StorageConfig,
     wal: Option<&'a Arc<WriteAheadLog>>,
     memtable_manager: &'a Arc<MemTableManager>,
-    sstables: &'a Arc<RwLock<Vec<SSTableInfo>>>,
-    manifest: &'a Arc<Mutex<Manifest>>,
-    mutation_barrier: &'a Arc<RwLock<()>>,
+    sstables: &'a Arc<AsyncRwLock<Vec<SSTableInfo>>>,
+    manifest: &'a Arc<AsyncMutex<Manifest>>,
+    mutation_barrier: &'a Arc<AsyncRwLock<()>>,
     unapplied_wal_sequences: &'a Arc<Mutex<BTreeSet<u64>>>,
     next_sstable_id: &'a Arc<AtomicU64>,
     sstable_stats: &'a SstableStatistics,
@@ -1622,7 +1434,7 @@ async fn flush_memtable_to_sstable(
     // durable before the live reader list is updated. Reconcile that state
     // without rewriting or recounting the generation.
     let installed_entry = {
-        let manifest = resources.manifest.lock();
+        let manifest = resources.manifest.lock().await;
         manifest
             .sstables
             .iter()
@@ -1694,7 +1506,7 @@ async fn flush_memtable_to_sstable(
         // No writer may hold an allocated-but-unapplied sequence while the
         // safe recovery frontier is computed and installed.
         let _mutations = resources.mutation_barrier.write().await;
-        let mut live_manifest = resources.manifest.lock();
+        let mut live_manifest = resources.manifest.lock().await;
         let mut candidate = live_manifest.clone();
         candidate.sstables.push(SSTableManifestEntry {
             id,
@@ -1887,7 +1699,7 @@ async fn install_live_sstable(resources: &FlushResources<'_>, info: &SSTableInfo
 }
 
 async fn reclaim_wal_after_checkpoint(resources: &FlushResources<'_>) -> Result<()> {
-    let checkpoint = resources.manifest.lock().wal_checkpoint;
+    let checkpoint = resources.manifest.lock().await.wal_checkpoint;
     #[cfg(test)]
     super::failpoints::check(
         &resources.config.data_dir,
@@ -2005,6 +1817,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    type VersionedTableEntry<'a> = (&'a [u8], Option<&'a [u8]>, u64);
+
     fn isolated_config(path: &std::path::Path, wal_enabled: bool) -> StorageConfig {
         StorageConfig {
             data_dir: path.to_path_buf(),
@@ -2074,6 +1888,35 @@ mod tests {
             max_key: info.max_key,
             min_sequence: 0,
             max_sequence: manifest_max_sequence,
+            creation_time: id,
+        }
+    }
+
+    fn write_versioned_scan_table(
+        path: &std::path::Path,
+        id: u64,
+        entries: &[VersionedTableEntry<'_>],
+    ) -> SSTableManifestEntry {
+        let config = SSTableConfig {
+            compression: super::super::sstable::CompressionType::None,
+            ..SSTableConfig::default()
+        };
+        let mut writer = SSTableWriter::new(path, config).unwrap();
+        for (key, value, sequence) in entries {
+            writer.add_versioned(key, *value, *sequence).unwrap();
+        }
+        let info = writer.finish().unwrap();
+        SSTableManifestEntry {
+            id,
+            level: 0,
+            path: info.path,
+            size: info.file_size,
+            entry_count: info.entry_count,
+            tombstone_count: info.tombstone_count,
+            min_key: info.min_key,
+            max_key: info.max_key,
+            min_sequence: info.min_sequence,
+            max_sequence: info.max_sequence,
             creation_time: id,
         }
     }
@@ -2486,7 +2329,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_compaction_counts_selected_inputs_and_partial_output_once() {
+    async fn failed_compaction_counts_partial_output_once_and_removes_it() {
         let directory = TempDir::new().unwrap();
         let mut config = isolated_config(directory.path(), false);
         config.sstable_config = SSTableConfig {
@@ -2547,7 +2390,8 @@ mod tests {
 
         let output_path = directory.path().join("sstables/L1/failed-output.sst");
         let result = engine
-            .run_compaction(super::super::compaction::CompactionJob {
+            .compaction_coordinator
+            .execute_job_for_test(super::super::compaction::CompactionJob {
                 input_sstables: vec![input],
                 output_level: 1,
                 output_path: output_path.clone(),
@@ -2555,17 +2399,16 @@ mod tests {
             .await;
         assert!(matches!(result, Err(StorageError::Compaction(_))));
 
-        let partial_output_bytes = std::fs::metadata(&output_path).unwrap().len();
-        assert!(partial_output_bytes > 0);
         let stats = engine.physical_stats();
         assert_eq!(
             stats.amplification.compaction_input_bytes_since_open,
             input_info.file_size
         );
-        assert_eq!(
-            stats.amplification.compaction_output_bytes_since_open,
-            partial_output_bytes
+        assert!(
+            stats.amplification.compaction_output_bytes_since_open > 0,
+            "partial output bytes remain accounted after cleanup"
         );
+        assert!(!output_path.exists());
         assert_eq!(stats.sstables.files, 1);
         assert_eq!(stats.sstables.versions, input_info.entry_count);
         assert_eq!(stats.versions.reclaimed_by_compaction_since_open, 0);
@@ -2582,7 +2425,8 @@ mod tests {
         std::fs::write(&output_path, &stale_bytes).unwrap();
 
         let result = engine
-            .run_compaction(super::super::compaction::CompactionJob {
+            .compaction_coordinator
+            .execute_job_for_test(super::super::compaction::CompactionJob {
                 input_sstables: vec![SSTableManifestEntry {
                     id: 404,
                     level: 0,
@@ -2606,6 +2450,88 @@ mod tests {
         assert_eq!(stats.amplification.compaction_input_bytes_since_open, 8_192);
         assert_eq!(stats.amplification.compaction_output_bytes_since_open, 0);
         assert_eq!(std::fs::read(output_path).unwrap(), stale_bytes);
+    }
+
+    #[tokio::test]
+    async fn manifest_failed_compaction_keeps_inputs_live_and_retries_cleanly() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 2;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Engine::open(config.clone()).await.unwrap();
+        for generation in 0..2 {
+            for key in 0..128 {
+                engine
+                    .insert(
+                        format!("retry:{key:04}").as_bytes(),
+                        format!("generation-{generation}").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            engine.flush().await.unwrap();
+        }
+        let before = engine.physical_stats();
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::ManifestInstallation,
+        );
+
+        assert!(engine.compact().await.is_err());
+        failure.assert_hit();
+        let failed = engine.physical_stats();
+        assert_eq!(failed.sstables.files, 2);
+        assert_eq!(failed.sstables.bytes, before.sstables.bytes);
+        assert_eq!(failed.versions.reclaimed_by_compaction_since_open, 0);
+        assert_eq!(
+            failed.amplification.compaction_input_bytes_since_open,
+            before.sstables.bytes
+        );
+        assert!(failed.amplification.compaction_output_bytes_since_open > 0);
+        assert_eq!(
+            Manifest::load_or_create(directory.path())
+                .unwrap()
+                .sstables
+                .len(),
+            2
+        );
+        assert!(std::fs::read_dir(directory.path().join("sstables"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .all(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .map_or(true, |extension| extension != "sst")
+            }));
+        for key in 0..128 {
+            assert_eq!(
+                engine
+                    .get(format!("retry:{key:04}").as_bytes())
+                    .await
+                    .unwrap(),
+                Some(b"generation-1".to_vec())
+            );
+        }
+
+        assert_eq!(engine.compact().await.unwrap().files_compacted, 2);
+        let retried = engine.physical_stats();
+        assert_eq!(retried.sstables.files, 1);
+        assert_eq!(
+            retried.amplification.compaction_input_bytes_since_open,
+            before.sstables.bytes * 2
+        );
+        assert_eq!(retried.versions.reclaimed_by_compaction_since_open, 128);
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(
+            reopened.get(b"retry:0000").await.unwrap(),
+            Some(b"generation-1".to_vec())
+        );
+        assert_eq!(reopened.physical_stats().sstables.files, 1);
+        reopened.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2998,6 +2924,381 @@ mod tests {
             (3 * KEYS) as u64
         );
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_compaction_work_does_not_stall_a_current_thread_runtime() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 2;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Arc::new(Engine::open(config).await.unwrap());
+        for generation in 0..2 {
+            for key in 0..128 {
+                engine
+                    .insert(
+                        format!("runtime:{key:04}").as_bytes(),
+                        format!("generation-{generation}").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            engine.flush().await.unwrap();
+        }
+
+        let during_manifest = engine
+            .compaction_coordinator
+            .gate_during_manifest_for_test();
+        let progress = Arc::new(AtomicU64::new(0));
+        let stop_ticker = Arc::new(AtomicU64::new(0));
+        let manifest_waiter_started = Arc::new(AtomicU64::new(0));
+        let ticker_progress = Arc::clone(&progress);
+        let ticker_stop = Arc::clone(&stop_ticker);
+        let ticker = tokio::spawn(async move {
+            while ticker_stop.load(Ordering::Acquire) == 0 {
+                ticker_progress.fetch_add(1, Ordering::AcqRel);
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        // An external observer always releases the synchronous test gate. It
+        // samples only after another async task has tried to acquire the
+        // manifest lock held by compaction, proving both the blocking-pool
+        // placement and non-blocking lock contention.
+        let observer_gate = Arc::clone(&during_manifest);
+        let observer_progress = Arc::clone(&progress);
+        let observer_waiter_started = Arc::clone(&manifest_waiter_started);
+        let observer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !observer_gate.reached() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if !observer_gate.reached() {
+                observer_gate.release();
+                return None;
+            }
+            let waiter_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while observer_waiter_started.load(Ordering::Acquire) == 0
+                && std::time::Instant::now() < waiter_deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let waiter_started = observer_waiter_started.load(Ordering::Acquire) != 0;
+            let before = observer_progress.load(Ordering::Acquire);
+            std::thread::sleep(Duration::from_millis(100));
+            let after = observer_progress.load(Ordering::Acquire);
+            observer_gate.release();
+            Some((waiter_started, before, after))
+        });
+
+        let compacting_engine = Arc::clone(&engine);
+        let compaction = tokio::spawn(async move { compacting_engine.compact().await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !during_manifest.reached() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compaction must reach manifest installation");
+
+        manifest_waiter_started.store(1, Ordering::Release);
+        let manifest = Arc::clone(&engine.manifest);
+        let manifest_waiter = tokio::spawn(async move {
+            let _manifest = manifest.lock().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!manifest_waiter.is_finished());
+
+        let result = compaction.await.unwrap().unwrap();
+        manifest_waiter.await.unwrap();
+        stop_ticker.store(1, Ordering::Release);
+        ticker.await.unwrap();
+        let (waiter_started, before, after) = observer
+            .join()
+            .unwrap()
+            .expect("compaction must reach the manifest blocking boundary");
+
+        assert_eq!(result.files_compacted, 2);
+        assert!(
+            waiter_started,
+            "the manifest waiter must contend at the gate"
+        );
+        assert!(
+            after > before,
+            "another task must progress while compaction blocks on file work"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn foreground_and_background_compaction_share_one_deterministic_claim() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 4;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Arc::new(Engine::open(config).await.unwrap());
+        for generation in 0..4 {
+            for key in 0..256 {
+                engine
+                    .insert(
+                        format!("race:{key:04}").as_bytes(),
+                        format!("generation-{generation}").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            engine.flush().await.unwrap();
+        }
+        let selected_bytes = engine.physical_stats().sstables.bytes;
+
+        let manual_engine = Arc::clone(&engine);
+        let manual = tokio::spawn(async move { manual_engine.compact().await.unwrap() });
+        let background = engine.clone_for_background();
+        let background = tokio::spawn(async move { background.compact().await.unwrap() });
+        let mut outcomes = vec![
+            manual.await.unwrap().files_compacted,
+            background.await.unwrap().files_compacted,
+        ];
+        outcomes.sort_unstable();
+
+        assert_eq!(outcomes, vec![0, 4]);
+        assert_eq!(engine.physical_stats().sstables.files, 1);
+        assert_eq!(
+            engine
+                .physical_stats()
+                .amplification
+                .compaction_input_bytes_since_open,
+            selected_bytes
+        );
+        assert_eq!(engine.physical_stats().compactions_in_progress, 0);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_published_during_compaction_is_preserved_in_manifest_live_list_and_stats() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 2;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Arc::new(Engine::open(config).await.unwrap());
+        for generation in 0..2 {
+            engine
+                .insert(
+                    b"flush-race:old",
+                    format!("generation-{generation}").as_bytes(),
+                )
+                .await
+                .unwrap();
+            engine.flush().await.unwrap();
+        }
+        let selected_bytes = engine.physical_stats().sstables.bytes;
+        let before_manifest = engine
+            .compaction_coordinator
+            .gate_before_manifest_for_test();
+        let compacting_engine = Arc::clone(&engine);
+        let compaction = tokio::spawn(async move { compacting_engine.compact().await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !before_manifest.reached() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compaction must reach manifest publication");
+
+        engine
+            .insert(b"flush-race:new", b"arrived-during-compaction")
+            .await
+            .unwrap();
+        engine.flush().await.unwrap();
+        assert_eq!(engine.sstables.read().await.len(), 3);
+        before_manifest.release();
+        assert_eq!(compaction.await.unwrap().files_compacted, 2);
+
+        let manifest = Manifest::load_or_create(directory.path()).unwrap();
+        assert_eq!(manifest.sstables.len(), 2);
+        assert_eq!(engine.sstables.read().await.len(), 2);
+        assert_eq!(engine.physical_stats().sstables.files, 2);
+        assert_eq!(
+            engine
+                .physical_stats()
+                .amplification
+                .compaction_input_bytes_since_open,
+            selected_bytes
+        );
+        assert_eq!(
+            engine.get(b"flush-race:old").await.unwrap(),
+            Some(b"generation-1".to_vec())
+        );
+        assert_eq!(
+            engine.get(b"flush-race:new").await.unwrap(),
+            Some(b"arrived-during-compaction".to_vec())
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_concurrent_manual_requests_execute_one_input_set_once() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 4;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Arc::new(Engine::open(config).await.unwrap());
+        for generation in 0..4 {
+            for key in 0..256 {
+                engine
+                    .insert(
+                        format!("manual:{key:04}").as_bytes(),
+                        format!("generation-{generation}").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            engine.flush().await.unwrap();
+        }
+        let selected_bytes = engine.physical_stats().sstables.bytes;
+        let mut requests = Vec::new();
+        for _ in 0..12 {
+            let request_engine = Arc::clone(&engine);
+            requests.push(tokio::spawn(async move {
+                request_engine.compact().await.unwrap().files_compacted
+            }));
+        }
+        let mut outcomes = Vec::new();
+        for request in requests {
+            outcomes.push(request.await.unwrap());
+        }
+        outcomes.sort_unstable();
+
+        assert_eq!(outcomes, [vec![0; 11], vec![4]].concat());
+        let stats = engine.physical_stats();
+        assert_eq!(stats.sstables.files, 1);
+        assert_eq!(
+            stats.amplification.compaction_input_bytes_since_open,
+            selected_bytes
+        );
+        assert_eq!(stats.compactions_in_progress, 0);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_queued_requests_leave_the_coordinator_queue() {
+        let directory = TempDir::new().unwrap();
+        let engine = Arc::new(
+            Engine::open(isolated_config(directory.path(), false))
+                .await
+                .unwrap(),
+        );
+        let ownership = engine
+            .compaction_coordinator
+            .hold_ownership_for_test()
+            .await;
+        let mut cancelled = Vec::new();
+        for _ in 0..32 {
+            let request_engine = Arc::clone(&engine);
+            cancelled.push(tokio::spawn(async move { request_engine.compact().await }));
+        }
+        tokio::task::yield_now().await;
+        for request in &cancelled {
+            request.abort();
+        }
+        let surviving_engine = Arc::clone(&engine);
+        let surviving = tokio::spawn(async move { surviving_engine.compact().await.unwrap() });
+        drop(ownership);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), surviving)
+            .await
+            .expect("cancelled waiters must not starve the next request")
+            .unwrap();
+        assert_eq!(result.files_compacted, 0);
+        for request in cancelled {
+            match request.await {
+                Ok(Ok(result)) => assert_eq!(result.files_compacted, 0),
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(Err(error)) => panic!("cancelled request failed unexpectedly: {error}"),
+            }
+        }
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_drains_an_owner_after_its_waiter_is_aborted_and_rejects_new_requests() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 4;
+        config.sstable_config = SSTableConfig {
+            block_size: 512,
+            compression: super::super::sstable::CompressionType::None,
+            ..SSTableConfig::default()
+        };
+        let engine = Arc::new(Engine::open(config.clone()).await.unwrap());
+        for generation in 0..4 {
+            for key in 0..128 {
+                engine
+                    .insert(
+                        format!("shutdown:{key:05}").as_bytes(),
+                        format!("generation-{generation:02}-{:064}", key).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            engine.flush().await.unwrap();
+        }
+        let after_manifest = engine.compaction_coordinator.gate_after_manifest_for_test();
+
+        let owner_engine = Arc::clone(&engine);
+        let owner = tokio::spawn(async move { owner_engine.compact().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !after_manifest.reached() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compaction must durably publish its manifest candidate");
+        assert_eq!(
+            Manifest::load_or_create(directory.path())
+                .unwrap()
+                .sstables
+                .len(),
+            1
+        );
+        assert_eq!(engine.sstables.read().await.len(), 4);
+        assert_eq!(
+            engine.get(b"shutdown:00000").await.unwrap(),
+            Some(format!("generation-03-{:064}", 0).into_bytes())
+        );
+        owner.abort();
+
+        let shutdown_engine = Arc::clone(&engine);
+        let shutdown = tokio::spawn(async move { shutdown_engine.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while engine.compaction_coordinator.accepting_requests_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must stop compaction admission");
+        let rejected = tokio::time::timeout(Duration::from_millis(200), engine.compact())
+            .await
+            .expect("requests during shutdown are immediate no-ops")
+            .unwrap();
+        assert_eq!(rejected.files_compacted, 0);
+        assert!(!shutdown.is_finished());
+
+        after_manifest.release();
+        shutdown.await.unwrap().unwrap();
+        let _ = owner.await;
+        assert_eq!(engine.physical_stats().compactions_in_progress, 0);
+        assert_eq!(engine.physical_stats().sstables.files, 1);
+        let engine = Arc::try_unwrap(engine).ok().unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(
+            reopened.get(b"shutdown:00000").await.unwrap(),
+            Some(format!("generation-03-{:064}", 0).into_bytes())
+        );
+        reopened.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3700,6 +4001,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_level_legacy_and_versioned_winners_survive_compaction_reopen_and_new_writes() {
+        let directory = TempDir::new().unwrap();
+        let sstable_directory = directory.path().join("sstables");
+        std::fs::create_dir_all(&sstable_directory).unwrap();
+
+        let mut level_zero = write_legacy_scan_table(
+            &sstable_directory.join("legacy-l0.sst"),
+            10,
+            &[
+                (b"order:current-tombstone", Some(b"old-current-tombstone")),
+                (b"order:current-value", Some(b"old-current-value")),
+                (b"order:legacy-tombstone", Some(b"old-legacy-tombstone")),
+                (b"order:legacy-value", Some(b"old-legacy-value")),
+            ],
+            90,
+        );
+        level_zero.level = 0;
+        let mut level_one = write_legacy_scan_table(
+            &sstable_directory.join("legacy-l1.sst"),
+            20,
+            &[
+                (b"order:current-value", None),
+                (b"order:legacy-tombstone", None),
+                (b"order:legacy-value", Some(b"legacy-winner")),
+            ],
+            80,
+        );
+        level_one.level = 1;
+        let mut level_two = write_legacy_scan_table(
+            &sstable_directory.join("legacy-l2.sst"),
+            15,
+            &[
+                (b"order:current-tombstone", Some(b"stale")),
+                (b"order:legacy-tombstone", Some(b"stale")),
+                (b"order:legacy-value", Some(b"stale")),
+            ],
+            70,
+        );
+        level_two.level = 2;
+        let mut level_three = write_versioned_scan_table(
+            &sstable_directory.join("versioned-l3.sst"),
+            30,
+            &[
+                (b"order:current-tombstone", None, 100),
+                (b"order:current-value", Some(b"versioned-winner"), 101),
+            ],
+        );
+        level_three.level = 3;
+        let old_paths = [
+            level_zero.path.clone(),
+            level_one.path.clone(),
+            level_two.path.clone(),
+            level_three.path.clone(),
+        ];
+        let mut manifest = Manifest::new();
+        manifest.sstables = vec![level_zero, level_one, level_two, level_three];
+        manifest.save(directory.path()).unwrap();
+
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 1;
+        config.compaction_config.max_levels = 4;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Engine::open(config.clone()).await.unwrap();
+        assert_eq!(engine.get(b"order:legacy-tombstone").await.unwrap(), None);
+        assert_eq!(
+            engine.get(b"order:legacy-value").await.unwrap(),
+            Some(b"legacy-winner".to_vec())
+        );
+        assert_eq!(engine.get(b"order:current-tombstone").await.unwrap(), None);
+        assert_eq!(
+            engine.get(b"order:current-value").await.unwrap(),
+            Some(b"versioned-winner".to_vec())
+        );
+
+        let result = engine.compact().await.unwrap();
+        assert_eq!(result.files_compacted, 4);
+        let compacted_manifest = Manifest::load_or_create(directory.path()).unwrap();
+        assert_eq!(compacted_manifest.sstables.len(), 1);
+        assert_eq!(compacted_manifest.sstables[0].level, 3);
+        assert!(old_paths.iter().all(|path| !path.exists()));
+        assert_eq!(engine.get(b"order:legacy-tombstone").await.unwrap(), None);
+        assert_eq!(
+            engine.get(b"order:legacy-value").await.unwrap(),
+            Some(b"legacy-winner".to_vec())
+        );
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(
+            reopened.get(b"order:current-tombstone").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            reopened.get(b"order:current-value").await.unwrap(),
+            Some(b"versioned-winner".to_vec())
+        );
+        reopened
+            .insert(b"order:legacy-tombstone", b"new-versioned-value")
+            .await
+            .unwrap();
+        reopened.delete(b"order:legacy-value").await.unwrap();
+        reopened.flush().await.unwrap();
+        assert_eq!(
+            reopened.get(b"order:legacy-tombstone").await.unwrap(),
+            Some(b"new-versioned-value".to_vec())
+        );
+        assert_eq!(reopened.get(b"order:legacy-value").await.unwrap(), None);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn streamed_winners_match_point_reads_across_legacy_v3_and_memory_sources() {
         use std::collections::BTreeMap;
 
@@ -4010,6 +4423,60 @@ mod tests {
         assert!(pairs
             .iter()
             .all(|(_, value)| value.starts_with(b"value-1-")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn committed_compaction_defers_failed_unlinks_and_retries_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions(PathBuf);
+
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 2;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Engine::open(config).await.unwrap();
+        for generation in 0..2 {
+            engine
+                .insert(
+                    b"cleanup:key",
+                    format!("generation-{generation}").as_bytes(),
+                )
+                .await
+                .unwrap();
+            engine.flush().await.unwrap();
+        }
+        let input_paths = engine
+            .sstables
+            .read()
+            .await
+            .iter()
+            .map(|table| table.path.clone())
+            .collect::<Vec<_>>();
+        let level_zero = directory.path().join("sstables/L0");
+        let restore = RestorePermissions(level_zero.clone());
+        std::fs::set_permissions(&level_zero, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        assert_eq!(engine.compact().await.unwrap().files_compacted, 2);
+        assert_eq!(engine.physical_stats().sstables.files, 1);
+        assert!(input_paths.iter().all(|path| path.exists()));
+        assert_eq!(
+            engine.get(b"cleanup:key").await.unwrap(),
+            Some(b"generation-1".to_vec())
+        );
+
+        drop(restore);
+        assert_eq!(engine.compact().await.unwrap().files_compacted, 0);
+        assert!(input_paths.iter().all(|path| !path.exists()));
+        assert_eq!(engine.physical_stats().sstables.files, 1);
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
