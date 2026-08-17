@@ -17,7 +17,7 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use tracing::{debug, info};
 
-use super::cache::BlockCache;
+use super::cache::{BlockCache, CacheStats};
 use super::sstable::SSTableReader;
 use crate::core::error::{Error, Result};
 
@@ -207,6 +207,11 @@ impl SSTablePool {
             estimated_used: estimate_open_fds(),
             partitions: self.partitions.len(),
         }
+    }
+
+    /// Get decompressed block-cache statistics when that cache is enabled.
+    pub fn block_cache_stats(&self) -> Option<CacheStats> {
+        self.block_cache.as_ref().map(|cache| cache.stats())
     }
 
     fn should_backpressure(&self) -> bool {

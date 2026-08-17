@@ -25,6 +25,7 @@ pub struct SSTableWriter {
     index_builder: IndexBuilder,
     bloom_filter: BloomFilter,
     entry_count: u64,
+    tombstone_count: u64,
     file_offset: u64,
     min_key: Option<Bytes>,
     max_key: Option<Bytes>,
@@ -62,6 +63,7 @@ impl SSTableWriter {
             index_builder: IndexBuilder::new(),
             bloom_filter,
             entry_count: 0,
+            tombstone_count: 0,
             file_offset: 0,
             min_key: None,
             max_key: None,
@@ -115,6 +117,9 @@ impl SSTableWriter {
         }
 
         self.entry_count += 1;
+        if value.is_none() {
+            self.tombstone_count += 1;
+        }
         Ok(())
     }
 
@@ -227,6 +232,7 @@ impl SSTableWriter {
             path: self.path,
             file_size,
             entry_count: self.entry_count,
+            tombstone_count: self.tombstone_count,
             min_key: self.min_key.unwrap_or_default().to_vec(),
             max_key: self.max_key.unwrap_or_default().to_vec(),
             creation_time: std::time::SystemTime::now()

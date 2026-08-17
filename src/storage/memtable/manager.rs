@@ -23,7 +23,9 @@ use std::thread::ThreadId;
 use tracing::info;
 
 use super::table::{MemTable, MemTableError, Result};
-use super::types::{MemTableConfig, MemTableEntry, MemTableManagerStats};
+use super::types::{
+    estimated_memtable_entry_size, MemTableConfig, MemTableEntry, MemTableManagerStats,
+};
 use crate::storage::version::VersionOrder;
 
 /// Thread-local write buffer size (number of entries before flush to main memtable)
@@ -79,6 +81,12 @@ pub struct MemTableManager {
     config: MemTableConfig,
     /// Next engine-wide mutation sequence.
     next_sequence: AtomicU64,
+    /// Physical mutations currently retained in per-thread write buffers.
+    buffered_versions: AtomicU64,
+    /// Approximate bytes currently retained in per-thread write buffers.
+    buffered_bytes: AtomicU64,
+    /// Serializes only batched buffer-to-memtable publication with sampling.
+    buffer_handoff: RwLock<()>,
 }
 
 impl MemTableManager {
@@ -99,6 +107,9 @@ impl MemTableManager {
             flush_ids: Mutex::new(HashMap::new()),
             config,
             next_sequence: AtomicU64::new(next_sequence),
+            buffered_versions: AtomicU64::new(0),
+            buffered_bytes: AtomicU64::new(0),
+            buffer_handoff: RwLock::new(()),
         }
     }
 
@@ -132,7 +143,7 @@ impl MemTableManager {
         let _mutation = self.lock_key(key);
         for _ in 0..5 {
             let active = self.active.read();
-            match active.insert_with_sequence(key, value, sequence) {
+            match active.insert_with_sequence_prelocked(key, value, sequence) {
                 Ok(()) => return Ok(()),
                 Err(MemTableError::Full) => {
                     drop(active);
@@ -161,12 +172,22 @@ impl MemTableManager {
             value: value.to_vec(),
             sequence,
         });
+        self.buffered_bytes.fetch_add(
+            estimated_memtable_entry_size(key, Some(value)) as u64,
+            Ordering::Relaxed,
+        );
+        // Publish the complete buffered entry before the foreground call can
+        // acknowledge it.
+        self.buffered_versions.fetch_add(1, Ordering::Release);
 
         // Flush buffer when full
         if buf.len() >= THREAD_LOCAL_BUFFER_SIZE {
+            let _handoff = self.buffer_handoff.write();
             let entries: Vec<_> = buf.drain(..).collect();
             drop(buf); // Release lock before calling flush
-            self.flush_buffer(&entries)?;
+            let result = self.flush_buffer(&entries);
+            self.release_buffered_entries(&entries);
+            result?;
         }
         Ok(sequence)
     }
@@ -231,8 +252,8 @@ impl MemTableManager {
         }
         for ((key, value), &sequence) in entries.iter().zip(sequences) {
             match value {
-                Some(value) => active.insert_batch_entry(key, value, sequence),
-                None => active.delete_batch_entry(key, sequence),
+                Some(value) => active.insert_batch_entry_prelocked(key, value, sequence),
+                None => active.delete_batch_entry_prelocked(key, sequence),
             }
         }
         let should_rotate = active.should_flush();
@@ -253,7 +274,11 @@ impl MemTableManager {
             // Try to insert remaining entries
             let mut success = true;
             for (i, entry) in entries[start_idx..].iter().enumerate() {
-                match active.insert_with_sequence(&entry.key, &entry.value, entry.sequence) {
+                match active.insert_with_sequence_prelocked(
+                    &entry.key,
+                    &entry.value,
+                    entry.sequence,
+                ) {
                     Ok(()) => {}
                     Err(MemTableError::Full) => {
                         start_idx += i;
@@ -291,9 +316,12 @@ impl MemTableManager {
             }
             let mut buf = buffer.lock();
             if !buf.is_empty() {
+                let _handoff = self.buffer_handoff.write();
                 let entries: Vec<_> = buf.drain(..).collect();
                 drop(buf);
-                self.flush_buffer(&entries)?;
+                let result = self.flush_buffer(&entries);
+                self.release_buffered_entries(&entries);
+                result?;
             }
         }
         Ok(())
@@ -314,7 +342,7 @@ impl MemTableManager {
         let _mutation = self.lock_key(key);
         for _ in 0..5 {
             let active = self.active.read();
-            match active.delete_with_sequence(key, sequence) {
+            match active.delete_with_sequence_prelocked(key, sequence) {
                 Ok(()) => return Ok(()),
                 Err(MemTableError::Full) => {
                     drop(active);
@@ -513,6 +541,19 @@ impl MemTableManager {
             .fetch_max(sequence.saturating_add(1), Ordering::AcqRel);
     }
 
+    fn release_buffered_entries(&self, entries: &[BufferEntry]) {
+        let bytes = entries.iter().fold(0_u64, |total, entry| {
+            total.saturating_add(
+                estimated_memtable_entry_size(&entry.key, Some(&entry.value)) as u64,
+            )
+        });
+        self.buffered_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        // The active-table mutations and byte-gauge update happen before a
+        // sampler can observe this handoff as complete.
+        self.buffered_versions
+            .fetch_sub(entries.len() as u64, Ordering::Release);
+    }
+
     fn lock_key(&self, key: &[u8]) -> parking_lot::MutexGuard<'static, ()> {
         MUTATION_LOCKS[self.lock_index(key)].lock()
     }
@@ -577,6 +618,12 @@ impl MemTableManager {
 
     /// Get statistics for all memtables
     pub fn stats(&self) -> MemTableManagerStats {
+        // Ordinary buffered inserts publish only atomics. This shared lock
+        // coordinates sampling with the less frequent batched handoff into the
+        // active table, never with the per-insert fast path.
+        let _handoff = self.buffer_handoff.read();
+        let buffered_versions = self.buffered_versions.load(Ordering::Acquire);
+        let buffered_bytes = self.buffered_bytes.load(Ordering::Relaxed);
         let active_stats = self.active.read().stats();
         let immutable_stats: Vec<_> = self
             .immutable
@@ -586,6 +633,8 @@ impl MemTableManager {
             .collect();
 
         MemTableManagerStats {
+            buffered_versions,
+            buffered_bytes,
             active: active_stats,
             immutable: immutable_stats,
         }
@@ -661,6 +710,55 @@ mod tests {
 
         manager.delete(b"key1").unwrap();
         assert!(!manager.contains_key(b"key1"));
+    }
+
+    #[test]
+    fn replacement_transitions_do_not_inflate_counts_or_rotate_early() {
+        let config = MemTableConfig {
+            max_size: b"same".len() + b"new-value".len() + 33,
+            max_entries: 2,
+            ..test_config()
+        };
+        let manager = MemTableManager::new(config);
+
+        manager.delete(b"same").unwrap();
+        manager.delete(b"same").unwrap();
+        manager.insert(b"same", b"value").unwrap();
+        manager.insert(b"same", b"new-value").unwrap();
+        manager.delete(b"same").unwrap();
+
+        let stats = manager.stats();
+        assert_eq!(stats.active.entry_count, 1);
+        assert_eq!(stats.active.tombstone_count, 1);
+        assert_eq!(stats.active.size_bytes, b"same".len() + 32);
+        assert!(stats.immutable.is_empty());
+
+        manager.insert(b"other", b"value").unwrap();
+        assert_eq!(manager.stats().active.entry_count, 2);
+        assert_eq!(manager.immutable_count(), 0);
+        manager.insert(b"rotates", b"value").unwrap();
+        assert_eq!(manager.immutable_count(), 1);
+    }
+
+    #[test]
+    fn buffered_and_active_gauges_use_the_same_entry_size_estimate() {
+        let manager = MemTableManager::new(test_config());
+        let key = b"buffered-key";
+        let value = b"buffered-value";
+
+        manager.insert_buffered(key, value).unwrap();
+        let buffered = manager.stats();
+        assert_eq!(buffered.buffered_versions, 1);
+        assert_eq!(
+            buffered.buffered_bytes,
+            estimated_memtable_entry_size(key, Some(value)) as u64
+        );
+
+        manager.flush_thread_local().unwrap();
+        let active = manager.stats();
+        assert_eq!(active.buffered_versions, 0);
+        assert_eq!(active.buffered_bytes, 0);
+        assert_eq!(active.active.size_bytes as u64, buffered.buffered_bytes);
     }
 
     #[test]

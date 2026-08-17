@@ -27,16 +27,18 @@ use crate::core::crypto::crc32_checksum;
 use crate::core::error::{Error, Result};
 
 const MANIFEST_MAGIC: &[u8; 8] = b"HNSHMNFT";
-/// Format v2 removed the unused length-prefixed checkpoint extension. Readers
-/// still accept v1 so existing databases can be upgraded in place.
-const MANIFEST_VERSION: u32 = 2;
+/// Format v3 persists per-SSTable tombstone counts for cheap physical gauges.
+/// Readers still accept v1 and v2 so existing databases can be upgraded in
+/// place after their tables are inspected once at open.
+pub(crate) const MANIFEST_VERSION: u32 = 3;
+const MANIFEST_VERSION_WITHOUT_TOMBSTONE_COUNTS: u32 = 2;
 const LEGACY_MANIFEST_VERSION: u32 = 1;
 
 /// Database manifest - tracks persistent state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Manifest version for compatibility
-    pub version: u64,
+    /// On-disk format version loaded, or the current format for a new manifest.
+    pub loaded_format_version: u64,
     /// First WAL sequence not known to be represented by installed SSTables.
     /// On recovery, replay WAL entries greater than or equal to this sequence.
     pub wal_checkpoint: u64,
@@ -52,6 +54,7 @@ pub struct SSTableManifestEntry {
     pub path: PathBuf,
     pub size: u64,
     pub entry_count: u64,
+    pub tombstone_count: u64,
     pub min_key: Vec<u8>,
     pub max_key: Vec<u8>,
     pub min_sequence: u64,
@@ -63,7 +66,7 @@ impl Manifest {
     /// Create new empty manifest
     pub fn new() -> Self {
         Self {
-            version: 0,
+            loaded_format_version: u64::from(MANIFEST_VERSION),
             wal_checkpoint: 0,
             sstables: Vec::new(),
         }
@@ -129,7 +132,10 @@ impl Manifest {
 
         // Read version
         let version = reader.read_u32::<LittleEndian>()?;
-        if version != MANIFEST_VERSION && version != LEGACY_MANIFEST_VERSION {
+        if version != MANIFEST_VERSION
+            && version != MANIFEST_VERSION_WITHOUT_TOMBSTONE_COUNTS
+            && version != LEGACY_MANIFEST_VERSION
+        {
             return Err(Error::Internal {
                 message: format!("Unsupported manifest version: {}", version),
             });
@@ -150,7 +156,7 @@ impl Manifest {
         // Read SSTable entries
         let mut sstables = Vec::with_capacity(sstable_count);
         for _ in 0..sstable_count {
-            let entry = Self::read_sstable_entry(&mut reader)?;
+            let entry = Self::read_sstable_entry(&mut reader, version)?;
             sstables.push(entry);
         }
 
@@ -162,7 +168,7 @@ impl Manifest {
         );
 
         Ok(Self {
-            version: version as u64,
+            loaded_format_version: u64::from(version),
             wal_checkpoint,
             sstables,
         })
@@ -191,7 +197,7 @@ impl Manifest {
 
             // Write SSTable entries
             for entry in &self.sstables {
-                Self::write_sstable_entry(&mut buf, entry)?;
+                Self::write_sstable_entry(&mut buf, entry, MANIFEST_VERSION)?;
             }
 
             // Compute CRC32 over all content and append it
@@ -225,25 +231,28 @@ impl Manifest {
         Ok(())
     }
 
+    /// Persist an already validated legacy manifest in the current format.
+    pub(crate) fn persist_format_upgrade(&mut self, data_dir: &Path) -> Result<()> {
+        self.loaded_format_version = u64::from(MANIFEST_VERSION);
+        self.save(data_dir)
+    }
+
     /// Update the exclusive durable frontier after a successful flush.
     pub fn update_checkpoint(&mut self, sequence: u64) {
         self.wal_checkpoint = sequence;
-        self.version += 1;
     }
 
     /// Add SSTable to manifest
     pub fn add_sstable(&mut self, entry: SSTableManifestEntry) {
         self.sstables.push(entry);
-        self.version += 1;
     }
 
     /// Remove SSTables (after compaction)
     pub fn remove_sstables(&mut self, ids: &[u64]) {
         self.sstables.retain(|e| !ids.contains(&e.id));
-        self.version += 1;
     }
 
-    fn read_sstable_entry(reader: &mut impl Read) -> Result<SSTableManifestEntry> {
+    fn read_sstable_entry(reader: &mut impl Read, version: u32) -> Result<SSTableManifestEntry> {
         let id = reader.read_u64::<LittleEndian>()?;
         let level = reader.read_u32::<LittleEndian>()?;
 
@@ -255,6 +264,11 @@ impl Manifest {
 
         let size = reader.read_u64::<LittleEndian>()?;
         let entry_count = reader.read_u64::<LittleEndian>()?;
+        let tombstone_count = if version >= MANIFEST_VERSION {
+            reader.read_u64::<LittleEndian>()?
+        } else {
+            0
+        };
 
         // Read min_key
         let min_key_len = reader.read_u32::<LittleEndian>()? as usize;
@@ -276,6 +290,7 @@ impl Manifest {
             path,
             size,
             entry_count,
+            tombstone_count,
             min_key,
             max_key,
             min_sequence,
@@ -284,7 +299,11 @@ impl Manifest {
         })
     }
 
-    fn write_sstable_entry(writer: &mut impl Write, entry: &SSTableManifestEntry) -> Result<()> {
+    fn write_sstable_entry(
+        writer: &mut impl Write,
+        entry: &SSTableManifestEntry,
+        version: u32,
+    ) -> Result<()> {
         writer.write_u64::<LittleEndian>(entry.id)?;
         writer.write_u32::<LittleEndian>(entry.level)?;
 
@@ -295,6 +314,9 @@ impl Manifest {
 
         writer.write_u64::<LittleEndian>(entry.size)?;
         writer.write_u64::<LittleEndian>(entry.entry_count)?;
+        if version >= MANIFEST_VERSION {
+            writer.write_u64::<LittleEndian>(entry.tombstone_count)?;
+        }
 
         // Write min_key
         writer.write_u32::<LittleEndian>(entry.min_key.len() as u32)?;
@@ -308,6 +330,29 @@ impl Manifest {
         writer.write_u64::<LittleEndian>(entry.max_sequence)?;
         writer.write_u64::<LittleEndian>(entry.creation_time)?;
 
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_legacy_for_test(&self, data_dir: &Path, version: u32) -> Result<()> {
+        assert!(
+            version == LEGACY_MANIFEST_VERSION
+                || version == MANIFEST_VERSION_WITHOUT_TOMBSTONE_COUNTS
+        );
+        let mut buffer = Vec::new();
+        buffer.write_all(MANIFEST_MAGIC)?;
+        buffer.write_u32::<LittleEndian>(version)?;
+        buffer.write_u64::<LittleEndian>(self.wal_checkpoint)?;
+        if version == LEGACY_MANIFEST_VERSION {
+            buffer.write_u32::<LittleEndian>(0)?;
+        }
+        buffer.write_u32::<LittleEndian>(self.sstables.len() as u32)?;
+        for entry in &self.sstables {
+            Self::write_sstable_entry(&mut buffer, entry, version)?;
+        }
+        let checksum = crc32_checksum(&buffer);
+        buffer.write_u32::<LittleEndian>(checksum)?;
+        std::fs::write(data_dir.join("MANIFEST"), buffer)?;
         Ok(())
     }
 }
@@ -383,6 +428,7 @@ mod tests {
             path: PathBuf::from("/data/sstables/1.sst"),
             size: 1024,
             entry_count: 100,
+            tombstone_count: 7,
             min_key: vec![0, 1, 2],
             max_key: vec![9, 9, 9],
             min_sequence: 0,
@@ -400,6 +446,7 @@ mod tests {
         assert_eq!(loaded.sstables.len(), 1);
         assert_eq!(loaded.sstables[0].id, 1);
         assert_eq!(loaded.sstables[0].entry_count, 100);
+        assert_eq!(loaded.sstables[0].tombstone_count, 7);
     }
 
     #[test]
@@ -418,7 +465,7 @@ mod tests {
         Manifest::new().save(temp_dir.path()).unwrap();
 
         let bytes = std::fs::read(temp_dir.path().join("MANIFEST")).unwrap();
-        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 3);
         assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 0);
         assert_eq!(bytes.len(), 28);
     }
@@ -442,6 +489,34 @@ mod tests {
         let manifest = Manifest::load_or_create(temp_dir.path()).unwrap();
         assert_eq!(manifest.wal_checkpoint, 42);
         assert!(manifest.sstables.is_empty());
+    }
+
+    #[test]
+    fn loads_v2_manifest_without_tombstone_counts() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manifest = Manifest::new();
+        manifest.add_sstable(SSTableManifestEntry {
+            id: 9,
+            level: 0,
+            path: PathBuf::from("legacy.sst"),
+            size: 2048,
+            entry_count: 3,
+            tombstone_count: 2,
+            min_key: b"a".to_vec(),
+            max_key: b"z".to_vec(),
+            min_sequence: 1,
+            max_sequence: 3,
+            creation_time: 99,
+        });
+        manifest
+            .save_legacy_for_test(temp_dir.path(), MANIFEST_VERSION_WITHOUT_TOMBSTONE_COUNTS)
+            .unwrap();
+
+        let loaded = Manifest::load_or_create(temp_dir.path()).unwrap();
+        assert_eq!(loaded.loaded_format_version, 2);
+        assert_eq!(loaded.sstables.len(), 1);
+        assert_eq!(loaded.sstables[0].entry_count, 3);
+        assert_eq!(loaded.sstables[0].tombstone_count, 0);
     }
 
     #[test]

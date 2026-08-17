@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::types::Compression;
-use crate::core::{DbConfig, WriteBatch};
+use crate::core::{DbConfig, LogicalStats, PhysicalStats, WriteBatch};
 
 use super::directory_lock::LOCKED_DIRECTORY_GUIDANCE;
 use super::engine::{Engine, StorageConfig, StorageError};
@@ -437,9 +437,16 @@ impl Db {
         Ok(())
     }
 
-    /// Get database statistics
+    /// Get legacy mixed physical statistics.
+    ///
+    /// This compatibility API performs no scan. `total_keys` is a physical
+    /// version count and `total_bytes` mixes approximate memtable bytes with
+    /// SSTable file bytes; neither field describes logical live data. Use
+    /// [`Self::logical_stats`] and [`Self::physical_stats`] for unambiguous
+    /// statistics.
+    #[deprecated(note = "use logical_stats() and physical_stats()")]
     pub fn stats(&self) -> DbStats {
-        let stats = self.engine.stats();
+        let stats = self.engine.legacy_stats();
         DbStats {
             total_keys: stats.total_keys,
             total_bytes: stats.total_bytes,
@@ -457,14 +464,37 @@ impl Db {
             write_stall_micros: stats.write_stall_micros,
         }
     }
+
+    /// Scan one coherent snapshot for exact logical live-data statistics.
+    ///
+    /// This fallible async operation is O(physical versions), reads SSTable
+    /// blocks, and freezes a nonempty active memtable while taking the
+    /// snapshot. That freeze can increase bytes written by later flushes and
+    /// compactions. Tombstones and superseded versions never inflate the
+    /// returned key or byte counts.
+    pub async fn logical_stats(&self) -> Result<LogicalStats> {
+        Ok(self.engine.logical_stats().await?)
+    }
+
+    /// Get cheap physical gauges and process-lifetime cumulative counters.
+    ///
+    /// This performs no logical-data scan. Current component gauges are
+    /// monitoring samples rather than a transactional cross-component
+    /// snapshot. Every field ending in `_since_open` resets after reopen.
+    pub fn physical_stats(&self) -> PhysicalStats {
+        self.engine.physical_stats()
+    }
 }
 
-/// Database statistics
+/// Legacy mixed physical database statistics.
+///
+/// Kept for source compatibility with [`Db::stats`]. New code should use
+/// [`LogicalStats`] and [`PhysicalStats`].
 #[derive(Debug, Clone)]
 pub struct DbStats {
-    /// Total number of keys
+    /// Physical versions across memtables and SSTables, not logical live keys.
     pub total_keys: u64,
-    /// Total data size in bytes
+    /// Approximate memtable bytes plus SSTable file bytes.
     pub total_bytes: u64,
     /// WAL size in bytes
     pub wal_size: u64,

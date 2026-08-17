@@ -19,6 +19,7 @@ pub mod direct_io;
 mod directory_lock;
 pub mod engine;
 #[cfg(test)]
+#[allow(deprecated)]
 mod failpoints;
 pub mod fd;
 pub mod iter;

@@ -114,9 +114,15 @@ impl DbConfig {
 /// Storage statistics
 #[derive(Debug, Clone, Default)]
 pub struct StorageStats {
-    /// Total number of keys in the database
+    /// Total number of physical versions across memtables and SSTables.
+    ///
+    /// This legacy field is not a logical live-key count. Use
+    /// `Db::logical_stats` for an exact logical snapshot.
     pub total_keys: u64,
-    /// Total size of all data in bytes
+    /// Approximate memtable bytes plus SSTable file bytes.
+    ///
+    /// This legacy field mixes memory estimates and on-disk bytes. Use
+    /// `Db::physical_stats` for separated gauges.
     pub total_bytes: u64,
     /// Current WAL size in bytes
     pub wal_size: u64,
@@ -144,6 +150,176 @@ pub struct StorageStats {
     pub write_stall_count: u64,
     /// Total controlled write stall time in microseconds
     pub write_stall_micros: u64,
+}
+
+/// Exact statistics for one coherent logical database snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogicalStats {
+    /// Number of unique live keys in the snapshot.
+    pub live_keys: u64,
+    /// Bytes occupied by the unique live keys themselves.
+    pub key_bytes: u64,
+    /// Bytes occupied by the values of unique live keys.
+    pub value_bytes: u64,
+    /// Sum of [`Self::key_bytes`] and [`Self::value_bytes`].
+    pub total_bytes: u64,
+}
+
+/// Cheap physical and operational statistics.
+///
+/// Current gauges describe storage visible when each component is sampled.
+/// Fields ending in `_since_open` are monotonic for one `Db`/`Engine` process
+/// lifetime and reset when the database is reopened.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhysicalStats {
+    /// Write-ahead log state.
+    pub wal: WalStats,
+    /// Active and immutable memtable state.
+    pub memtables: PhysicalMemTableStats,
+    /// Installed SSTable state.
+    pub sstables: PhysicalSSTableStats,
+    /// Physical version and tombstone state.
+    pub versions: PhysicalVersionStats,
+    /// Block and SSTable-reader cache state.
+    pub cache: PhysicalCacheStats,
+    /// Controlled write-stall state.
+    pub stalls: WriteStallStats,
+    /// Counters used to calculate write amplification.
+    pub amplification: WriteAmplificationStats,
+    /// Compaction selections or jobs currently in progress.
+    pub compactions_in_progress: u64,
+}
+
+/// Physical write-ahead log statistics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalStats {
+    /// Whether the WAL is enabled for this database.
+    pub enabled: bool,
+    /// Bytes in the active WAL segment.
+    pub active_segment_bytes: u64,
+    /// Validated bytes in all retained WAL segments, including headers.
+    /// A partial failed append is excluded until recovery repairs the tail.
+    pub retained_valid_bytes: u64,
+    /// Encoded WAL bytes appended successfully since this database was opened.
+    pub bytes_written_since_open: u64,
+}
+
+/// Physical memtable statistics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhysicalMemTableStats {
+    /// Approximate bytes in per-thread write buffers awaiting publication.
+    pub buffered_bytes: u64,
+    /// Approximate bytes in the writable memtable.
+    pub active_bytes: u64,
+    /// Approximate bytes in immutable memtables awaiting flush completion.
+    pub immutable_bytes: u64,
+    /// Physical versions in the writable memtable.
+    pub active_versions: u64,
+    /// Physical mutations in per-thread write buffers awaiting publication.
+    pub buffered_versions: u64,
+    /// Physical versions in immutable memtables.
+    pub immutable_versions: u64,
+    /// Tombstone versions across writable and immutable memtables.
+    pub tombstones: u64,
+    /// Immutable memtables awaiting flush completion.
+    pub immutable_tables: u64,
+}
+
+/// Physical SSTable statistics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhysicalSSTableStats {
+    /// Bytes occupied by installed SSTable files.
+    pub bytes: u64,
+    /// Number of installed SSTable files.
+    pub files: u64,
+    /// Number of installed level-zero SSTable files.
+    pub level_zero_files: u64,
+    /// Physical versions stored in installed SSTables.
+    pub versions: u64,
+    /// Tombstone versions stored in installed SSTables.
+    pub tombstones: u64,
+}
+
+/// Physical version statistics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhysicalVersionStats {
+    /// Current physical versions across memtables and installed SSTables.
+    pub current: u64,
+    /// Current tombstone versions across memtables and installed SSTables.
+    pub tombstones: u64,
+    /// Superseded versions discarded by completed compactions since open.
+    pub reclaimed_by_compaction_since_open: u64,
+    /// Tombstone versions among the superseded versions reclaimed by completed
+    /// compactions since open. A winning tombstone remains current and is not
+    /// counted as reclaimed.
+    pub tombstones_reclaimed_by_compaction_since_open: u64,
+}
+
+/// Physical cache statistics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhysicalCacheStats {
+    /// Whether the decompressed block cache is enabled.
+    pub block_cache_enabled: bool,
+    /// Current decompressed block-cache entry count.
+    pub block_cache_entries: u64,
+    /// Current decompressed block-cache bytes.
+    pub block_cache_bytes: u64,
+    /// Block-cache hits since open.
+    pub block_cache_hits_since_open: u64,
+    /// Block-cache misses since open.
+    pub block_cache_misses_since_open: u64,
+    /// Current cached SSTable-reader count.
+    pub sstable_readers: u64,
+    /// SSTable-reader cache hits since open.
+    pub sstable_reader_hits_since_open: u64,
+    /// SSTable-reader cache misses since open.
+    pub sstable_reader_misses_since_open: u64,
+    /// SSTable-reader evictions since open.
+    pub sstable_reader_evictions_since_open: u64,
+}
+
+/// Controlled write-stall statistics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteStallStats {
+    /// Number of controlled stalls since open.
+    pub count_since_open: u64,
+    /// Total controlled stall time in microseconds since open.
+    pub micros_since_open: u64,
+}
+
+/// Process-lifetime byte counters for write-amplification calculations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteAmplificationStats {
+    /// Key and value payload bytes from successful foreground mutations since open.
+    /// Delete operations contribute their key bytes.
+    pub logical_bytes_ingested_since_open: u64,
+    /// Encoded WAL bytes appended successfully since open.
+    pub wal_bytes_written_since_open: u64,
+    /// SSTable file bytes produced by memtable flush attempts since open.
+    pub flush_bytes_written_since_open: u64,
+    /// Selected input SSTable file bytes for compaction attempts since open.
+    /// Failed attempts count their selected inputs once execution begins.
+    pub compaction_input_bytes_since_open: u64,
+    /// Actual output-file bytes produced by compaction attempts since open.
+    /// Partial files from failed attempts are included.
+    pub compaction_output_bytes_since_open: u64,
+}
+
+impl WriteAmplificationStats {
+    /// SSTable bytes written per logical foreground payload byte since open.
+    ///
+    /// WAL bytes are intentionally excluded so callers can report WAL and LSM
+    /// amplification separately. Maintenance may rewrite data that predates
+    /// this process, so this is an observed since-open activity ratio rather
+    /// than a persisted database-lifetime ratio. Returns `None` before any
+    /// foreground payload is ingested.
+    pub fn sstable_write_amplification(&self) -> Option<f64> {
+        (self.logical_bytes_ingested_since_open != 0).then(|| {
+            self.flush_bytes_written_since_open
+                .saturating_add(self.compaction_output_bytes_since_open) as f64
+                / self.logical_bytes_ingested_since_open as f64
+        })
+    }
 }
 
 /// Compaction result

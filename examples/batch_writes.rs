@@ -141,10 +141,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Bob's balance: ${}", String::from_utf8_lossy(&bob));
     }
 
-    let stats = db.stats();
+    let stats = db.logical_stats().await?;
     println!(
         "\nFinal stats: {} keys, {} bytes",
-        stats.total_keys, stats.total_bytes
+        stats.live_keys, stats.total_bytes
     );
 
     println!("\nBatch writes example completed successfully!");

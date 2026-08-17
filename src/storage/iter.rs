@@ -150,6 +150,24 @@ impl EntryGuard {
         }
     }
 
+    /// Get the value length without materializing an in-memory value.
+    #[inline]
+    pub fn value_len(&self) -> usize {
+        match &self.value {
+            GuardValue::Memory { table, key, cached } => cached.get().map_or_else(
+                || {
+                    table
+                        .data
+                        .get(key.as_slice())
+                        .and_then(|entry| entry.value().value.as_ref().map(Vec::len))
+                        .expect("a frozen scan winner must retain its value")
+                },
+                Vec::len,
+            ),
+            GuardValue::Block { range, .. } => range.len(),
+        }
+    }
+
     /// Consume the guard and return the key-value pair.
     #[inline]
     pub fn into_pair(self) -> (Vec<u8>, Vec<u8>) {

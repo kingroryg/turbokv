@@ -92,7 +92,12 @@ pub trait StorageEngine: Send + Sync {
     /// background, but can be triggered manually if needed.
     fn compact(&self) -> Result<CompactionResult>;
 
-    /// Get storage statistics.
+    /// Get legacy mixed physical storage statistics.
+    ///
+    /// Implementations with exact logical and separated physical statistics
+    /// should expose those through implementation-specific APIs; this legacy
+    /// trait method cannot perform an async logical snapshot scan.
+    #[deprecated(note = "use implementation-specific logical and physical statistics APIs")]
     fn stats(&self) -> Result<StorageStats>;
 }
 

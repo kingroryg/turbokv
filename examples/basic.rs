@@ -65,11 +65,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================
     // STATS - View database statistics
     // ============================================
-    let stats = db.stats();
+    let logical = db.logical_stats().await?;
+    let physical = db.physical_stats();
     println!("\nDatabase Statistics:");
-    println!("  Total keys: {}", stats.total_keys);
-    println!("  Total bytes: {}", stats.total_bytes);
-    println!("  MemTable size: {} bytes", stats.memtable_size);
+    println!("  Live keys: {}", logical.live_keys);
+    println!("  Logical bytes: {}", logical.total_bytes);
+    println!(
+        "  Active MemTable size: {} bytes",
+        physical.memtables.active_bytes
+    );
 
     // ============================================
     // FLUSH - Persist data to disk

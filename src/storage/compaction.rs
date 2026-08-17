@@ -67,6 +67,9 @@ pub struct CompactionResult {
     pub bytes_written: u64,
     pub entries_merged: u64,
     pub entries_dropped: u64,
+    /// Tombstone versions among [`Self::entries_dropped`]. Winning tombstones
+    /// remain current versions and are not counted as reclaimed.
+    pub tombstones_dropped: u64,
     /// Keys that survived compaction (for vector index filtering)
     pub live_keys: Vec<Vec<u8>>,
 }
@@ -147,6 +150,7 @@ impl Compactor {
         let mut bytes_read = 0u64;
         let mut entries_merged = 0u64;
         let mut entries_dropped = 0u64;
+        let mut tombstones_dropped = 0u64;
 
         // Open all input SSTables
         let readers: Vec<SSTableReader> = job
@@ -187,6 +191,9 @@ impl Compactor {
 
             if is_duplicate {
                 entries_dropped += 1;
+                if entry.value.is_none() {
+                    tombstones_dropped += 1;
+                }
             } else {
                 writer.add_versioned(&entry.key, entry.value.as_deref(), entry.sequence)?;
                 if entry.value.is_some() {
@@ -228,6 +235,7 @@ impl Compactor {
             path: job.output_path,
             size: output_info.file_size,
             entry_count: output_info.entry_count,
+            tombstone_count: output_info.tombstone_count,
             min_key: output_info.min_key,
             max_key: output_info.max_key,
             min_sequence: output_info.min_sequence,
@@ -255,6 +263,7 @@ impl Compactor {
             bytes_written,
             entries_merged,
             entries_dropped,
+            tombstones_dropped,
             live_keys,
         })
     }
@@ -372,6 +381,7 @@ mod tests {
             path: path.to_path_buf(),
             size: info.file_size,
             entry_count: info.entry_count,
+            tombstone_count: info.tombstone_count,
             min_key: info.min_key,
             max_key: info.max_key,
             min_sequence: info.min_sequence,
@@ -405,6 +415,7 @@ mod tests {
                 path: PathBuf::from(format!("/tmp/{}.sst", i)),
                 size: 1024,
                 entry_count: 100,
+                tombstone_count: 0,
                 min_key: vec![],
                 max_key: vec![],
                 min_sequence: 0,

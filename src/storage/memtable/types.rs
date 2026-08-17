@@ -4,6 +4,17 @@
 
 use std::time::{Duration, Instant};
 
+/// Approximate allocation and index overhead charged to every physical entry.
+pub(crate) const MEMTABLE_ENTRY_OVERHEAD_BYTES: usize = 32;
+
+/// Estimate the bytes charged to one physical memtable or write-buffer entry.
+#[inline]
+pub(crate) fn estimated_memtable_entry_size(key: &[u8], value: Option<&[u8]>) -> usize {
+    key.len()
+        .saturating_add(value.map_or(0, <[u8]>::len))
+        .saturating_add(MEMTABLE_ENTRY_OVERHEAD_BYTES)
+}
+
 /// Entry stored in the MemTable
 ///
 /// Value is `Option<Vec<u8>>` where:
@@ -93,6 +104,10 @@ impl Default for MemTableConfig {
 /// Statistics for the MemTable manager
 #[derive(Debug)]
 pub struct MemTableManagerStats {
+    /// Physical mutations waiting in per-thread write buffers.
+    pub buffered_versions: u64,
+    /// Approximate bytes waiting in per-thread write buffers.
+    pub buffered_bytes: u64,
     /// Stats for the active (writable) memtable
     pub active: MemTableStats,
     /// Stats for immutable memtables awaiting flush

@@ -18,7 +18,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
-use turbokv::{Compression, Db, DbOptions, DbStats};
+use turbokv::{Compression, Db, DbOptions, PhysicalStats};
 
 type DynError = Box<dyn std::error::Error>;
 const MEMTABLE_BYTES: u32 = 64 * 1024 * 1024;
@@ -208,9 +208,9 @@ async fn run_turbokv(
     let stats = settle_turbokv(&db, config.operations).await?;
     let settlement = settlement_start.elapsed();
     let disk_bytes = directory_size(temp.path())?;
-    let write_bytes = stats.wal_bytes_written
-        + stats.sstable_flush_bytes_written
-        + stats.compaction_bytes_written;
+    let write_bytes = stats.amplification.wal_bytes_written_since_open
+        + stats.amplification.flush_bytes_written_since_open
+        + stats.amplification.compaction_output_bytes_since_open;
     Ok(measurement(
         EngineName::TurboKv,
         repetition,
@@ -220,16 +220,16 @@ async fn run_turbokv(
         samples,
         StorageMetrics {
             disk_bytes,
-            wal_bytes_written: Some(stats.wal_bytes_written),
-            flush_bytes_written: Some(stats.sstable_flush_bytes_written),
-            compaction_bytes_read: Some(stats.compaction_bytes_read),
-            compaction_bytes_written: Some(stats.compaction_bytes_written),
+            wal_bytes_written: Some(stats.amplification.wal_bytes_written_since_open),
+            flush_bytes_written: Some(stats.amplification.flush_bytes_written_since_open),
+            compaction_bytes_read: Some(stats.amplification.compaction_input_bytes_since_open),
+            compaction_bytes_written: Some(stats.amplification.compaction_output_bytes_since_open),
             physical_write_bytes: Some(write_bytes),
         },
     ))
 }
 
-async fn settle_turbokv(db: &Db, expected_keys: u64) -> Result<DbStats, DynError> {
+async fn settle_turbokv(db: &Db, expected_keys: u64) -> Result<PhysicalStats, DynError> {
     let deadline = Instant::now() + SETTLEMENT_TIMEOUT;
     db.flush().await?;
 
@@ -256,12 +256,13 @@ async fn wait_for_accounted_keys(
     db: &Db,
     expected_keys: u64,
     deadline: Instant,
-) -> Result<DbStats, DynError> {
+) -> Result<PhysicalStats, DynError> {
     loop {
-        let stats = db.stats();
-        if stats.total_keys == expected_keys
-            && stats.memtable_size == 0
-            && stats.immutable_memtables == 0
+        let logical = db.logical_stats().await?;
+        let stats = db.physical_stats();
+        if logical.live_keys == expected_keys
+            && stats.memtables.active_versions == 0
+            && stats.memtables.immutable_tables == 0
             && stats.compactions_in_progress == 0
         {
             return Ok(stats);
@@ -269,7 +270,7 @@ async fn wait_for_accounted_keys(
         if Instant::now() >= deadline {
             return Err(format!(
                 "TurboKV settlement timed out with {} of {expected_keys} keys accounted for",
-                stats.total_keys
+                logical.live_keys
             )
             .into());
         }
@@ -277,12 +278,12 @@ async fn wait_for_accounted_keys(
     }
 }
 
-const fn maintenance_signature(stats: &DbStats) -> (u64, u64, u64, u64, u64) {
+const fn maintenance_signature(stats: &PhysicalStats) -> (u64, u64, u64, u64, u64) {
     (
-        stats.sstable_count,
-        stats.l0_sstable_count,
-        stats.compaction_bytes_read,
-        stats.compaction_bytes_written,
+        stats.sstables.files,
+        stats.sstables.level_zero_files,
+        stats.amplification.compaction_input_bytes_since_open,
+        stats.amplification.compaction_output_bytes_since_open,
         stats.compactions_in_progress,
     )
 }

@@ -63,7 +63,6 @@ struct WriteRequest {
 
 pub(crate) struct BatchAppend {
     pub sequences: Vec<u64>,
-    pub bytes_written: u64,
 }
 
 struct EncodedBatchRecord {
@@ -73,6 +72,44 @@ struct EncodedBatchRecord {
     last_sequence: u64,
 }
 
+struct WalByteAccounting {
+    retained_valid: AtomicU64,
+    written_since_open: AtomicU64,
+}
+
+impl WalByteAccounting {
+    fn new(retained_valid: u64) -> Self {
+        Self {
+            retained_valid: AtomicU64::new(retained_valid),
+            written_since_open: AtomicU64::new(0),
+        }
+    }
+
+    fn record_segment_created(&self) {
+        self.retained_valid
+            .fetch_add(WAL_HEADER_SIZE as u64, Ordering::Relaxed);
+    }
+
+    fn record_append(&self, bytes: u64) {
+        self.retained_valid.fetch_add(bytes, Ordering::Relaxed);
+        // Publish the cumulative counter after the retained gauge so a
+        // sampler that observes this append can also observe its valid bytes.
+        self.written_since_open.fetch_add(bytes, Ordering::Release);
+    }
+
+    fn record_reclamation(&self, bytes: u64) {
+        self.retained_valid.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    fn retained_valid(&self) -> u64 {
+        self.retained_valid.load(Ordering::Relaxed)
+    }
+
+    fn written_since_open(&self) -> u64 {
+        self.written_since_open.load(Ordering::Acquire)
+    }
+}
+
 pub struct WriteAheadLog {
     wal_dir: PathBuf,
     config: WalConfig,
@@ -80,6 +117,7 @@ pub struct WriteAheadLog {
     sequence: Arc<AtomicU64>,
     /// Atomic batch spans used to keep durable checkpoints on batch boundaries.
     batch_ranges: Arc<RwLock<BTreeMap<u64, u64>>>,
+    byte_accounting: Arc<WalByteAccounting>,
     write_tx: mpsc::Sender<WriteRequest>,
     #[allow(dead_code)]
     group_commit_in_progress: Arc<AtomicU64>,
@@ -112,6 +150,7 @@ impl WriteAheadLog {
             })?;
 
         let (wal_file, sequence, batch_ranges) = Self::open_or_create(&wal_dir, &config).await?;
+        let byte_accounting = Arc::new(WalByteAccounting::new(retained_wal_bytes(&wal_dir)?));
         let current_file = Arc::new(RwLock::new(wal_file));
         let (write_tx, write_rx) = mpsc::channel::<WriteRequest>(config.max_batch_size * 2);
 
@@ -121,6 +160,7 @@ impl WriteAheadLog {
         let bg_dir = wal_dir.clone();
         let group_commit_in_progress = Arc::new(AtomicU64::new(0));
         let bg_group_commit_in_progress = Arc::clone(&group_commit_in_progress);
+        let bg_byte_accounting = Arc::clone(&byte_accounting);
         tokio::spawn(async move {
             Self::group_commit_loop(
                 write_rx,
@@ -129,6 +169,7 @@ impl WriteAheadLog {
                 bg_dir,
                 directory_lock,
                 bg_group_commit_in_progress,
+                bg_byte_accounting,
             )
             .await;
         });
@@ -139,6 +180,7 @@ impl WriteAheadLog {
             current_file,
             sequence: Arc::new(AtomicU64::new(sequence)),
             batch_ranges: Arc::new(RwLock::new(batch_ranges)),
+            byte_accounting,
             write_tx,
             group_commit_in_progress,
         })
@@ -234,9 +276,11 @@ impl WriteAheadLog {
                 finalize_header(&mut file)?;
                 let new_seq = file.next_segment_sequence()?;
                 *file = create_file(&self.wal_dir, new_seq, &self.config)?;
+                self.byte_accounting.record_segment_created();
                 info!("Rotated WAL file, new sequence: {}", new_seq);
             }
             file.file.write_all(&buf)?;
+            self.byte_accounting.record_append(entry_bytes);
             file.record_append(entry_bytes, 1, sequence, sequence);
 
             Ok(sequence)
@@ -256,11 +300,17 @@ impl WriteAheadLog {
         };
 
         if needs_rotation {
-            rotate_sync(&self.current_file, &self.wal_dir, &self.config)?;
+            rotate_sync(
+                &self.current_file,
+                &self.wal_dir,
+                &self.config,
+                &self.byte_accounting,
+            )?;
         }
 
         let mut file = self.current_file.write();
         write_entry(&mut file.file, entry)?;
+        self.byte_accounting.record_append(entry_bytes);
         file.record_append(entry_bytes, 1, entry.sequence, entry.sequence);
 
         if sync {
@@ -344,9 +394,11 @@ impl WriteAheadLog {
                 finalize_header(&mut file)?;
                 let new_seq = file.next_segment_sequence()?;
                 *file = create_file(&self.wal_dir, new_seq, &self.config)?;
+                self.byte_accounting.record_segment_created();
                 info!("Rotated WAL file, new sequence: {}", new_seq);
             }
             file.file.write_all(&buf)?;
+            self.byte_accounting.record_append(entry_bytes);
             file.record_append(entry_bytes, 1, sequence, sequence);
 
             Ok(sequence)
@@ -365,7 +417,6 @@ impl WriteAheadLog {
         if entries.is_empty() {
             return Ok(BatchAppend {
                 sequences: Vec::new(),
-                bytes_written: 0,
             });
         }
 
@@ -377,7 +428,6 @@ impl WriteAheadLog {
 
         Ok(BatchAppend {
             sequences: batch.sequences,
-            bytes_written: batch.encoded.len() as u64,
         })
     }
 
@@ -449,17 +499,18 @@ impl WriteAheadLog {
                 .last_sequence
                 .map_or(true, |last| last < up_to_sequence)
             {
-                eligible.push(path);
+                eligible.push((path, metadata.valid_end));
             }
         }
 
         // Keep the active identity stable only for the final recheck/unlink
         // window. Rotation and appends require the write side of this lock.
         let current_file = self.current_file.read();
-        for path in eligible {
+        for (path, valid_bytes) in eligible {
             if *path != current_file.path {
                 info!("Deleting WAL file: {:?}", path);
                 std::fs::remove_file(path)?;
+                self.byte_accounting.record_reclamation(valid_bytes);
             }
         }
         self.batch_ranges
@@ -492,6 +543,18 @@ impl WriteAheadLog {
     pub fn current_size(&self) -> u64 {
         let file = self.current_file.read();
         file.size
+    }
+
+    /// Returns validated bytes in all retained WAL segments, including headers.
+    /// A partial failed append is excluded until recovery repairs the tail.
+    pub fn retained_size(&self) -> u64 {
+        self.byte_accounting.retained_valid()
+    }
+
+    /// Returns encoded WAL entry bytes appended successfully since open.
+    /// Segment headers and recovered pre-open bytes are excluded.
+    pub fn bytes_written_since_open(&self) -> u64 {
+        self.byte_accounting.written_since_open()
     }
 
     #[cfg(test)]
@@ -573,6 +636,7 @@ impl WriteAheadLog {
 
         let mut f = self.current_file.write();
         f.file.write_all(&batch.encoded)?;
+        self.byte_accounting.record_append(total_batch_size);
         f.record_append(
             total_batch_size,
             batch.sequences.len() as u64,
@@ -587,7 +651,12 @@ impl WriteAheadLog {
     }
 
     async fn rotate(&self) -> Result<()> {
-        rotate_sync(&self.current_file, &self.wal_dir, &self.config)
+        rotate_sync(
+            &self.current_file,
+            &self.wal_dir,
+            &self.config,
+            &self.byte_accounting,
+        )
     }
 
     async fn group_commit_loop(
@@ -597,6 +666,7 @@ impl WriteAheadLog {
         wal_dir: PathBuf,
         directory_lock: Option<Weak<DirectoryLock>>,
         group_commit_in_progress: Arc<AtomicU64>,
+        byte_accounting: Arc<WalByteAccounting>,
     ) {
         // Adaptive group commit: no artificial delay for single writers,
         // but batches concurrent writers efficiently.
@@ -650,7 +720,8 @@ impl WriteAheadLog {
             };
             let _in_progress = InProgressGuard::new(Arc::clone(&group_commit_in_progress));
 
-            let result = write_batch_sync(&current_file, &batch, &config, &wal_dir);
+            let result =
+                write_batch_sync(&current_file, &batch, &config, &wal_dir, &byte_accounting);
             let ok = result.is_ok();
 
             for req in batch {
@@ -675,7 +746,7 @@ impl WriteAheadLog {
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.extension() == Some(std::ffi::OsStr::new("wal")) {
+            if entry.file_type().await?.is_file() {
                 if let Some(sequence) = wal_sequence_from_path(&path) {
                     wal_files.push((sequence, path));
                 }
@@ -727,7 +798,7 @@ impl WriteAheadLog {
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.extension() == Some(std::ffi::OsStr::new("wal")) {
+            if entry.file_type().await?.is_file() {
                 if let Some(sequence) = wal_sequence_from_path(&path) {
                     files.push((sequence, path));
                 }
@@ -777,6 +848,7 @@ fn write_batch_sync(
     batch: &[WriteRequest],
     config: &WalConfig,
     wal_dir: &Path,
+    byte_accounting: &WalByteAccounting,
 ) -> Result<()> {
     let entries: Vec<&WalEntry> = batch.iter().map(|req| &req.entry).collect();
 
@@ -786,11 +858,12 @@ fn write_batch_sync(
         f.should_rotate(total_batch_size, config.max_file_size)
     };
     if needs_rotation {
-        rotate_sync(current_file, wal_dir, config)?;
+        rotate_sync(current_file, wal_dir, config, byte_accounting)?;
     }
 
     let mut f = current_file.write();
     write_entries_batch(&mut f.file, &entries)?;
+    byte_accounting.record_append(total_batch_size);
     if let (Some(min_sequence), Some(max_sequence)) = (
         entries.iter().map(|entry| entry.sequence).min(),
         entries.iter().map(|entry| entry.sequence).max(),
@@ -813,15 +886,29 @@ fn rotate_sync(
     current_file: &Arc<RwLock<WalFile>>,
     wal_dir: &Path,
     config: &WalConfig,
+    byte_accounting: &WalByteAccounting,
 ) -> Result<()> {
     let mut current = current_file.write();
     finalize_header(&mut current)?;
 
     let new_seq = current.next_segment_sequence()?;
     *current = create_file(wal_dir, new_seq, config)?;
+    byte_accounting.record_segment_created();
 
     info!("Rotated WAL file, new sequence: {}", new_seq);
     Ok(())
+}
+
+fn retained_wal_bytes(wal_dir: &Path) -> Result<u64> {
+    std::fs::read_dir(wal_dir)?.try_fold(0_u64, |total, entry| {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file() && wal_sequence_from_path(&path).is_some() {
+            Ok(total.saturating_add(entry.metadata()?.len()))
+        } else {
+            Ok(total)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -881,6 +968,51 @@ mod tests {
         let (key, value) = entries[2].decode_kv().unwrap();
         assert_eq!(key, b"key1");
         assert_eq!(value, None); // Delete entry
+    }
+
+    #[tokio::test]
+    async fn retained_size_includes_every_valid_segment_and_survives_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: WAL_HEADER_SIZE as u64 + 48,
+            sync_on_write: true,
+            ..Default::default()
+        };
+        let wal = WriteAheadLog::new(temp_dir.path(), config.clone())
+            .await
+            .unwrap();
+
+        for key in 0..4 {
+            wal.append(format!("key-{key}").as_bytes(), b"value")
+                .await
+                .unwrap();
+        }
+        wal.flush().await.unwrap();
+
+        let paths = wal_paths(temp_dir.path());
+        assert!(paths.len() > 1);
+        let filesystem_bytes = paths
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .sum::<u64>();
+        assert_eq!(wal.retained_size(), filesystem_bytes);
+        assert!(wal.retained_size() > wal.current_size());
+        let before_reclamation = wal.retained_size();
+        wal.truncate(u64::MAX).await.unwrap();
+        let after_reclamation = wal.retained_size();
+        assert!(after_reclamation < before_reclamation);
+        assert_eq!(after_reclamation, wal.current_size());
+        assert_eq!(
+            after_reclamation,
+            wal_paths(temp_dir.path())
+                .iter()
+                .map(|path| std::fs::metadata(path).unwrap().len())
+                .sum::<u64>()
+        );
+        drop(wal);
+
+        let reopened = WriteAheadLog::new(temp_dir.path(), config).await.unwrap();
+        assert_eq!(reopened.retained_size(), after_reclamation);
     }
 
     #[tokio::test]
@@ -968,6 +1100,105 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_group_commit_counts_bytes_at_physical_append_and_resets_on_reopen() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig::paranoid();
+        let wal = Arc::new(
+            WriteAheadLog::new(directory.path(), config.clone())
+                .await
+                .unwrap(),
+        );
+        let retained_before = wal.retained_size();
+        assert_eq!(wal.bytes_written_since_open(), 0);
+
+        let (locked_tx, locked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_wal = Arc::clone(&wal);
+        let lock_holder = tokio::task::spawn_blocking(move || {
+            let file_guard = lock_wal.lock_current_file_for_test();
+            let _ = locked_tx.send(());
+            release_rx.recv().unwrap();
+            drop(file_guard);
+        });
+        locked_rx.await.unwrap();
+
+        let queued_wal = Arc::clone(&wal);
+        let queued = tokio::spawn(async move {
+            queued_wal
+                .append(b"cancelled:key", b"persisted-value")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while wal.group_commit_in_progress_for_test() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued group commit did not start");
+
+        queued.abort();
+        assert!(queued.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        lock_holder.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while wal.group_commit_in_progress_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued group commit did not finish");
+
+        let written = wal.bytes_written_since_open();
+        assert!(written > 0);
+        assert_eq!(wal.retained_size() - retained_before, written);
+        assert_eq!(wal.read_from(0).await.unwrap().len(), 1);
+        let retained_after = wal.retained_size();
+        drop(wal);
+
+        let reopened = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        assert_eq!(reopened.retained_size(), retained_after);
+        assert_eq!(reopened.bytes_written_since_open(), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_and_retained_size_ignore_noncanonical_wal_paths() {
+        let directory = TempDir::new().unwrap();
+        let aliases = [
+            "1.wal".to_string(),
+            format!("{:019}.wal", 1),
+            format!("{:021}.wal", 1),
+            "0000000000000000000000001.wal".to_string(),
+            "unrecognized.wal".to_string(),
+            format!("{:020}.tmp", 999),
+        ];
+        for (index, alias) in aliases.iter().enumerate() {
+            std::fs::write(directory.path().join(alias), vec![0_u8; index + 1]).unwrap();
+        }
+        std::fs::create_dir(directory.path().join("00000000000000000998.wal")).unwrap();
+
+        let wal = WriteAheadLog::new(directory.path(), WalConfig::durable())
+            .await
+            .unwrap();
+
+        assert_eq!(wal.retained_size(), wal.current_size());
+        assert_eq!(
+            wal_sequence_from_path(&wal.current_file.read().path),
+            Some(0)
+        );
+        let retained = wal.retained_size();
+        drop(wal);
+
+        let reopened = WriteAheadLog::new(directory.path(), WalConfig::durable())
+            .await
+            .unwrap();
+        assert_eq!(reopened.retained_size(), retained);
+        for alias in aliases {
+            assert!(directory.path().join(alias).is_file());
+        }
+        assert!(directory.path().join("00000000000000000998.wal").is_dir());
+    }
+
     #[tokio::test]
     async fn reclaimed_batch_ranges_do_not_accumulate_in_memory() {
         let directory = TempDir::new().unwrap();
@@ -995,19 +1226,22 @@ mod tests {
         wal.flush().await.unwrap();
         let path = wal.current_file.read().path.clone();
         let valid_end = wal.current_size();
+        assert_eq!(wal.retained_size(), valid_end);
+        {
+            let mut current = wal.lock_current_file_for_test();
+            current.file.seek(SeekFrom::End(0)).unwrap();
+            current.file.write_all(&[8, 0, 0, 0, 1, 2, 3]).unwrap();
+            current.file.sync_all().unwrap();
+        }
+        assert_eq!(wal.retained_size(), valid_end);
+        assert_eq!(path.metadata().unwrap().len(), valid_end + 7);
         drop(wal);
-
-        OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap()
-            .write_all(&[8, 0, 0, 0, 1, 2, 3])
-            .unwrap();
 
         let repaired = WriteAheadLog::new(directory.path(), config.clone())
             .await
             .unwrap();
         assert_eq!(repaired.current_size(), valid_end);
+        assert_eq!(repaired.retained_size(), valid_end);
         assert_eq!(path.metadata().unwrap().len(), valid_end);
         assert_eq!(repaired.current_sequence(), 1);
         assert_eq!(repaired.append(b"after", b"repair").await.unwrap(), 1);

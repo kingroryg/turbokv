@@ -74,7 +74,11 @@ pub mod optimizations;
 pub mod storage;
 
 // Primary API
-pub use core::types::{CompactionStyle, Compression, DbConfig, WriteBatch};
+pub use core::types::{
+    CompactionStyle, Compression, DbConfig, LogicalStats, PhysicalCacheStats,
+    PhysicalMemTableStats, PhysicalSSTableStats, PhysicalStats, PhysicalVersionStats, WalStats,
+    WriteAmplificationStats, WriteBatch, WriteStallStats,
+};
 pub use storage::db::{Db, DbError, DbOptions, DbStats};
 pub use storage::iter::{EntryGuard, PrefixIter, RangeIter, ScanEntry, ScanError, ScanResult};
 
