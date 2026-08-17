@@ -199,7 +199,7 @@ the corresponding clean-tree JSON evidence artifact.
 | `scan_prefix_iter(prefix)` | Fallible streaming prefix scan with guard-based value access |
 | `write_batch(batch)` | Batch write operations |
 | `flush()` | Flush memtable to disk |
-| `compact()` | Trigger manual compaction |
+| `compact()` | Drain the captured manual-compaction scope and report actual files, bytes, duration, reclaimed space, and remaining work |
 | `logical_stats()` | Scan a coherent snapshot for exact unique live-key and logical-byte counts |
 | `physical_stats()` | Get cheap physical gauges and counters since open without scanning logical data |
 | `stats()` | Legacy mixed physical statistics (deprecated) |

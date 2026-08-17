@@ -2,8 +2,13 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 use tempfile::TempDir;
+use turbokv::storage::compaction::{CompactionConfig, CompactionJob};
+use turbokv::storage::manifest::SSTableManifestEntry;
+use turbokv::storage::{Compactor, SSTableConfig, SSTableReader, SSTableWriter};
 use turbokv::{Db, DbError, DbOptions, Engine, StorageConfig, StorageError, WriteBatch};
 
 const CRASH_WRITER_PATH: &str = "TURBOKV_CONTRACT_CRASH_WRITER_PATH";
@@ -50,6 +55,100 @@ fn expect_directory_locked(result: Result<Db, DbError>) -> std::path::PathBuf {
         Err(error) => panic!("expected a directory-locked error, got: {error}"),
         Ok(_) => panic!("a second database unexpectedly acquired the directory"),
     }
+}
+
+#[test]
+#[allow(deprecated)]
+fn low_level_compactor_keeps_its_legacy_single_output_contract() {
+    let directory = TempDir::new().unwrap();
+    let sstable_directory = directory.path().join("sstables");
+    std::fs::create_dir_all(&sstable_directory).unwrap();
+    let config = SSTableConfig::default();
+    let input_path = sstable_directory.join("input.sst");
+    let mut writer = SSTableWriter::new(&input_path, config.clone()).unwrap();
+    for index in 0_u64..32 {
+        let value = [index as u8; 256];
+        writer
+            .add(format!("key-{index:04}").as_bytes(), Some(&value))
+            .unwrap();
+    }
+    let input_info = writer.finish().unwrap();
+    let input = SSTableManifestEntry {
+        id: 1,
+        level: 0,
+        path: input_info.path,
+        size: input_info.file_size,
+        entry_count: input_info.entry_count,
+        tombstone_count: input_info.tombstone_count,
+        min_key: input_info.min_key,
+        max_key: input_info.max_key,
+        min_sequence: input_info.min_sequence,
+        max_sequence: input_info.max_sequence,
+        creation_time: input_info.creation_time,
+    };
+    let compactor = Compactor::new(
+        CompactionConfig {
+            target_file_size: 1,
+            ..CompactionConfig::default()
+        },
+        config,
+        directory.path().to_path_buf(),
+        Arc::new(AtomicU64::new(2)),
+    );
+    let selectable = (0_u64..4)
+        .map(|index| SSTableManifestEntry {
+            id: index + 10,
+            creation_time: index,
+            ..input.clone()
+        })
+        .collect::<Vec<_>>();
+    let picked = compactor.pick_compaction(&selectable).unwrap();
+    assert_eq!(picked.input_sstables.len(), 4);
+    assert_eq!(picked.output_level, 1);
+    assert_eq!(
+        picked.output_path.parent(),
+        Some(sstable_directory.as_path())
+    );
+    assert!(picked
+        .output_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("2_"));
+    assert!(!picked.output_path.exists());
+
+    let output_path = sstable_directory.join("42_legacy.sst");
+    std::fs::write(&output_path, b"replace this existing caller-owned file").unwrap();
+
+    let result = compactor
+        .execute(CompactionJob {
+            input_sstables: vec![input],
+            output_level: 1,
+            output_path: output_path.clone(),
+        })
+        .unwrap();
+
+    let output = result.output_sstable.unwrap();
+    assert_eq!(output.id, 42);
+    assert_eq!(output.path, output_path);
+    assert_eq!(output.entry_count, 32);
+    assert_eq!(result.bytes_written, output.size);
+    assert!(SSTableReader::open(output.path).is_ok());
+
+    let empty_path = sstable_directory.join("43_empty.sst");
+    let empty = compactor
+        .execute(CompactionJob {
+            input_sstables: Vec::new(),
+            output_level: 1,
+            output_path: empty_path.clone(),
+        })
+        .unwrap()
+        .output_sstable
+        .unwrap();
+    assert_eq!(empty.id, 43);
+    assert_eq!(empty.path, empty_path);
+    assert_eq!(empty.entry_count, 0);
+    assert!(SSTableReader::open(empty.path).is_ok());
 }
 
 #[tokio::test]

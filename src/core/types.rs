@@ -322,15 +322,41 @@ impl WriteAmplificationStats {
     }
 }
 
-/// Compaction result
-#[derive(Debug, Clone, Default)]
+/// Result of a requested compaction operation.
+///
+/// Counts and byte totals describe actual completed compaction jobs, including
+/// intermediate outputs consumed by a later job in the same manual drain.
+/// [`Self::work_remaining`] reports whether another job was selectable in the
+/// final live-state observation before the request released ownership.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompactionResult {
-    /// Number of files compacted
-    pub files_compacted: u32,
-    /// Bytes reclaimed
+    /// Number of SSTable inputs read.
+    pub input_files: u64,
+    /// Number of SSTable outputs installed.
+    pub output_files: u64,
+    /// Bytes read from input SSTables.
+    pub bytes_read: u64,
+    /// Bytes written to installed output SSTables.
+    pub bytes_written: u64,
+    /// Input bytes minus output bytes, saturating at zero.
     pub bytes_reclaimed: u64,
-    /// Duration of compaction in milliseconds
+    /// Wall-clock duration of the complete request in milliseconds.
     pub duration_ms: u64,
+    /// Whether another compaction job was selectable in the request's final
+    /// live-state observation.
+    ///
+    /// Manual compaction drains the files in scope when it acquires ownership;
+    /// later flushes enter that scope only when required by overlap closure.
+    /// This can still be `true` when other concurrent flushes create new work.
+    /// Background compaction deliberately runs at most one job.
+    pub work_remaining: bool,
+}
+
+impl CompactionResult {
+    /// Whether the coordinator had no selectable work when this request ended.
+    pub fn is_complete(&self) -> bool {
+        !self.work_remaining
+    }
 }
 
 /// Write batch operation type

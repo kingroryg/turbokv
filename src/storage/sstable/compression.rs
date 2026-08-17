@@ -53,6 +53,17 @@ pub fn compress_block(data: &[u8], compression: CompressionType) -> Result<Vec<u
     }
 }
 
+/// Maximum bytes the configured block compressor can emit for an input size.
+pub(crate) fn max_compressed_block_size(input_size: usize, compression: CompressionType) -> usize {
+    match compression {
+        CompressionType::None => input_size,
+        CompressionType::Zstd => zstd::zstd_safe::compress_bound(input_size),
+        CompressionType::Snappy => snap::raw::max_compress_len(input_size),
+        CompressionType::Lz4 => lz4_flex::block::get_maximum_output_size(input_size)
+            .saturating_add(std::mem::size_of::<u32>()),
+    }
+}
+
 pub fn decompress_block(data: &[u8], compression: CompressionType) -> Result<Vec<u8>> {
     match compression {
         CompressionType::None => Ok(data.to_vec()),

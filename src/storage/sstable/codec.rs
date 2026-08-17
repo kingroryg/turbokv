@@ -1,9 +1,45 @@
+use std::io::{self, Write};
 use std::ops::Range;
 
 use bytes::Bytes;
 
 use super::reader::{SSTableEntry, SSTableValue};
 use crate::core::error::{Error, Result};
+
+/// A zero-copy sink for measuring the exact byte count produced by an encoder.
+///
+/// Encoders pass their existing slices through [`Write::write`], so measuring
+/// large keys, bloom filters, or compressed blocks never copies their payloads.
+#[derive(Default)]
+pub(crate) struct CountingWriter {
+    bytes_written: u64,
+}
+
+impl CountingWriter {
+    pub(crate) fn with_bytes_written(bytes_written: u64) -> Self {
+        Self { bytes_written }
+    }
+
+    pub(crate) fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let added = u64::try_from(buffer.len())
+            .map_err(|_| io::Error::other("encoded slice length exceeds u64"))?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(added)
+            .ok_or_else(|| io::Error::other("encoded byte count exceeds u64"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// A decoded value reference backed by one verified, decompressed block.
 pub(crate) struct SSTableEntryRef {

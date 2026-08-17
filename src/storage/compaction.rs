@@ -30,7 +30,9 @@ use crate::core::CompactionResult as PublicCompactionResult;
 use super::directory_lock::DirectoryLock;
 use super::engine::{Result as EngineResult, SstableStatistics, StorageError};
 use super::manifest::{sync_directory, Manifest, SSTableManifestEntry};
-use super::sstable::{SSTableConfig, SSTableEntry, SSTableInfo, SSTableReader, SSTableWriter};
+use super::sstable::{
+    OutputAppendDecision, SSTableConfig, SSTableEntry, SSTableInfo, SSTableReader, SSTableWriter,
+};
 use super::version::VersionOrder;
 use super::InProgressGuard;
 
@@ -63,10 +65,11 @@ impl Default for CompactionConfig {
 pub struct CompactionJob {
     pub input_sstables: Vec<SSTableManifestEntry>,
     pub output_level: u32,
+    /// Caller-visible output path used by the deprecated single-output seam.
     pub output_path: PathBuf,
 }
 
-/// Result of a compaction run
+/// Result of the deprecated single-output compaction execution seam.
 #[derive(Debug, Clone)]
 pub struct CompactionResult {
     pub input_ids: Vec<u64>,
@@ -82,12 +85,54 @@ pub struct CompactionResult {
     pub live_keys: Vec<Vec<u8>>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct CompactionSelection {
+    pub(super) input_sstables: Vec<SSTableManifestEntry>,
+    pub(super) output_level: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CompactionExecution {
+    pub(super) input_ids: Vec<u64>,
+    pub(super) output_sstables: Vec<SSTableManifestEntry>,
+    pub(super) bytes_read: u64,
+    pub(super) bytes_written: u64,
+    entries_merged: u64,
+    pub(super) entries_dropped: u64,
+    pub(super) tombstones_dropped: u64,
+    live_keys: Vec<Vec<u8>>,
+}
+
+struct CompactionExecutionOptions {
+    target_file_size: u64,
+    first_output: Option<CompactionOutputIdentity>,
+    require_output: bool,
+}
+
+struct CompactionOutputIdentity {
+    id: u64,
+    path: PathBuf,
+    creation: CompactionOutputCreation,
+}
+
+enum CompactionOutputCreation {
+    ClaimUnique,
+    CallerOwned,
+}
+
+struct PendingCompactionOutput {
+    id: u64,
+    writer: SSTableWriter,
+}
+
 /// Selects and executes the SSTable merge portion of a coordinated compaction.
 pub struct Compactor {
     config: CompactionConfig,
     sstable_config: SSTableConfig,
     data_dir: PathBuf,
     next_sstable_id: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    exact_projection_counter: Arc<AtomicU64>,
 }
 
 impl Compactor {
@@ -102,27 +147,64 @@ impl Compactor {
             sstable_config,
             data_dir,
             next_sstable_id,
+            #[cfg(test)]
+            exact_projection_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Check if compaction is needed and return a job if so
+    #[cfg(test)]
+    fn exact_projection_count(&self) -> u64 {
+        self.exact_projection_counter.load(Ordering::Relaxed)
+    }
+
+    /// Check if compaction is needed and return a legacy single-output job.
+    ///
+    /// New code should use [`crate::Db::compact`]. This adapter preserves the
+    /// pre-0.5 low-level API and allocates its historical caller-visible path;
+    /// coordinator selection remains side-effect free.
+    #[deprecated(note = "use Db::compact for coordinated multi-output compaction")]
     pub fn pick_compaction(&self, sstables: &[SSTableManifestEntry]) -> Option<CompactionJob> {
+        self.pick_compaction_selection(sstables)
+            .map(|selection| CompactionJob {
+                input_sstables: selection.input_sstables,
+                output_level: selection.output_level,
+                output_path: self.new_sstable_identity().1,
+            })
+    }
+
+    fn pick_compaction_selection(
+        &self,
+        sstables: &[SSTableManifestEntry],
+    ) -> Option<CompactionSelection> {
+        let scope = sstables.iter().map(|table| table.id).collect();
+        self.pick_compaction_in_scope(sstables, &scope)
+    }
+
+    /// Select work whose source pressure belongs to `scope`, expanding the
+    /// chosen job through every currently live overlapping table for safety.
+    fn pick_compaction_in_scope(
+        &self,
+        sstables: &[SSTableManifestEntry],
+        scope: &HashSet<u64>,
+    ) -> Option<CompactionSelection> {
         if self.config.max_levels < 2 {
             return None;
         }
 
         // Priority 1: L0 compaction (keeps write path fast)
-        let mut l0_tables: Vec<_> = sstables.iter().filter(|s| s.level == 0).cloned().collect();
+        let mut l0_tables: Vec<_> = sstables
+            .iter()
+            .filter(|s| s.level == 0 && scope.contains(&s.id))
+            .cloned()
+            .collect();
         l0_tables.sort_by_key(|table| table.id);
 
         if !l0_tables.is_empty() && l0_tables.len() >= self.config.l0_compaction_trigger {
             let (input_sstables, output_level) =
                 complete_overlap_closure(sstables, l0_tables, 1, self.config.max_levels);
-            let output_path = self.new_sstable_path();
-            return Some(CompactionJob {
+            return Some(CompactionSelection {
                 input_sstables,
                 output_level,
-                output_path,
             });
         }
 
@@ -131,7 +213,7 @@ impl Compactor {
         for level in 1..highest_output_level {
             let level_tables: Vec<_> = sstables
                 .iter()
-                .filter(|s| s.level == level)
+                .filter(|s| s.level == level && scope.contains(&s.id))
                 .cloned()
                 .collect();
             let level_size: u64 = level_tables.iter().map(|s| s.size).sum();
@@ -149,11 +231,9 @@ impl Compactor {
                     level + 1,
                     self.config.max_levels,
                 );
-                let output_path = self.new_sstable_path();
-                return Some(CompactionJob {
+                return Some(CompactionSelection {
                     input_sstables,
                     output_level,
-                    output_path,
                 });
             }
         }
@@ -161,8 +241,57 @@ impl Compactor {
         None
     }
 
-    /// Execute a compaction job using streaming merge
+    /// Execute one legacy, caller-named, single-output compaction.
+    ///
+    /// This preserves the pre-0.5 low-level API. It does not coordinate with
+    /// [`crate::Db::compact`] or publish a manifest, so new code should use the
+    /// database method instead.
+    #[deprecated(note = "use Db::compact for coordinated multi-output compaction")]
     pub fn execute(&self, job: CompactionJob) -> Result<CompactionResult> {
+        let output_id = sstable_id_from_path(&job.output_path);
+        let selection = CompactionSelection {
+            input_sstables: job.input_sstables,
+            output_level: job.output_level,
+        };
+        let mut output_attempts = CompactionOutputAttempts::new(Arc::new(Mutex::new(Vec::new())));
+        let execution = self
+            .execute_selection(
+                selection,
+                &mut output_attempts,
+                CompactionExecutionOptions {
+                    target_file_size: u64::MAX,
+                    first_output: Some(CompactionOutputIdentity {
+                        id: output_id,
+                        path: job.output_path,
+                        creation: CompactionOutputCreation::CallerOwned,
+                    }),
+                    require_output: true,
+                },
+            )
+            .map_err(|error| Error::Compaction {
+                reason: error.to_string(),
+            })?;
+        output_attempts.mark_manifest_committed();
+        debug_assert!(execution.output_sstables.len() <= 1);
+        Ok(CompactionResult {
+            input_ids: execution.input_ids,
+            output_sstable: execution.output_sstables.into_iter().next(),
+            bytes_read: execution.bytes_read,
+            bytes_written: execution.bytes_written,
+            entries_merged: execution.entries_merged,
+            entries_dropped: execution.entries_dropped,
+            tombstones_dropped: execution.tombstones_dropped,
+            live_keys: execution.live_keys,
+        })
+    }
+
+    /// Execute a coordinated compaction selection using streaming merge.
+    fn execute_selection(
+        &self,
+        job: CompactionSelection,
+        output_attempts: &mut CompactionOutputAttempts,
+        mut options: CompactionExecutionOptions,
+    ) -> EngineResult<CompactionExecution> {
         info!(
             "Starting compaction: {} inputs -> L{}",
             job.input_sstables.len(),
@@ -174,7 +303,7 @@ impl Compactor {
         let mut entries_dropped = 0u64;
         let mut tombstones_dropped = 0u64;
 
-        // Open all input SSTables
+        // Open all input SSTables.
         let readers: Vec<SSTableReader> = job
             .input_sstables
             .iter()
@@ -182,10 +311,8 @@ impl Compactor {
                 bytes_read += entry.size;
                 SSTableReader::open(&entry.path)
             })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Create output writer
-        let mut writer = SSTableWriter::new(&job.output_path, self.sstable_config.clone())?;
+            .collect::<Result<Vec<_>>>()
+            .map_err(compaction_error)?;
 
         // Streaming k-way merge
         let mut heap: BinaryHeap<Reverse<MergeEntry>> = BinaryHeap::new();
@@ -194,7 +321,7 @@ impl Compactor {
         // Initialize heap with first entry from each iterator
         for (idx, iter) in iterators.iter_mut().enumerate() {
             if let Some(result) = iter.next_versioned() {
-                let (key, entry) = result?;
+                let (key, entry) = result.map_err(compaction_error)?;
                 heap.push(Reverse(MergeEntry::new(
                     key,
                     entry,
@@ -206,6 +333,8 @@ impl Compactor {
 
         let mut last_key: Option<Bytes> = None;
         let mut live_keys: Vec<Vec<u8>> = Vec::new();
+        let mut pending_output: Option<PendingCompactionOutput> = None;
+        let mut output_sstables = Vec::new();
 
         while let Some(Reverse(entry)) = heap.pop() {
             // Deduplicate: keep only the newest version of each key
@@ -217,7 +346,45 @@ impl Compactor {
                     tombstones_dropped += 1;
                 }
             } else {
-                writer.add_versioned(&entry.key, entry.value.as_deref(), entry.sequence)?;
+                let append_decision = if let Some(output) = &pending_output {
+                    if output.writer.is_empty() {
+                        OutputAppendDecision::Append
+                    } else {
+                        output
+                            .writer
+                            .decide_target_size(
+                                &entry.key,
+                                entry.value.as_deref(),
+                                entry.sequence,
+                                options.target_file_size,
+                            )
+                            .map_err(compaction_error)?
+                    }
+                } else {
+                    OutputAppendDecision::Append
+                };
+                if append_decision == OutputAppendDecision::SplitBefore {
+                    let completed = pending_output
+                        .take()
+                        .expect("a split is requested only for a nonempty output");
+                    output_sstables.push(self.finish_output(job.output_level, completed)?);
+                }
+                if pending_output.is_none() {
+                    pending_output =
+                        Some(self.start_output(output_attempts, &mut options.first_output)?);
+                }
+                pending_output
+                    .as_mut()
+                    .expect("an output writer was just created")
+                    .writer
+                    .add_versioned(&entry.key, entry.value.as_deref(), entry.sequence)
+                    .map_err(compaction_error)?;
+                if append_decision == OutputAppendDecision::AppendAndSeal {
+                    let completed = pending_output
+                        .take()
+                        .expect("an appended output is present to seal");
+                    output_sstables.push(self.finish_output(job.output_level, completed)?);
+                }
                 if entry.value.is_some() {
                     live_keys.push(entry.key.to_vec());
                 }
@@ -227,7 +394,7 @@ impl Compactor {
 
             // Advance the iterator that provided this entry
             if let Some(result) = iterators[entry.source].next_versioned() {
-                let (key, next_entry) = result?;
+                let (key, next_entry) = result.map_err(compaction_error)?;
                 heap.push(Reverse(MergeEntry::new(
                     key,
                     next_entry,
@@ -237,36 +404,21 @@ impl Compactor {
             }
         }
 
-        // Finish writing
-        let output_info = writer.finish()?;
-        let bytes_written = output_info.file_size;
-
-        // Create manifest entry for output
-        // Extract the ID from the output path filename (already allocated by new_sstable_path)
-        // Filename format: {id}_{timestamp}.sst
-        let id = job
-            .output_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.split('_').next())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        let output_entry = SSTableManifestEntry {
-            id,
-            level: job.output_level,
-            path: job.output_path,
-            size: output_info.file_size,
-            entry_count: output_info.entry_count,
-            tombstone_count: output_info.tombstone_count,
-            min_key: output_info.min_key,
-            max_key: output_info.max_key,
-            min_sequence: output_info.min_sequence,
-            max_sequence: output_info.max_sequence,
-            creation_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        };
+        if let Some(completed) = pending_output {
+            output_sstables.push(self.finish_output(job.output_level, completed)?);
+        }
+        if output_sstables.is_empty() && options.require_output {
+            let empty = self.start_output(output_attempts, &mut options.first_output)?;
+            output_sstables.push(self.finish_output(job.output_level, empty)?);
+        }
+        let bytes_written = output_sstables
+            .iter()
+            .fold(0_u64, |total, output| total.saturating_add(output.size));
+        if options.require_output {
+            debug_assert_eq!(output_sstables.len(), 1);
+        } else {
+            validate_compaction_outputs(&output_sstables)?;
+        }
 
         let input_ids: Vec<u64> = job.input_sstables.iter().map(|s| s.id).collect();
 
@@ -278,9 +430,9 @@ impl Compactor {
             bytes_written as f64 / 1024.0 / 1024.0
         );
 
-        Ok(CompactionResult {
+        Ok(CompactionExecution {
             input_ids,
-            output_sstable: Some(output_entry),
+            output_sstables,
             bytes_read,
             bytes_written,
             entries_merged,
@@ -290,14 +442,63 @@ impl Compactor {
         })
     }
 
+    fn start_output(
+        &self,
+        output_attempts: &mut CompactionOutputAttempts,
+        first_output: &mut Option<CompactionOutputIdentity>,
+    ) -> EngineResult<PendingCompactionOutput> {
+        let CompactionOutputIdentity { id, path, creation } = first_output
+            .take()
+            .unwrap_or_else(|| self.new_sstable_identity().into());
+        if matches!(creation, CompactionOutputCreation::ClaimUnique) {
+            output_attempts.claim(path.clone())?;
+        }
+        #[allow(unused_mut)]
+        let mut writer =
+            SSTableWriter::new(&path, self.sstable_config.clone()).map_err(compaction_error)?;
+        if matches!(creation, CompactionOutputCreation::CallerOwned) {
+            output_attempts.track(path);
+        }
+        #[cfg(test)]
+        writer.set_exact_projection_counter(Arc::clone(&self.exact_projection_counter));
+        Ok(PendingCompactionOutput { id, writer })
+    }
+
+    fn finish_output(
+        &self,
+        output_level: u32,
+        pending: PendingCompactionOutput,
+    ) -> EngineResult<SSTableManifestEntry> {
+        let output_info = pending.writer.finish().map_err(compaction_error)?;
+
+        #[cfg(test)]
+        super::failpoints::check(
+            &self.data_dir,
+            super::failpoints::PersistenceBoundary::CompactionOutputPublication,
+        )?;
+
+        Ok(SSTableManifestEntry {
+            id: pending.id,
+            level: output_level,
+            path: output_info.path,
+            size: output_info.file_size,
+            entry_count: output_info.entry_count,
+            tombstone_count: output_info.tombstone_count,
+            min_key: output_info.min_key,
+            max_key: output_info.max_key,
+            min_sequence: output_info.min_sequence,
+            max_sequence: output_info.max_sequence,
+            creation_time: output_info.creation_time,
+        })
+    }
+
     /// Delete old SSTable files after successful compaction
     pub fn cleanup_inputs(&self, paths: &[PathBuf]) -> Result<()> {
         for path in paths {
-            if path.exists() {
-                std::fs::remove_file(path).map_err(|e| Error::Io {
-                    message: format!("Failed to delete compacted SSTable: {:?}", path),
-                    source: e,
-                })?;
+            if remove_sstable_if_present(path).map_err(|e| Error::Io {
+                message: format!("Failed to delete compacted SSTable: {:?}", path),
+                source: e,
+            })? {
                 debug!("Deleted compacted SSTable: {:?}", path);
             }
         }
@@ -309,7 +510,7 @@ impl Compactor {
         self.config.target_file_size * self.config.level_size_multiplier.pow(level)
     }
 
-    fn new_sstable_path(&self) -> PathBuf {
+    fn new_sstable_identity(&self) -> (u64, PathBuf) {
         let id = self
             .next_sstable_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -317,10 +518,72 @@ impl Compactor {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        self.data_dir
+        let path = self
+            .data_dir
             .join("sstables")
-            .join(format!("{}_{}.sst", id, timestamp))
+            .join(format!("{}_{}.sst", id, timestamp));
+        (id, path)
     }
+}
+
+impl From<(u64, PathBuf)> for CompactionOutputIdentity {
+    fn from((id, path): (u64, PathBuf)) -> Self {
+        Self {
+            id,
+            path,
+            creation: CompactionOutputCreation::ClaimUnique,
+        }
+    }
+}
+
+fn compaction_error(error: Error) -> StorageError {
+    StorageError::Compaction(error.to_string())
+}
+
+fn sstable_id_from_path(path: &std::path::Path) -> u64 {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.split('_').next())
+        .and_then(|id| id.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Remove one SSTable using the shared cleanup policy.
+///
+/// A missing path is already clean. Other failures remain visible to callers
+/// so coordinated cleanup can defer and retry them.
+pub(super) fn remove_sstable_if_present(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_compaction_outputs(outputs: &[SSTableManifestEntry]) -> EngineResult<()> {
+    let mut ids = HashSet::with_capacity(outputs.len());
+    let mut paths = HashSet::with_capacity(outputs.len());
+    for output in outputs {
+        if output.entry_count == 0 {
+            return Err(StorageError::Compaction(
+                "compaction produced an empty SSTable".to_string(),
+            ));
+        }
+        if !ids.insert(output.id) || !paths.insert(&output.path) {
+            return Err(StorageError::Compaction(
+                "compaction produced duplicate output identities".to_string(),
+            ));
+        }
+    }
+    if outputs
+        .windows(2)
+        .any(|adjacent| adjacent[0].max_key >= adjacent[1].min_key)
+    {
+        return Err(StorageError::Compaction(
+            "compaction outputs are not strictly ordered and nonoverlapping".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Expand a source seed to the complete connected overlap component.
@@ -424,9 +687,15 @@ struct PreparedCompactionPublication {
     input_sstables: Vec<SSTableManifestEntry>,
     input_ids: HashSet<u64>,
     input_paths: Vec<PathBuf>,
-    result: CompactionResult,
+    result: CompactionExecution,
     inputs_are_safe_to_unlink: bool,
     publication_error: Option<StorageError>,
+}
+
+#[derive(Clone, Copy)]
+enum CompactionRequestKind {
+    ManualDrain,
+    BackgroundJob,
 }
 
 impl CompactionCoordinator {
@@ -441,6 +710,7 @@ impl CompactionCoordinator {
         manifest: Arc<AsyncMutex<Manifest>>,
         sstable_stats: Arc<SstableStatistics>,
         compactions_in_progress: Arc<AtomicU64>,
+        deferred_cleanup: Vec<PathBuf>,
     ) -> Self {
         Self {
             ownership: Arc::new(AsyncMutex::new(())),
@@ -452,7 +722,7 @@ impl CompactionCoordinator {
             manifest,
             sstable_stats,
             compactions_in_progress,
-            deferred_cleanup: Arc::new(Mutex::new(Vec::new())),
+            deferred_cleanup: Arc::new(Mutex::new(deferred_cleanup)),
             #[cfg(test)]
             before_manifest_gate: Mutex::new(None),
             #[cfg(test)]
@@ -465,55 +735,127 @@ impl CompactionCoordinator {
     /// Queue a compaction request and reselect against the state published by
     /// every earlier request. During graceful shutdown new requests are stable
     /// no-ops; a request already owning the claim runs to completion.
-    pub(super) async fn request(self: &Arc<Self>) -> EngineResult<PublicCompactionResult> {
+    pub(super) async fn request_manual(self: &Arc<Self>) -> EngineResult<PublicCompactionResult> {
+        self.request(CompactionRequestKind::ManualDrain).await
+    }
+
+    pub(super) async fn request_background(
+        self: &Arc<Self>,
+    ) -> EngineResult<PublicCompactionResult> {
+        self.request(CompactionRequestKind::BackgroundJob).await
+    }
+
+    async fn request(
+        self: &Arc<Self>,
+        kind: CompactionRequestKind,
+    ) -> EngineResult<PublicCompactionResult> {
+        let started = Instant::now();
         if !self.accepting_requests.load(Ordering::Acquire) {
-            return Ok(PublicCompactionResult::default());
+            return Ok(self.current_work_result(started).await);
         }
 
         let claim = Arc::clone(&self.ownership).lock_owned().await;
         if !self.accepting_requests.load(Ordering::Acquire) {
-            return Ok(PublicCompactionResult::default());
+            return Ok(self.current_work_result(started).await);
         }
         let Some(directory_lock) = self.directory_lock.upgrade() else {
-            return Ok(PublicCompactionResult::default());
+            return Ok(self.current_work_result(started).await);
         };
 
         // Ownership and directory lifetime transfer before the caller reaches
         // another await point. Cancelling the waiter therefore detaches, but
         // never aborts, the accepted job. Shutdown drains `ownership`.
         let coordinator = Arc::clone(self);
-        tokio::spawn(async move { coordinator.run_owned(claim, directory_lock).await })
-            .await
-            .map_err(|error| {
-                StorageError::Other(format!("coordinated compaction task failed: {error}"))
-            })?
+        tokio::spawn(async move {
+            coordinator
+                .run_owned(claim, directory_lock, kind, started)
+                .await
+        })
+        .await
+        .map_err(|error| {
+            StorageError::Other(format!("coordinated compaction task failed: {error}"))
+        })?
+    }
+
+    async fn current_work_result(&self, started: Instant) -> PublicCompactionResult {
+        let snapshot = self.live_manifest_entries().await;
+        PublicCompactionResult {
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            work_remaining: self
+                .compactor
+                .pick_compaction_selection(&snapshot)
+                .is_some(),
+            ..PublicCompactionResult::default()
+        }
     }
 
     async fn run_owned(
         self: Arc<Self>,
         _claim: OwnedMutexGuard<()>,
         _directory_lock: Arc<DirectoryLock>,
+        kind: CompactionRequestKind,
+        started: Instant,
     ) -> EngineResult<PublicCompactionResult> {
         let _in_progress = InProgressGuard::new(Arc::clone(&self.compactions_in_progress));
-        let snapshot = self.live_manifest_entries().await;
-        let job = self.compactor.pick_compaction(&snapshot);
-        let started = job.as_ref().map(|_| Instant::now());
-        let Some(prepared) = self.prepare_claimed(job).await? else {
-            return Ok(PublicCompactionResult::default());
-        };
+        let initial = self.live_manifest_entries().await;
+        let mut scope = initial.iter().map(|table| table.id).collect::<HashSet<_>>();
+        let mut aggregate = PublicCompactionResult::default();
+        self.prepare_claimed(None).await?;
 
-        let result = self.publish_prepared(prepared).await?;
-        Ok(PublicCompactionResult {
-            files_compacted: u32::try_from(result.input_ids.len()).unwrap_or(u32::MAX),
-            bytes_reclaimed: result.bytes_read.saturating_sub(result.bytes_written),
-            duration_ms: u64::try_from(
-                started
-                    .expect("a prepared publication always has a selected job")
-                    .elapsed()
-                    .as_millis(),
-            )
-            .unwrap_or(u64::MAX),
-        })
+        loop {
+            let snapshot = self.live_manifest_entries().await;
+            let job = match kind {
+                CompactionRequestKind::ManualDrain => {
+                    self.compactor.pick_compaction_in_scope(&snapshot, &scope)
+                }
+                CompactionRequestKind::BackgroundJob => {
+                    self.compactor.pick_compaction_selection(&snapshot)
+                }
+            };
+            let Some(job) = job else {
+                break;
+            };
+            if !job
+                .input_sstables
+                .iter()
+                .any(|input| input.level < job.output_level)
+            {
+                return Err(StorageError::Compaction(
+                    "selected compaction job cannot advance any input".to_string(),
+                ));
+            }
+
+            let prepared = self
+                .prepare_claimed(Some(job))
+                .await?
+                .expect("a selected compaction job always prepares a publication");
+            let result = self.publish_prepared(prepared).await?;
+            for input_id in &result.input_ids {
+                scope.remove(input_id);
+            }
+            scope.extend(result.output_sstables.iter().map(|output| output.id));
+            aggregate.input_files = aggregate
+                .input_files
+                .saturating_add(u64::try_from(result.input_ids.len()).unwrap_or(u64::MAX));
+            aggregate.output_files = aggregate
+                .output_files
+                .saturating_add(u64::try_from(result.output_sstables.len()).unwrap_or(u64::MAX));
+            aggregate.bytes_read = aggregate.bytes_read.saturating_add(result.bytes_read);
+            aggregate.bytes_written = aggregate.bytes_written.saturating_add(result.bytes_written);
+
+            if matches!(kind, CompactionRequestKind::BackgroundJob) {
+                break;
+            }
+        }
+
+        aggregate.bytes_reclaimed = aggregate.bytes_read.saturating_sub(aggregate.bytes_written);
+        aggregate.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let final_snapshot = self.live_manifest_entries().await;
+        aggregate.work_remaining = self
+            .compactor
+            .pick_compaction_selection(&final_snapshot)
+            .is_some();
+        Ok(aggregate)
     }
 
     /// Permanently stop admitting requests. Waiting on the returned drain
@@ -550,7 +892,7 @@ impl CompactionCoordinator {
     /// `run_owned` while this blocking task is awaited.
     async fn prepare_claimed(
         self: &Arc<Self>,
-        job: Option<CompactionJob>,
+        job: Option<CompactionSelection>,
     ) -> EngineResult<Option<PreparedCompactionPublication>> {
         let coordinator = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
@@ -564,7 +906,7 @@ impl CompactionCoordinator {
 
     fn execute_claimed_blocking(
         &self,
-        job: CompactionJob,
+        job: CompactionSelection,
     ) -> EngineResult<PreparedCompactionPublication> {
         let input_sstables = job.input_sstables.clone();
         let input_ids: HashSet<u64> = input_sstables.iter().map(|table| table.id).collect();
@@ -575,30 +917,22 @@ impl CompactionCoordinator {
         let selected_input_bytes = input_sstables
             .iter()
             .fold(0_u64, |total, table| total.saturating_add(table.size));
-        let mut output_attempt = match CompactionOutputAttempt::claim(
-            job.output_path.clone(),
-            Arc::clone(&self.deferred_cleanup),
-        ) {
-            Ok(attempt) => attempt,
-            Err(error) => {
-                self.sstable_stats
-                    .record_compaction_attempt(selected_input_bytes, 0);
-                return Err(error);
-            }
-        };
+        let mut output_attempts = CompactionOutputAttempts::new(Arc::clone(&self.deferred_cleanup));
 
-        let execution = self.compactor.execute(job);
+        let execution = self.compactor.execute_selection(
+            job,
+            &mut output_attempts,
+            CompactionExecutionOptions {
+                target_file_size: self.compactor.config.target_file_size,
+                first_output: None,
+                require_output: false,
+            },
+        );
         self.sstable_stats
-            .record_compaction_attempt(selected_input_bytes, output_attempt.produced_bytes());
-        let result = execution.map_err(|error| StorageError::Compaction(error.to_string()))?;
+            .record_compaction_attempt(selected_input_bytes, output_attempts.produced_bytes());
+        let result = execution?;
 
-        #[cfg(test)]
-        super::failpoints::check(
-            &self.data_dir,
-            super::failpoints::PersistenceBoundary::CompactionOutputPublication,
-        )?;
-
-        if let Some(output) = &result.output_sstable {
+        if let Some(output) = result.output_sstables.first() {
             let output_directory = output.path.parent().ok_or_else(|| {
                 StorageError::Compaction(format!(
                     "compaction output has no parent directory: {}",
@@ -639,9 +973,9 @@ impl CompactionCoordinator {
             candidate
                 .sstables
                 .retain(|table| !input_ids.contains(&table.id));
-            if let Some(output) = &result.output_sstable {
-                candidate.sstables.push(output.clone());
-            }
+            candidate
+                .sstables
+                .extend(result.output_sstables.iter().cloned());
 
             #[cfg(test)]
             super::failpoints::check(
@@ -668,13 +1002,18 @@ impl CompactionCoordinator {
                     )));
                 }
             }
+            #[cfg(test)]
+            super::failpoints::crash_if_armed(
+                &self.data_dir,
+                super::failpoints::PersistenceBoundary::CompactionManifestPublication,
+            );
             *live_manifest = candidate;
         }
 
         // A process crash reopens from the already durable manifest. Mark the
         // output committed before returning to the asynchronous live-list
         // publication step so the output guard cannot remove it.
-        output_attempt.mark_manifest_committed();
+        output_attempts.mark_manifest_committed();
         #[cfg(test)]
         if let Some(gate) = self.after_manifest_gate.lock().take() {
             gate.reach_and_wait();
@@ -693,7 +1032,7 @@ impl CompactionCoordinator {
     async fn publish_prepared(
         self: &Arc<Self>,
         prepared: PreparedCompactionPublication,
-    ) -> EngineResult<CompactionResult> {
+    ) -> EngineResult<CompactionExecution> {
         let PreparedCompactionPublication {
             input_sstables,
             input_ids,
@@ -733,9 +1072,9 @@ impl CompactionCoordinator {
     fn cleanup_or_defer(&self, paths: Vec<PathBuf>) {
         let mut deferred = Vec::new();
         for path in paths {
-            match std::fs::remove_file(&path) {
-                Ok(()) => debug!("Deleted obsolete SSTable: {:?}", path),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            match remove_sstable_if_present(&path) {
+                Ok(true) => debug!("Deleted obsolete SSTable: {:?}", path),
+                Ok(false) => {}
                 Err(error) => {
                     warn!(
                         "Deferring obsolete SSTable cleanup for {:?}: {}",
@@ -751,7 +1090,7 @@ impl CompactionCoordinator {
     #[cfg(test)]
     pub(super) async fn execute_job_for_test(
         self: &Arc<Self>,
-        job: CompactionJob,
+        job: CompactionSelection,
     ) -> EngineResult<()> {
         let _claim = self.ownership.lock().await;
         let _in_progress = InProgressGuard::new(Arc::clone(&self.compactions_in_progress));
@@ -854,16 +1193,25 @@ impl CompactionAdmissionPause<'_> {
     }
 }
 
-/// Owns an uncommitted output. Failure paths remove partial output after its
-/// bytes have been accounted; an unlink failure is retried by the coordinator.
-struct CompactionOutputAttempt {
-    path: PathBuf,
+/// Owns every output in one unpublished manifest candidate. Failure paths
+/// remove all partial and finished outputs after their bytes have been
+/// accounted; unlink failures are retried by the coordinator.
+struct CompactionOutputAttempts {
+    paths: Vec<PathBuf>,
     manifest_committed: bool,
     deferred_cleanup: Arc<Mutex<Vec<PathBuf>>>,
 }
 
-impl CompactionOutputAttempt {
-    fn claim(path: PathBuf, deferred_cleanup: Arc<Mutex<Vec<PathBuf>>>) -> EngineResult<Self> {
+impl CompactionOutputAttempts {
+    fn new(deferred_cleanup: Arc<Mutex<Vec<PathBuf>>>) -> Self {
+        Self {
+            paths: Vec::new(),
+            manifest_committed: false,
+            deferred_cleanup,
+        }
+    }
+
+    fn claim(&mut self, path: PathBuf) -> EngineResult<()> {
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -874,15 +1222,18 @@ impl CompactionOutputAttempt {
                     path.display()
                 ))
             })?;
-        Ok(Self {
-            path,
-            manifest_committed: false,
-            deferred_cleanup,
-        })
+        self.paths.push(path);
+        Ok(())
+    }
+
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
     }
 
     fn produced_bytes(&self) -> u64 {
-        std::fs::metadata(&self.path).map_or(0, |metadata| metadata.len())
+        self.paths.iter().fold(0_u64, |total, path| {
+            total.saturating_add(std::fs::metadata(path).map_or(0, |metadata| metadata.len()))
+        })
     }
 
     fn mark_manifest_committed(&mut self) {
@@ -890,20 +1241,21 @@ impl CompactionOutputAttempt {
     }
 }
 
-impl Drop for CompactionOutputAttempt {
+impl Drop for CompactionOutputAttempts {
     fn drop(&mut self) {
         if self.manifest_committed {
             return;
         }
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                warn!(
-                    "Deferring failed compaction output cleanup for {:?}: {}",
-                    self.path, error
-                );
-                self.deferred_cleanup.lock().push(self.path.clone());
+        for path in &self.paths {
+            match remove_sstable_if_present(path) {
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(
+                        "Deferring failed compaction output cleanup for {:?}: {}",
+                        path, error
+                    );
+                    self.deferred_cleanup.lock().push(path.clone());
+                }
             }
         }
     }
@@ -963,6 +1315,8 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use tempfile::TempDir;
 
+    type OwnedVersionedEntry = (Vec<u8>, Option<Vec<u8>>, u64);
+
     fn write_versioned_table(
         path: &std::path::Path,
         id: u64,
@@ -1015,6 +1369,34 @@ mod tests {
         }
     }
 
+    fn write_entries_table(
+        path: &std::path::Path,
+        id: u64,
+        config: SSTableConfig,
+        entries: &[OwnedVersionedEntry],
+    ) -> SSTableManifestEntry {
+        let mut writer = SSTableWriter::new(path, config).unwrap();
+        for (key, value, sequence) in entries {
+            writer
+                .add_versioned(key, value.as_deref(), *sequence)
+                .unwrap();
+        }
+        let info = writer.finish().unwrap();
+        SSTableManifestEntry {
+            id,
+            level: 0,
+            path: info.path,
+            size: info.file_size,
+            entry_count: info.entry_count,
+            tombstone_count: info.tombstone_count,
+            min_key: info.min_key,
+            max_key: info.max_key,
+            min_sequence: info.min_sequence,
+            max_sequence: info.max_sequence,
+            creation_time: id,
+        }
+    }
+
     #[test]
     fn test_compaction_config_defaults() {
         let config = CompactionConfig::default();
@@ -1049,7 +1431,7 @@ mod tests {
             })
             .collect();
 
-        let job = compactor.pick_compaction(&sstables);
+        let job = compactor.pick_compaction_selection(&sstables);
         assert!(job.is_some());
         assert_eq!(job.unwrap().output_level, 1);
     }
@@ -1080,7 +1462,7 @@ mod tests {
             metadata_table(8, 2, b"zz", b"zzz", 8),
         ];
 
-        let job = compactor.pick_compaction(&tables).unwrap();
+        let job = compactor.pick_compaction_selection(&tables).unwrap();
         assert_eq!(job.output_level, 3);
         assert_eq!(
             job.input_sstables
@@ -1111,7 +1493,9 @@ mod tests {
             metadata_table(2, 2, b"n", b"z", 2),
         ];
 
-        assert!(compactor.pick_compaction(&top_level_only).is_none());
+        assert!(compactor
+            .pick_compaction_selection(&top_level_only)
+            .is_none());
     }
 
     #[test]
@@ -1132,19 +1516,258 @@ mod tests {
             directory.path().to_path_buf(),
             Arc::new(AtomicU64::new(3)),
         );
+        let mut attempts = CompactionOutputAttempts::new(Arc::new(Mutex::new(Vec::new())));
         let result = compactor
-            .execute(CompactionJob {
-                input_sstables: vec![newest_tombstone, stale_value],
-                output_level: 1,
-                output_path: sstable_directory.join("3.sst"),
-            })
+            .execute_selection(
+                CompactionSelection {
+                    input_sstables: vec![newest_tombstone, stale_value],
+                    output_level: 1,
+                },
+                &mut attempts,
+                CompactionExecutionOptions {
+                    target_file_size: compactor.config.target_file_size,
+                    first_output: None,
+                    require_output: false,
+                },
+            )
             .unwrap();
+        attempts.mark_manifest_committed();
 
-        let output = result.output_sstable.unwrap();
+        let output = result.output_sstables.into_iter().next().unwrap();
         assert_eq!((output.min_sequence, output.max_sequence), (20, 20));
         let reader = SSTableReader::open(output.path).unwrap();
         let entry = reader.get_entry(b"ordered:key").unwrap().unwrap();
         assert_eq!(entry.sequence, Some(20));
         assert!(entry.value.into_option().is_none());
+    }
+
+    #[test]
+    fn compressed_split_projection_work_is_bounded_by_output_count() {
+        const KEY_COUNT: u64 = 400;
+        const TARGET_SIZE: u64 = 24 * 1024;
+
+        for compression in [
+            CompressionType::None,
+            CompressionType::Zstd,
+            CompressionType::Snappy,
+            CompressionType::Lz4,
+        ] {
+            let directory = TempDir::new().unwrap();
+            let sstable_directory = directory.path().join("sstables");
+            std::fs::create_dir_all(&sstable_directory).unwrap();
+            let config = SSTableConfig {
+                block_size: 2 * 1024,
+                compression,
+                ..SSTableConfig::default()
+            };
+            let older = (0..KEY_COUNT)
+                .map(|index| {
+                    (
+                        format!("key-{index:06}").into_bytes(),
+                        Some(vec![b'a'; 512]),
+                        1,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let newer = (0..KEY_COUNT)
+                .map(|index| {
+                    let mut value = vec![b'a'; 512];
+                    value[0] = b'b';
+                    (format!("key-{index:06}").into_bytes(), Some(value), 2)
+                })
+                .collect::<Vec<_>>();
+            let inputs = vec![
+                write_entries_table(
+                    &sstable_directory.join("older.sst"),
+                    1,
+                    config.clone(),
+                    &older,
+                ),
+                write_entries_table(
+                    &sstable_directory.join("newer.sst"),
+                    2,
+                    config.clone(),
+                    &newer,
+                ),
+            ];
+            let compactor = Compactor::new(
+                CompactionConfig {
+                    target_file_size: TARGET_SIZE,
+                    ..CompactionConfig::default()
+                },
+                config,
+                directory.path().to_path_buf(),
+                Arc::new(AtomicU64::new(10)),
+            );
+            let mut attempts = CompactionOutputAttempts::new(Arc::new(Mutex::new(Vec::new())));
+            let result = compactor
+                .execute_selection(
+                    CompactionSelection {
+                        input_sstables: inputs,
+                        output_level: 1,
+                    },
+                    &mut attempts,
+                    CompactionExecutionOptions {
+                        target_file_size: TARGET_SIZE,
+                        first_output: None,
+                        require_output: false,
+                    },
+                )
+                .unwrap();
+            attempts.mark_manifest_committed();
+
+            assert!(result.output_sstables.len() > 1, "{compression:?}");
+            assert!(result
+                .output_sstables
+                .iter()
+                .all(|table| table.size <= TARGET_SIZE));
+            assert!(result
+                .output_sstables
+                .windows(2)
+                .all(|pair| pair[0].max_key < pair[1].min_key));
+            let exact_projections = compactor.exact_projection_count();
+            assert!(
+                exact_projections <= result.output_sstables.len() as u64,
+                "{compression:?}: {exact_projections} exact projections for {} outputs",
+                result.output_sstables.len()
+            );
+            assert!(exact_projections < KEY_COUNT / 4, "{compression:?}");
+
+            let mut observed = Vec::new();
+            for output in &result.output_sstables {
+                let reader = SSTableReader::open(&output.path).unwrap();
+                let mut iterator = reader.iter();
+                while let Some(entry) = iterator.next_versioned() {
+                    let (key, entry) = entry.unwrap();
+                    observed.push((key.to_vec(), entry));
+                }
+            }
+            assert_eq!(observed.len(), KEY_COUNT as usize);
+            for (index, (key, entry)) in observed.into_iter().enumerate() {
+                assert_eq!(key, format!("key-{index:06}").as_bytes());
+                assert_eq!(entry.sequence, Some(2));
+                let value = entry.value.into_option().unwrap();
+                assert_eq!(value.len(), 512);
+                assert_eq!(value[0], b'b');
+                assert!(value[1..].iter().all(|byte| *byte == b'a'));
+            }
+        }
+    }
+
+    #[test]
+    fn split_size_is_soft_exact_and_preserves_binary_and_tombstone_entries() {
+        let directory = TempDir::new().unwrap();
+        let sstable_directory = directory.path().join("sstables");
+        std::fs::create_dir_all(&sstable_directory).unwrap();
+        let config = SSTableConfig {
+            block_size: 64,
+            compression: CompressionType::None,
+            ..SSTableConfig::default()
+        };
+        let entries = vec![
+            (vec![0, 0xff], Some(vec![0x11; 37]), 1),
+            (vec![1, 0], Some(vec![0x22; 37]), 2),
+            (vec![2, 0xff], None, 3),
+            (vec![3, 0], Some(vec![0x44; 37]), 4),
+        ];
+        let input = write_entries_table(
+            &sstable_directory.join("input.sst"),
+            1,
+            config.clone(),
+            &entries,
+        );
+        let exact_two_entry_size = write_entries_table(
+            &sstable_directory.join("calibration.sst"),
+            2,
+            config.clone(),
+            &entries[..2],
+        )
+        .size;
+
+        let execute = |target_file_size: u64, next_id: u64| {
+            let compactor = Compactor::new(
+                CompactionConfig {
+                    target_file_size,
+                    ..CompactionConfig::default()
+                },
+                config.clone(),
+                directory.path().to_path_buf(),
+                Arc::new(AtomicU64::new(next_id)),
+            );
+            let mut attempts = CompactionOutputAttempts::new(Arc::new(Mutex::new(Vec::new())));
+            let result = compactor
+                .execute_selection(
+                    CompactionSelection {
+                        input_sstables: vec![input.clone()],
+                        output_level: 1,
+                    },
+                    &mut attempts,
+                    CompactionExecutionOptions {
+                        target_file_size,
+                        first_output: None,
+                        require_output: false,
+                    },
+                )
+                .unwrap();
+            attempts.mark_manifest_committed();
+            result
+        };
+
+        let exact = execute(exact_two_entry_size, 10);
+        assert!(exact.output_sstables.len() >= 2);
+        assert_eq!(exact.output_sstables[0].entry_count, 2);
+        assert_eq!(
+            exact
+                .output_sstables
+                .iter()
+                .map(|table| table.entry_count)
+                .sum::<u64>(),
+            4
+        );
+        assert_eq!(
+            exact
+                .output_sstables
+                .iter()
+                .map(|table| table.tombstone_count)
+                .sum::<u64>(),
+            1
+        );
+        for adjacent in exact.output_sstables.windows(2) {
+            assert!(adjacent[0].max_key < adjacent[1].min_key);
+        }
+        for (key, expected, sequence) in &entries {
+            let table = exact
+                .output_sstables
+                .iter()
+                .find(|table| {
+                    table.min_key.as_slice() <= key.as_slice()
+                        && key.as_slice() <= table.max_key.as_slice()
+                })
+                .unwrap();
+            let entry = SSTableReader::open(&table.path)
+                .unwrap()
+                .get_entry(key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry.sequence, Some(*sequence));
+            assert_eq!(entry.value.into_option().as_deref(), expected.as_deref());
+        }
+
+        let one_byte_over = execute(exact_two_entry_size - 1, 20);
+        assert_eq!(one_byte_over.output_sstables[0].entry_count, 1);
+
+        let single_entry_size = write_entries_table(
+            &sstable_directory.join("single-calibration.sst"),
+            3,
+            config.clone(),
+            &entries[..1],
+        )
+        .size;
+        let oversized = execute(single_entry_size - 1, 30);
+        assert!(oversized.output_sstables[0].size > single_entry_size - 1);
+        assert!(oversized
+            .output_sstables
+            .iter()
+            .all(|table| table.entry_count > 0));
     }
 }

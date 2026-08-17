@@ -31,7 +31,7 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -40,7 +40,7 @@ use std::time::Duration;
 use parking_lot::{Mutex, RwLock as SyncRwLock};
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::core::{
     CompactionResult, DbConfig, Error as CoreError, LogicalStats, PhysicalCacheStats,
@@ -51,7 +51,7 @@ use crate::core::{
 #[cfg(test)]
 use super::InProgressGuard;
 use super::{
-    compaction::{CompactionConfig, CompactionCoordinator},
+    compaction::{remove_sstable_if_present, CompactionConfig, CompactionCoordinator},
     directory_lock::{
         AcquireError as DirectoryLockAcquireError, DirectoryLock, LOCKED_DIRECTORY_GUIDANCE,
     },
@@ -346,7 +346,7 @@ impl SstableStatistics {
         &self,
         live: &mut Vec<SSTableInfo>,
         inputs: &[SSTableManifestEntry],
-        result: &super::compaction::CompactionResult,
+        result: &super::compaction::CompactionExecution,
     ) {
         let input_ids: Vec<u64> = inputs.iter().map(|table| table.id).collect();
         let removed_versions: u64 = inputs.iter().map(|table| table.entry_count).sum();
@@ -364,7 +364,7 @@ impl SstableStatistics {
         self.level_zero_files
             .fetch_sub(removed_level_zero, Ordering::Relaxed);
 
-        if let Some(output) = &result.output_sstable {
+        for output in &result.output_sstables {
             let info = sstable_info_from_manifest(output);
             live.push(info);
             self.versions
@@ -426,6 +426,17 @@ impl Engine {
                 .persist_format_upgrade(&config.data_dir)
                 .map_err(|error| StorageError::Manifest(error.to_string()))?;
         }
+        let referenced_sstables = manifest
+            .sstables
+            .iter()
+            .map(|table| table.path.clone())
+            .collect::<HashSet<_>>();
+        let cleanup_directory = sstable_dir.clone();
+        let deferred_sstable_cleanup = tokio::task::spawn_blocking(move || {
+            cleanup_unreferenced_sstables(&cleanup_directory, &referenced_sstables)
+        })
+        .await
+        .map_err(|error| StorageError::Other(format!("SSTable cleanup task failed: {error}")))?;
         let wal_checkpoint = manifest.wal_checkpoint;
         let persisted_next_sequence = manifest
             .sstables
@@ -530,6 +541,7 @@ impl Engine {
             Arc::clone(&manifest),
             Arc::clone(&sstable_stats),
             Arc::clone(&compactions_in_progress),
+            deferred_sstable_cleanup,
         ));
 
         let engine = Self {
@@ -855,14 +867,16 @@ impl Engine {
         Ok(())
     }
 
-    /// Trigger compaction.
+    /// Drain manual compaction work captured after coordinator ownership.
     ///
     /// Manual and background requests share one fair coordinator. Concurrent
-    /// requests serialize and reselect after each preceding publication, so an
-    /// already compacted input set is reported by exactly one request. Once
+    /// requests serialize and reselect after each preceding publication. A
+    /// manual request carries descendants of its initial live-file scope to a
+    /// fixed point while excluding unrelated concurrent flush arrivals;
+    /// overlap closure can still pull a later arrival into a scoped job. Once
     /// shutdown starts, new requests are successful no-ops.
     pub async fn compact(&self) -> Result<CompactionResult> {
-        self.compaction_coordinator.request().await
+        self.compaction_coordinator.request_manual().await
     }
 
     /// Get legacy mixed physical storage statistics.
@@ -1379,7 +1393,7 @@ impl BackgroundEngine {
         let Some(_directory_lock) = self.directory_lock.upgrade() else {
             return Ok(CompactionResult::default());
         };
-        self.compaction_coordinator.request().await
+        self.compaction_coordinator.request_background().await
     }
 
     async fn flush_memtable_to_sstable(
@@ -1805,6 +1819,104 @@ fn physical_tombstone_stats_overflow() -> StorageError {
     StorageError::Other("physical tombstone statistics exceed u64 accounting limits".to_string())
 }
 
+/// Remove SSTables that cannot be authoritative because the durable manifest
+/// does not reference them. A crash can leave both unpublished compaction
+/// outputs and already-obsolete inputs behind. Failed unlinks are handed to
+/// the coordinator's ordinary deferred-cleanup retry path.
+fn cleanup_unreferenced_sstables(
+    sstable_directory: &std::path::Path,
+    referenced: &HashSet<PathBuf>,
+) -> Vec<PathBuf> {
+    // The directory lock canonicalizes the configured data directory, while
+    // older manifests can contain equivalent non-canonical paths (for example,
+    // macOS's /var and /private/var aliases). Compare filesystem identities in
+    // the canonical namespace so those authoritative tables are retained.
+    let mut referenced_identities = HashSet::with_capacity(referenced.len());
+    for path in referenced {
+        let canonical_path = match std::fs::canonicalize(path) {
+            Ok(canonical_path) => canonical_path,
+            Err(error) => {
+                warn!(
+                    "Skipping crash-leftover cleanup because manifest SSTable identity {:?} could not be resolved: {}",
+                    path, error
+                );
+                return Vec::new();
+            }
+        };
+        referenced_identities.insert(canonical_path);
+    }
+    let mut directories = vec![sstable_directory.to_path_buf()];
+    match std::fs::read_dir(sstable_directory) {
+        Ok(entries) => {
+            directories.extend(
+                entries
+                    .filter_map(std::result::Result::ok)
+                    .filter_map(|entry| {
+                        entry
+                            .file_type()
+                            .ok()
+                            .filter(std::fs::FileType::is_dir)
+                            .map(|_| entry.path())
+                    }),
+            );
+        }
+        Err(error) => {
+            warn!(
+                "Could not scan SSTable directory {} for crash leftovers: {}",
+                sstable_directory.display(),
+                error
+            );
+            return Vec::new();
+        }
+    }
+
+    let mut deferred = Vec::new();
+    for directory in directories {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(
+                    "Could not scan SSTable directory {} for crash leftovers: {}",
+                    directory.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        for path in entries
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "sst"))
+        {
+            let canonical_path = match std::fs::canonicalize(&path) {
+                Ok(canonical_path) => canonical_path,
+                Err(error) => {
+                    warn!(
+                        "Retaining SSTable with unresolved filesystem identity {:?}: {}",
+                        path, error
+                    );
+                    continue;
+                }
+            };
+            if referenced_identities.contains(&canonical_path) {
+                continue;
+            }
+            match remove_sstable_if_present(&path) {
+                Ok(true) => debug!("Deleted unreferenced SSTable after reopen: {:?}", path),
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(
+                        "Deferring unreferenced SSTable cleanup for {:?}: {}",
+                        path, error
+                    );
+                    deferred.push(path);
+                }
+            }
+        }
+    }
+    deferred
+}
+
 #[cfg(test)]
 fn wal_data_entry_size(key: &[u8], value: &[u8]) -> u64 {
     const WAL_ENTRY_HEADER_SIZE: usize = 32;
@@ -1814,6 +1926,8 @@ fn wal_data_entry_size(key: &[u8], value: &[u8]) -> u64 {
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
     use tempfile::TempDir;
 
@@ -2388,13 +2502,11 @@ mod tests {
                 .install_if_absent(&mut live, &input_info);
         }
 
-        let output_path = directory.path().join("sstables/L1/failed-output.sst");
         let result = engine
             .compaction_coordinator
-            .execute_job_for_test(super::super::compaction::CompactionJob {
+            .execute_job_for_test(super::super::compaction::CompactionSelection {
                 input_sstables: vec![input],
                 output_level: 1,
-                output_path: output_path.clone(),
             })
             .await;
         assert!(matches!(result, Err(StorageError::Compaction(_))));
@@ -2408,7 +2520,14 @@ mod tests {
             stats.amplification.compaction_output_bytes_since_open > 0,
             "partial output bytes remain accounted after cleanup"
         );
-        assert!(!output_path.exists());
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("sstables"))
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sst"))
+                .count(),
+            0
+        );
         assert_eq!(stats.sstables.files, 1);
         assert_eq!(stats.sstables.versions, input_info.entry_count);
         assert_eq!(stats.versions.reclaimed_by_compaction_since_open, 0);
@@ -2426,7 +2545,7 @@ mod tests {
 
         let result = engine
             .compaction_coordinator
-            .execute_job_for_test(super::super::compaction::CompactionJob {
+            .execute_job_for_test(super::super::compaction::CompactionSelection {
                 input_sstables: vec![SSTableManifestEntry {
                     id: 404,
                     level: 0,
@@ -2441,7 +2560,6 @@ mod tests {
                     creation_time: 0,
                 }],
                 output_level: 1,
-                output_path: output_path.clone(),
             })
             .await;
         assert!(matches!(result, Err(StorageError::Compaction(_))));
@@ -2514,7 +2632,7 @@ mod tests {
             );
         }
 
-        assert_eq!(engine.compact().await.unwrap().files_compacted, 2);
+        assert_eq!(engine.compact().await.unwrap().input_files, 2);
         let retried = engine.physical_stats();
         assert_eq!(retried.sstables.files, 1);
         assert_eq!(
@@ -3019,7 +3137,7 @@ mod tests {
             .unwrap()
             .expect("compaction must reach the manifest blocking boundary");
 
-        assert_eq!(result.files_compacted, 2);
+        assert_eq!(result.input_files, 2);
         assert!(
             waiter_started,
             "the manifest waiter must contend at the gate"
@@ -3057,8 +3175,8 @@ mod tests {
         let background = engine.clone_for_background();
         let background = tokio::spawn(async move { background.compact().await.unwrap() });
         let mut outcomes = vec![
-            manual.await.unwrap().files_compacted,
-            background.await.unwrap().files_compacted,
+            manual.await.unwrap().input_files,
+            background.await.unwrap().input_files,
         ];
         outcomes.sort_unstable();
 
@@ -3113,7 +3231,7 @@ mod tests {
         engine.flush().await.unwrap();
         assert_eq!(engine.sstables.read().await.len(), 3);
         before_manifest.release();
-        assert_eq!(compaction.await.unwrap().files_compacted, 2);
+        assert_eq!(compaction.await.unwrap().input_files, 2);
 
         let manifest = Manifest::load_or_create(directory.path()).unwrap();
         assert_eq!(manifest.sstables.len(), 2);
@@ -3135,6 +3253,217 @@ mod tests {
             Some(b"arrived-during-compaction".to_vec())
         );
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn manual_scope_terminates_while_unrelated_flushes_keep_arriving() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 4;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Arc::new(Engine::open(config).await.unwrap());
+        for generation in 0..4 {
+            engine
+                .insert(
+                    format!("a:initial:{generation}").as_bytes(),
+                    b"initial-scope",
+                )
+                .await
+                .unwrap();
+            engine.flush().await.unwrap();
+        }
+
+        let before_manifest = engine
+            .compaction_coordinator
+            .gate_before_manifest_for_test();
+        let compacting_engine = Arc::clone(&engine);
+        let compaction = tokio::spawn(async move { compacting_engine.compact().await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !before_manifest.reached() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("manual compaction must reach its first publication");
+
+        for generation in 0..4 {
+            engine
+                .insert(
+                    format!("z:arrival:{generation:04}").as_bytes(),
+                    b"outside-manual-scope",
+                )
+                .await
+                .unwrap();
+            engine.flush().await.unwrap();
+        }
+        let keep_flushing = Arc::new(AtomicBool::new(true));
+        let flusher_flag = Arc::clone(&keep_flushing);
+        let flusher_engine = Arc::clone(&engine);
+        let flusher = tokio::spawn(async move {
+            let mut generation = 4_u64;
+            while flusher_flag.load(Ordering::Acquire) {
+                flusher_engine
+                    .insert(
+                        format!("z:arrival:{generation:04}").as_bytes(),
+                        b"outside-manual-scope",
+                    )
+                    .await
+                    .unwrap();
+                flusher_engine.flush().await.unwrap();
+                generation += 1;
+                tokio::task::yield_now().await;
+            }
+        });
+        before_manifest.release();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), compaction)
+            .await
+            .expect("unrelated flush arrivals must not extend the manual scope")
+            .unwrap();
+        keep_flushing.store(false, Ordering::Release);
+        flusher.await.unwrap();
+
+        assert_eq!(result.input_files, 4);
+        assert_eq!(result.output_files, 1);
+        assert!(result.work_remaining);
+        assert!(!result.is_complete());
+        assert_eq!(engine.physical_stats().compactions_in_progress, 0);
+        assert_eq!(
+            engine.get(b"a:initial:0").await.unwrap(),
+            Some(b"initial-scope".to_vec())
+        );
+        assert_eq!(
+            engine.get(b"z:arrival:0000").await.unwrap(),
+            Some(b"outside-manual-scope".to_vec())
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn manual_drain_splits_orders_and_recompacts_outputs_without_losing_winners() {
+        const KEYS: usize = 160;
+
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config = super::super::compaction::CompactionConfig {
+            l0_compaction_trigger: 2,
+            max_levels: 3,
+            level_size_multiplier: 1,
+            target_file_size: 20 * 1024,
+        };
+        config.sstable_config = SSTableConfig {
+            block_size: 512,
+            compression: super::super::sstable::CompressionType::Lz4,
+            ..SSTableConfig::default()
+        };
+        let engine = Engine::open(config.clone()).await.unwrap();
+
+        for key_index in 0..KEYS {
+            let key = [0, (key_index >> 8) as u8, key_index as u8, 0xff];
+            let value = (0_usize..192)
+                .map(|offset| key_index.wrapping_mul(131).wrapping_add(offset) as u8)
+                .collect::<Vec<_>>();
+            engine.insert(&key, &value).await.unwrap();
+        }
+        engine.flush().await.unwrap();
+        for key_index in 0..KEYS {
+            let key = [0, (key_index >> 8) as u8, key_index as u8, 0xff];
+            if key_index % 17 == 0 {
+                engine.delete(&key).await.unwrap();
+            } else {
+                let value = (0_usize..192)
+                    .map(|offset| {
+                        key_index
+                            .wrapping_mul(197)
+                            .wrapping_add(offset.wrapping_mul(7)) as u8
+                    })
+                    .collect::<Vec<_>>();
+                engine.insert(&key, &value).await.unwrap();
+            }
+        }
+        engine.flush().await.unwrap();
+
+        let result = engine.compact().await.unwrap();
+        assert!(
+            result.input_files > 2,
+            "manual drain must consume split descendants"
+        );
+        assert!(result.output_files > 2);
+        assert_eq!(
+            result.bytes_reclaimed,
+            result.bytes_read.saturating_sub(result.bytes_written)
+        );
+        assert!(result.is_complete());
+
+        let manifest = Manifest::load_or_create(directory.path()).unwrap();
+        assert!(manifest.sstables.len() > 1);
+        assert!(manifest.sstables.iter().any(|table| table.level == 2));
+        assert!(manifest.sstables.iter().all(|table| table.level > 0));
+        let mut ordered = manifest.sstables.clone();
+        ordered.sort_by(|left, right| left.min_key.cmp(&right.min_key));
+        for adjacent in ordered.windows(2) {
+            assert!(adjacent[0].max_key < adjacent[1].min_key);
+        }
+        assert!(ordered
+            .iter()
+            .all(|table| table.size <= config.compaction_config.target_file_size));
+
+        let stats = engine.physical_stats();
+        assert_eq!(
+            stats.amplification.compaction_input_bytes_since_open,
+            result.bytes_read
+        );
+        assert_eq!(
+            stats.amplification.compaction_output_bytes_since_open,
+            result.bytes_written
+        );
+        assert_eq!(stats.sstables.files, ordered.len() as u64);
+        let expected_pairs = (0..KEYS)
+            .filter(|key_index| key_index % 17 != 0)
+            .map(|key_index| {
+                let key = vec![0, (key_index >> 8) as u8, key_index as u8, 0xff];
+                let value = (0_usize..192)
+                    .map(|offset| {
+                        key_index
+                            .wrapping_mul(197)
+                            .wrapping_add(offset.wrapping_mul(7)) as u8
+                    })
+                    .collect::<Vec<_>>();
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(engine.range(&[0], &[1]).await.unwrap(), expected_pairs);
+        for key_index in 0..KEYS {
+            let key = [0, (key_index >> 8) as u8, key_index as u8, 0xff];
+            let value = engine.get(&key).await.unwrap();
+            if key_index % 17 == 0 {
+                assert_eq!(value, None);
+            } else {
+                assert_eq!(
+                    value,
+                    Some(expected_pairs[key_index - key_index.div_ceil(17)].1.clone())
+                );
+            }
+        }
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(reopened.range(&[0], &[1]).await.unwrap(), expected_pairs);
+        for key_index in 0..KEYS {
+            let key = [0, (key_index >> 8) as u8, key_index as u8, 0xff];
+            let expected = (key_index % 17 != 0).then(|| {
+                (0_usize..192)
+                    .map(|offset| {
+                        key_index
+                            .wrapping_mul(197)
+                            .wrapping_add(offset.wrapping_mul(7)) as u8
+                    })
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(reopened.get(&key).await.unwrap(), expected);
+        }
+        reopened.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3161,7 +3490,7 @@ mod tests {
         for _ in 0..12 {
             let request_engine = Arc::clone(&engine);
             requests.push(tokio::spawn(async move {
-                request_engine.compact().await.unwrap().files_compacted
+                request_engine.compact().await.unwrap().input_files
             }));
         }
         let mut outcomes = Vec::new();
@@ -3210,14 +3539,37 @@ mod tests {
             .await
             .expect("cancelled waiters must not starve the next request")
             .unwrap();
-        assert_eq!(result.files_compacted, 0);
+        assert_eq!(result.input_files, 0);
         for request in cancelled {
             match request.await {
-                Ok(Ok(result)) => assert_eq!(result.files_compacted, 0),
+                Ok(Ok(result)) => assert_eq!(result.input_files, 0),
                 Err(error) => assert!(error.is_cancelled()),
                 Ok(Err(error)) => panic!("cancelled request failed unexpectedly: {error}"),
             }
         }
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compaction_duration_includes_time_waiting_for_coordinator_ownership() {
+        let directory = TempDir::new().unwrap();
+        let engine = Arc::new(
+            Engine::open(isolated_config(directory.path(), false))
+                .await
+                .unwrap(),
+        );
+        let ownership = engine
+            .compaction_coordinator
+            .hold_ownership_for_test()
+            .await;
+        let waiting_engine = Arc::clone(&engine);
+        let request = tokio::spawn(async move { waiting_engine.compact().await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        drop(ownership);
+
+        let result = request.await.unwrap();
+        assert!(result.duration_ms >= 50);
+        assert!(result.is_complete());
         engine.shutdown().await.unwrap();
     }
 
@@ -3282,7 +3634,7 @@ mod tests {
             .await
             .expect("requests during shutdown are immediate no-ops")
             .unwrap();
-        assert_eq!(rejected.files_compacted, 0);
+        assert_eq!(rejected.input_files, 0);
         assert!(!shutdown.is_finished());
 
         after_manifest.release();
@@ -4000,6 +4352,43 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reopen_retains_manifest_table_through_symlinked_sstable_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new().unwrap();
+        let data_directory = directory.path().join("data");
+        let sstable_backing = directory.path().join("sstable-backing");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        std::fs::create_dir_all(&sstable_backing).unwrap();
+        symlink(&sstable_backing, data_directory.join("sstables")).unwrap();
+
+        let config = isolated_config(&data_directory, false);
+        let engine = Engine::open(config.clone()).await.unwrap();
+        engine.insert(b"symlink:key", b"preserved").await.unwrap();
+        engine.flush().await.unwrap();
+        let table_path = Manifest::load_or_create(&data_directory)
+            .unwrap()
+            .sstables
+            .into_iter()
+            .next()
+            .unwrap()
+            .path;
+        assert!(table_path.exists());
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert!(table_path.exists());
+        assert_eq!(reopened.physical_stats().sstables.files, 1);
+        assert_eq!(
+            reopened.get(b"symlink:key").await.unwrap(),
+            Some(b"preserved".to_vec())
+        );
+        reopened.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn cross_level_legacy_and_versioned_winners_survive_compaction_reopen_and_new_writes() {
         let directory = TempDir::new().unwrap();
@@ -4076,7 +4465,7 @@ mod tests {
         );
 
         let result = engine.compact().await.unwrap();
-        assert_eq!(result.files_compacted, 4);
+        assert_eq!(result.input_files, 4);
         let compacted_manifest = Manifest::load_or_create(directory.path()).unwrap();
         assert_eq!(compacted_manifest.sstables.len(), 1);
         assert_eq!(compacted_manifest.sstables[0].level, 3);
@@ -4464,7 +4853,7 @@ mod tests {
         let restore = RestorePermissions(level_zero.clone());
         std::fs::set_permissions(&level_zero, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-        assert_eq!(engine.compact().await.unwrap().files_compacted, 2);
+        assert_eq!(engine.compact().await.unwrap().input_files, 2);
         assert_eq!(engine.physical_stats().sstables.files, 1);
         assert!(input_paths.iter().all(|path| path.exists()));
         assert_eq!(
@@ -4473,7 +4862,7 @@ mod tests {
         );
 
         drop(restore);
-        assert_eq!(engine.compact().await.unwrap().files_compacted, 0);
+        assert_eq!(engine.compact().await.unwrap().input_files, 0);
         assert!(input_paths.iter().all(|path| !path.exists()));
         assert_eq!(engine.physical_stats().sstables.files, 1);
         engine.shutdown().await.unwrap();

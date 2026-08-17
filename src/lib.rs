@@ -75,7 +75,7 @@ pub mod storage;
 
 // Primary API
 pub use core::types::{
-    CompactionStyle, Compression, DbConfig, LogicalStats, PhysicalCacheStats,
+    CompactionResult, CompactionStyle, Compression, DbConfig, LogicalStats, PhysicalCacheStats,
     PhysicalMemTableStats, PhysicalSSTableStats, PhysicalStats, PhysicalVersionStats, WalStats,
     WriteAmplificationStats, WriteBatch, WriteStallStats,
 };
