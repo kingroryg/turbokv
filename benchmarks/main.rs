@@ -85,6 +85,7 @@ struct Measurement {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum EngineName {
+    #[serde(rename = "turbokv")]
     TurboKv,
     Fjall,
 }
