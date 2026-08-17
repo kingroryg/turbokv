@@ -63,9 +63,11 @@ uuid = { version = "1.8", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.10"
-fjall = "=2.11.2"
+fjall = "2"
+rocksdb = "0.22"
 proptest = "1.5"
 quickcheck = "1.0"
+criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 tokio = { version = "1.40", features = ["full", "test-util"] }
 
@@ -151,10 +153,13 @@ inherits = "release"
 debug = true
 
 [[bench]]
-name = "benchmarks"
-path = "benchmarks/main.rs"
+name = "kv_benchmarks"
 harness = false
 
-[[test]]
-name = "benchmark_protocol"
-path = "benchmarks/protocol_tests.rs"
+[[bench]]
+name = "large_scale_bench"
+harness = false
+
+[[bench]]
+name = "durable_bulkload"
+harness = false
