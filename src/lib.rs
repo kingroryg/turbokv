@@ -75,7 +75,7 @@ pub use storage::db::{Db, DbError, DbOptions, DbStats};
 pub use storage::iter::{EntryGuard, PrefixIter, RangeIter};
 
 // Advanced API
-pub use core::crypto::{crc32_checksum, MerkleChain, MerkleNode};
+pub use core::crypto::crc32_checksum;
 pub use storage::compaction::CompactionConfig;
 pub use storage::engine::{Engine, Result as StorageResult, StorageConfig, StorageError};
 pub use storage::memtable::{MemTableConfig, MemTableManager};

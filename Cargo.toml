@@ -36,10 +36,8 @@ bytes = "1.7"
 byteorder = "1.5"
 memmap2 = "0.9"
 
-# Cryptography
-blake3 = "1.5"
+# Data integrity
 crc32fast = "1.4"
-hex = "0.4"
 
 # Concurrent data structures
 crossbeam-skiplist = "0.1"

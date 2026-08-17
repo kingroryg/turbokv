@@ -109,5 +109,5 @@ TurboKV fast mode achieves **2.6x the throughput** of RocksDB. In durable mode, 
 - Direct-to-kernel WAL writes (no BufWriter overhead)
 - Zero-allocation write paths with thread-local buffers
 - Lock-free concurrent data structures
-- Efficient WAL encoding without Merkle overhead
+- Compact WAL entry encoding
 - SSTable fsync before manifest updates for durability

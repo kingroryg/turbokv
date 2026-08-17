@@ -121,37 +121,6 @@ mod utils_tests {
     }
 }
 
-mod crypto_tests {
-    use turbokv::core::crypto::MerkleChain;
-
-    #[test]
-    fn test_merkle_chain() {
-        let mut chain = MerkleChain::new();
-
-        let node1 = chain.add(b"data1");
-        let node2 = chain.add(b"data2");
-        let node3 = chain.add(b"data3");
-
-        assert_ne!(node1.hash, node2.hash);
-        assert_ne!(node2.hash, node3.hash);
-
-        assert!(node1.prev_hash.is_none());
-        assert_eq!(node2.prev_hash, Some(node1.hash.clone()));
-        assert_eq!(node3.prev_hash, Some(node2.hash.clone()));
-    }
-
-    #[test]
-    fn test_merkle_chain_deterministic() {
-        let mut chain1 = MerkleChain::new();
-        let mut chain2 = MerkleChain::new();
-
-        let node1a = chain1.add(b"same data");
-        let node1b = chain2.add(b"same data");
-
-        assert_eq!(node1a.data_hash, node1b.data_hash);
-    }
-}
-
 mod error_tests {
     use turbokv::core::error::{Error, Result};
 
@@ -181,7 +150,9 @@ mod error_tests {
         };
         assert!(recoverable.is_recoverable());
 
-        let non_recoverable = Error::TamperingDetected { position: 0 };
+        let non_recoverable = Error::Internal {
+            message: "failure".to_string(),
+        };
         assert!(!non_recoverable.is_recoverable());
     }
 }

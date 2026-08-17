@@ -2,7 +2,7 @@ use bytes::Bytes;
 use thiserror::Error;
 
 pub const WAL_MAGIC: &[u8; 8] = b"TURBOKV\0";
-pub const WAL_VERSION: u32 = 3; // v3: removed Merkle overhead
+pub const WAL_VERSION: u32 = 3;
 pub const WAL_HEADER_SIZE: usize = 64;
 pub const ENTRY_HEADER_SIZE: usize = 32;
 
