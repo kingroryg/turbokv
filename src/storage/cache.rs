@@ -29,6 +29,7 @@ impl CacheKey {
 /// Single shard of the cache
 struct CacheShard {
     lru: Mutex<LruCache<CacheKey, Bytes>>,
+    max_size_bytes: u64,
     size_bytes: AtomicU64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -38,8 +39,6 @@ struct CacheShard {
 pub struct BlockCache {
     shards: Vec<CacheShard>,
     shard_mask: usize,
-    #[allow(dead_code)]
-    max_size_bytes: usize,
 }
 
 /// Cache statistics
@@ -67,10 +66,12 @@ impl BlockCache {
         );
 
         let per_shard_entries = std::cmp::max(16, max_size_bytes / num_shards / 4096); // ~4KB per block
+        let per_shard_max_bytes = (max_size_bytes / num_shards) as u64;
 
         let shards: Vec<_> = (0..num_shards)
             .map(|_| CacheShard {
                 lru: Mutex::new(LruCache::new(NonZeroUsize::new(per_shard_entries).unwrap())),
+                max_size_bytes: per_shard_max_bytes,
                 size_bytes: AtomicU64::new(0),
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
@@ -80,7 +81,6 @@ impl BlockCache {
         Self {
             shards,
             shard_mask: num_shards - 1,
-            max_size_bytes,
         }
     }
 
@@ -115,6 +115,9 @@ impl BlockCache {
     pub fn insert(&self, key: CacheKey, value: Bytes) {
         let value_len = value.len() as u64;
         let shard = self.shard_for(&key);
+        if value_len > shard.max_size_bytes {
+            return;
+        }
         let mut lru = shard.lru.lock();
 
         // Evict old entry if exists
@@ -131,6 +134,15 @@ impl BlockCache {
                 .fetch_sub(evicted.len() as u64, Ordering::Relaxed);
         }
         shard.size_bytes.fetch_add(value_len, Ordering::Relaxed);
+
+        while shard.size_bytes.load(Ordering::Relaxed) > shard.max_size_bytes {
+            let Some((_, evicted)) = lru.pop_lru() else {
+                break;
+            };
+            shard
+                .size_bytes
+                .fetch_sub(evicted.len() as u64, Ordering::Relaxed);
+        }
     }
 
     /// Remove a block from cache (e.g., when SSTable is deleted)
@@ -173,5 +185,29 @@ impl BlockCache {
         };
 
         stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_enforces_actual_byte_budget_for_nonstandard_block_sizes() {
+        let cache = BlockCache::with_shards(10_000, 1);
+        cache.insert(CacheKey::new(1, 0), Bytes::from(vec![1; 6_000]));
+        cache.insert(CacheKey::new(1, 1), Bytes::from(vec![2; 6_000]));
+
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.size_bytes, 6_000);
+        assert!(cache.get(&CacheKey::new(1, 0)).is_none());
+        assert!(cache.get(&CacheKey::new(1, 1)).is_some());
+
+        cache.insert(CacheKey::new(1, 2), Bytes::from(vec![3; 10_001]));
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.size_bytes, 6_000);
+        assert!(cache.get(&CacheKey::new(1, 2)).is_none());
     }
 }

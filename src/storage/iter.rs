@@ -1,231 +1,701 @@
-//! # Guard Iterators for TurboKV
+//! Streaming guard iterators for range and prefix scans.
 //!
-//! Provides guard-based iteration over scan results.
+//! A scan retains a coherent set of read-only memtables and pinned SSTable
+//! readers, then performs an incremental k-way merge. The iterator itself keeps
+//! one head and, for each SSTable source, at most one decompressed block. Its
+//! working set is therefore O(source count * block size), plus O(source count)
+//! merge metadata. The independently configured shared block cache is bounded
+//! by actual decompressed bytes. Collection helpers necessarily retain their
+//! output too.
 //!
-//! ## Benefits
-//!
-//! - **Scan keys without consuming values**: Count keys, filter by key pattern
-//! - **Selective value access**: Only access values you need
-//! - **Efficient filtering**: Skip entries by key pattern without allocating
-//!
-//! Note: Values are currently pre-loaded. Future versions may implement
-//! true lazy loading from disk for large value workloads.
-//!
-//! ## Example
-//!
-//! ```rust,ignore
-//! // Count keys without loading values
-//! let count = db.range_iter(b"user:", b"user:\xff").await?.count();
-//!
-//! // Only load values for matching keys
-//! for guard in db.range_iter(b"user:", b"user:\xff").await? {
-//!     if guard.key().ends_with(b":active") {
-//!         let value = guard.value();  // Only loads here
-//!         process(value);
-//!     }
-//! }
-//! ```
+//! [`EntryGuard`] defers the copy of an in-memory value until it is requested.
+//! SSTable keys and values share a pinned decompressed block, so inspecting a
+//! key does not copy its value. The on-disk format interleaves keys and values
+//! inside compressed blocks; CRC verification and whole-block decompression are
+//! therefore required before any key in that block can be yielded.
 
-use std::vec::IntoIter;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+#[cfg(test)]
+use std::collections::HashSet;
+use std::fmt;
+use std::ops::{Bound, Range};
+use std::sync::{Arc, OnceLock};
 
-/// A guard that holds a key and can provide its value.
+use bytes::Bytes;
+
+use super::directory_lock::DirectoryLock;
+use super::engine::StorageError;
+use super::memtable::MemTable;
+use super::prefix_upper_bound;
+use super::sstable::{SSTableEntryRef, SSTableInfo, SSTableRangeCursor, SSTableReader};
+use super::version::VersionOrder;
+
+/// The result produced by one step of a streaming scan.
+pub type ScanResult = std::result::Result<EntryGuard, ScanError>;
+/// An owned key-value pair returned by collection helpers.
+pub type ScanEntry = (Vec<u8>, Vec<u8>);
+
+/// An error discovered while advancing a streaming scan.
 ///
-/// The guard allows inspecting the key without necessarily loading the value,
-/// enabling efficient filtering and key-only operations.
-#[derive(Debug, Clone)]
+/// Iterator creation still uses the database or storage API's normal error
+/// type. This purpose-specific boundary represents failures discovered later,
+/// while blocks are read and decoded.
+#[derive(Debug, thiserror::Error)]
+#[error("scan failed: {inner}")]
+pub struct ScanError {
+    #[source]
+    inner: StorageError,
+}
+
+impl From<StorageError> for ScanError {
+    fn from(inner: StorageError) -> Self {
+        Self { inner }
+    }
+}
+
+impl ScanError {
+    pub(crate) fn into_storage_error(self) -> StorageError {
+        self.inner
+    }
+}
+
+/// A guard that owns a key and retains its value source.
+///
+/// Calling [`Self::key`] never copies or materializes the value. For frozen
+/// memtables, [`Self::value`] performs the first value clone and caches it. For
+/// SSTables, the guard returns a slice of the already decompressed block.
 pub struct EntryGuard {
     key: Vec<u8>,
-    value: Option<Vec<u8>>, // None = tombstone (filtered out in public API)
+    value: GuardValue,
+}
+
+enum GuardValue {
+    Memory {
+        table: Arc<MemTable>,
+        key: Vec<u8>,
+        cached: OnceLock<Vec<u8>>,
+    },
+    Block {
+        block: Bytes,
+        range: Range<usize>,
+    },
+}
+
+impl Clone for EntryGuard {
+    fn clone(&self) -> Self {
+        let value = match &self.value {
+            GuardValue::Memory { table, key, cached } => GuardValue::Memory {
+                table: Arc::clone(table),
+                key: key.clone(),
+                cached: cached.clone(),
+            },
+            GuardValue::Block { block, range } => GuardValue::Block {
+                block: block.clone(),
+                range: range.clone(),
+            },
+        };
+        Self {
+            key: self.key.clone(),
+            value,
+        }
+    }
+}
+
+impl fmt::Debug for EntryGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EntryGuard")
+            .field("key", &self.key)
+            .field("value_loaded", &self.value_loaded())
+            .finish_non_exhaustive()
+    }
 }
 
 impl EntryGuard {
-    /// Create a new entry guard
-    pub(crate) fn new(key: Vec<u8>, value: Vec<u8>) -> Self {
-        Self {
-            key,
-            value: Some(value),
-        }
+    fn from_candidate(key: Bytes, value: CandidateValue) -> Self {
+        let key = key.to_vec();
+        let value = match value {
+            CandidateValue::Memory(table) => GuardValue::Memory {
+                key: key.clone(),
+                table,
+                cached: OnceLock::new(),
+            },
+            CandidateValue::Block { block, range } => GuardValue::Block { block, range },
+            CandidateValue::Tombstone => {
+                unreachable!("only live source-backed values become guarded candidates")
+            }
+        };
+        Self { key, value }
     }
 
-    /// Get the key (always cheap, already in memory)
+    /// Get the key. Keys are decoded while advancing the iterator.
     #[inline]
     pub fn key(&self) -> &[u8] {
         &self.key
     }
 
-    /// Get the value.
-    ///
-    /// Currently this is a cheap operation as values are pre-loaded.
-    /// Future versions may implement true lazy loading from disk.
+    /// Get the value, materializing it only when the source requires a copy.
     #[inline]
     pub fn value(&self) -> &[u8] {
-        self.value.as_deref().unwrap_or(&[])
+        match &self.value {
+            GuardValue::Memory { table, key, cached } => cached
+                .get_or_init(|| {
+                    table
+                        .get(key)
+                        .expect("a frozen scan winner must retain its value")
+                })
+                .as_slice(),
+            GuardValue::Block { block, range } => &block[range.clone()],
+        }
     }
 
-    /// Consume the guard and return the key-value pair
+    /// Consume the guard and return the key-value pair.
     #[inline]
     pub fn into_pair(self) -> (Vec<u8>, Vec<u8>) {
-        (self.key, self.value.unwrap_or_default())
+        let Self { key, value } = self;
+        (key, materialize_value(value))
     }
 
-    /// Consume the guard and return just the key
+    /// Consume the guard and return just the key without loading its value.
     #[inline]
     pub fn into_key(self) -> Vec<u8> {
         self.key
     }
 
-    /// Consume the guard and return just the value
+    /// Consume the guard and return the value.
     #[inline]
     pub fn into_value(self) -> Vec<u8> {
-        self.value.unwrap_or_default()
+        materialize_value(self.value)
     }
-}
 
-/// Iterator over a range of entries with lazy value access.
-///
-/// This iterator yields [`EntryGuard`] items that allow inspecting keys
-/// without loading values, enabling efficient filtering operations.
-pub struct RangeIter {
-    inner: IntoIter<EntryGuard>,
-}
-
-impl RangeIter {
-    /// Create a new range iterator from collected entries
-    pub(crate) fn new(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
-        let guards = entries
-            .into_iter()
-            .map(|(k, v)| EntryGuard::new(k, v))
-            .collect::<Vec<_>>();
-        Self {
-            inner: guards.into_iter(),
+    fn value_loaded(&self) -> bool {
+        match &self.value {
+            GuardValue::Block { .. } => true,
+            GuardValue::Memory { cached, .. } => cached.get().is_some(),
         }
     }
 
-    /// Count the number of entries without consuming values.
-    ///
-    /// This is useful when you only need to know how many keys match.
-    #[inline]
-    pub fn count(self) -> usize {
-        self.inner.len()
+    #[cfg(test)]
+    pub(crate) fn value_loaded_for_test(&self) -> bool {
+        self.value_loaded()
+    }
+}
+
+fn materialize_value(value: GuardValue) -> Vec<u8> {
+    match value {
+        GuardValue::Memory { table, key, cached } => cached.into_inner().unwrap_or_else(|| {
+            table
+                .get(&key)
+                .expect("a frozen scan winner must retain its value")
+        }),
+        GuardValue::Block { block, range } => block[range].to_vec(),
+    }
+}
+
+/// Iterator over a coherent range of entries.
+///
+/// Late SSTable checksum or decode failures are returned once and then the
+/// iterator is fused. This is intentionally a fallible item type: an infallible
+/// iterator cannot stream disk blocks without silently hiding late corruption.
+pub struct RangeIter {
+    sources: Vec<SourceCursor>,
+    heap: BinaryHeap<Reverse<HeapEntry>>,
+    equal: Vec<HeapEntry>,
+    pending_error: Option<StorageError>,
+    done: bool,
+    _directory_lock: Option<Arc<DirectoryLock>>,
+}
+
+impl RangeIter {
+    pub(crate) fn from_sources(
+        bounds: ScanBounds,
+        memtables: Vec<Arc<MemTable>>,
+        sstables: Vec<ScanSstable>,
+        directory_lock: Arc<DirectoryLock>,
+    ) -> std::result::Result<Self, StorageError> {
+        let bounds = Arc::new(bounds);
+        let mut sources = Vec::with_capacity(memtables.len() + sstables.len());
+        sources.extend(
+            memtables
+                .into_iter()
+                .enumerate()
+                .map(|(generation_rank, table)| {
+                    SourceCursor::Memory(MemoryCursor::new(
+                        table,
+                        generation_rank as u64,
+                        Arc::clone(&bounds),
+                    ))
+                }),
+        );
+        sources.extend(
+            sstables.into_iter().map(|source| {
+                SourceCursor::Sstable(SstableSource::new(source, Arc::clone(&bounds)))
+            }),
+        );
+
+        let mut iterator = Self {
+            equal: Vec::with_capacity(sources.len()),
+            sources,
+            heap: BinaryHeap::new(),
+            pending_error: None,
+            done: false,
+            _directory_lock: Some(directory_lock),
+        };
+        for source in 0..iterator.sources.len() {
+            if let Some(entry) = iterator.sources[source].next_entry()? {
+                iterator.heap.push(Reverse(HeapEntry { source, entry }));
+            }
+        }
+        Ok(iterator)
     }
 
-    /// Collect just the keys, discarding values.
-    ///
-    /// More efficient than collecting pairs when you don't need values.
-    pub fn keys(self) -> Vec<Vec<u8>> {
-        self.inner.map(|g| g.into_key()).collect()
+    pub(crate) fn empty(directory_lock: Arc<DirectoryLock>) -> Self {
+        Self {
+            sources: Vec::new(),
+            heap: BinaryHeap::new(),
+            equal: Vec::new(),
+            pending_error: None,
+            done: false,
+            _directory_lock: Some(directory_lock),
+        }
     }
 
-    /// Collect as key-value pairs.
-    pub fn collect_pairs(self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.inner.map(|g| g.into_pair()).collect()
+    /// Count entries while propagating any scan error.
+    pub fn count(mut self) -> std::result::Result<usize, ScanError> {
+        self.try_fold(0, |count, entry| entry.map(|_| count + 1))
     }
 
-    /// Skip entries and take a limited number (for pagination).
-    pub fn paginate(self, offset: usize, limit: usize) -> impl Iterator<Item = EntryGuard> {
-        self.inner.skip(offset).take(limit)
+    /// Collect keys without materializing values.
+    pub fn keys(mut self) -> std::result::Result<Vec<Vec<u8>>, ScanError> {
+        self.try_fold(Vec::new(), |mut keys, entry| {
+            keys.push(entry?.into_key());
+            Ok(keys)
+        })
+    }
+
+    /// Collect key-value pairs.
+    pub fn collect_pairs(mut self) -> std::result::Result<Vec<ScanEntry>, ScanError> {
+        self.try_fold(Vec::new(), |mut pairs, entry| {
+            pairs.push(entry?.into_pair());
+            Ok(pairs)
+        })
+    }
+
+    /// Skip entries and take a limited number while preserving scan errors.
+    pub fn paginate(self, offset: usize, limit: usize) -> impl Iterator<Item = ScanResult> {
+        Paginate {
+            inner: self,
+            remaining_offset: offset,
+            remaining_limit: limit,
+            done: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn working_set_for_test(&self) -> (usize, usize, usize, usize) {
+        let mut blocks = HashSet::new();
+        let mut block_bytes = 0;
+        let mut retain = |block: &Bytes| {
+            let pointer = block.as_ptr() as usize;
+            if blocks.insert(pointer) {
+                block_bytes += block.len();
+            }
+        };
+        for source in &self.sources {
+            if let SourceCursor::Sstable(source) = source {
+                if let Some(block) = source.cursor.retained_block() {
+                    retain(block);
+                }
+            }
+        }
+        for head in &self.heap {
+            if let CandidateValue::Block { block, .. } = &head.0.entry.value {
+                retain(block);
+            }
+        }
+        (
+            self.sources.len(),
+            self.heap.len(),
+            blocks.len(),
+            block_bytes,
+        )
     }
 }
 
 impl Iterator for RangeIter {
-    type Item = EntryGuard;
+    type Item = ScanResult;
 
-    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
-    }
+        if self.done {
+            return None;
+        }
+        if let Some(error) = self.pending_error.take() {
+            self.done = true;
+            self.heap.clear();
+            return Some(Err(error.into()));
+        }
 
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        loop {
+            let Reverse(first) = self.heap.pop()?;
+            let key = first.entry.key.clone();
+            self.equal.clear();
+            self.equal.push(first);
+            while self
+                .heap
+                .peek()
+                .is_some_and(|Reverse(head)| head.entry.key == key)
+            {
+                let Reverse(head) = self.heap.pop().expect("peeked heap entry");
+                self.equal.push(head);
+            }
+
+            let mut winner_index = 0;
+            for index in 1..self.equal.len() {
+                if self.equal[index].entry.order > self.equal[winner_index].entry.order {
+                    winner_index = index;
+                }
+            }
+            let winner = self.equal.swap_remove(winner_index);
+            let winner_key = winner.entry.key;
+            let winner_value = winner.entry.value;
+
+            for source in
+                std::iter::once(winner.source).chain(self.equal.drain(..).map(|head| head.source))
+            {
+                match self.sources[source].next_entry() {
+                    Ok(Some(entry)) => self.heap.push(Reverse(HeapEntry { source, entry })),
+                    Ok(None) => {}
+                    Err(error) => {
+                        if self.pending_error.is_none() {
+                            self.pending_error = Some(error);
+                        }
+                    }
+                }
+            }
+
+            match winner_value {
+                CandidateValue::Tombstone => {
+                    if let Some(error) = self.pending_error.take() {
+                        self.done = true;
+                        self.heap.clear();
+                        return Some(Err(error.into()));
+                    }
+                }
+                value => return Some(Ok(EntryGuard::from_candidate(winner_key, value))),
+            }
+        }
     }
 }
 
-impl ExactSizeIterator for RangeIter {
-    #[inline]
-    fn len(&self) -> usize {
-        self.inner.len()
+impl std::iter::FusedIterator for RangeIter {}
+
+struct Paginate {
+    inner: RangeIter,
+    remaining_offset: usize,
+    remaining_limit: usize,
+    done: bool,
+}
+
+impl Iterator for Paginate {
+    type Item = ScanResult;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.remaining_limit == 0 {
+            return None;
+        }
+        loop {
+            match self.inner.next()? {
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+                Ok(_) if self.remaining_offset > 0 => self.remaining_offset -= 1,
+                Ok(entry) => {
+                    self.remaining_limit -= 1;
+                    return Some(Ok(entry));
+                }
+            }
+        }
     }
 }
 
-/// Iterator over entries matching a prefix with lazy value access.
-///
-/// Identical to [`RangeIter`] but semantically represents a prefix scan.
+impl std::iter::FusedIterator for Paginate {}
+
+/// Prefix scans use the same streaming implementation as range scans.
 pub type PrefixIter = RangeIter;
+
+pub(crate) struct ScanSstable {
+    pub(crate) info: SSTableInfo,
+    pub(crate) reader: Arc<SSTableReader>,
+}
+
+#[derive(Clone)]
+pub(crate) enum ScanBounds {
+    Range {
+        start: Vec<u8>,
+        end: Vec<u8>,
+    },
+    Prefix {
+        prefix: Vec<u8>,
+        upper: Option<Vec<u8>>,
+    },
+}
+
+impl ScanBounds {
+    pub(crate) fn range(start: &[u8], end: &[u8]) -> Self {
+        Self::Range {
+            start: start.to_vec(),
+            end: end.to_vec(),
+        }
+    }
+
+    pub(crate) fn prefix(prefix: &[u8]) -> Self {
+        Self::Prefix {
+            prefix: prefix.to_vec(),
+            upper: prefix_upper_bound(prefix),
+        }
+    }
+
+    pub(crate) fn start(&self) -> &[u8] {
+        match self {
+            Self::Range { start, .. } => start,
+            Self::Prefix { prefix, .. } => prefix,
+        }
+    }
+
+    pub(crate) fn overlaps_table(&self, info: &SSTableInfo) -> bool {
+        if info.min_key.is_empty() && info.max_key.is_empty() {
+            return true;
+        }
+        match self {
+            Self::Range { start, end } => {
+                info.min_key.as_slice() < end.as_slice()
+                    && info.max_key.as_slice() >= start.as_slice()
+            }
+            Self::Prefix { prefix, upper } => {
+                info.max_key.as_slice() >= prefix.as_slice()
+                    && upper
+                        .as_ref()
+                        .map_or(true, |upper| info.min_key.as_slice() < upper.as_slice())
+            }
+        }
+    }
+
+    fn contains(&self, key: &[u8]) -> bool {
+        match self {
+            Self::Range { start, end } => key >= start.as_slice() && key < end.as_slice(),
+            Self::Prefix { prefix, .. } => key.starts_with(prefix),
+        }
+    }
+
+    fn past_end(&self, key: &[u8]) -> bool {
+        match self {
+            Self::Range { end, .. } => key >= end.as_slice(),
+            Self::Prefix {
+                prefix,
+                upper: Some(upper),
+            } => key >= upper.as_slice() || (key >= prefix.as_slice() && !key.starts_with(prefix)),
+            Self::Prefix {
+                prefix,
+                upper: None,
+            } => key >= prefix.as_slice() && !key.starts_with(prefix),
+        }
+    }
+}
+
+enum SourceCursor {
+    Memory(MemoryCursor),
+    Sstable(SstableSource),
+}
+
+impl SourceCursor {
+    fn next_entry(&mut self) -> std::result::Result<Option<SourceEntry>, StorageError> {
+        match self {
+            Self::Memory(cursor) => Ok(cursor.next_entry()),
+            Self::Sstable(cursor) => cursor.next_entry(),
+        }
+    }
+}
+
+struct MemoryCursor {
+    table: Arc<MemTable>,
+    generation_rank: u64,
+    bounds: Arc<ScanBounds>,
+    last_key: Option<Bytes>,
+    done: bool,
+}
+
+impl MemoryCursor {
+    fn new(table: Arc<MemTable>, generation_rank: u64, bounds: Arc<ScanBounds>) -> Self {
+        Self {
+            table,
+            generation_rank,
+            bounds,
+            last_key: None,
+            done: false,
+        }
+    }
+
+    fn next_entry(&mut self) -> Option<SourceEntry> {
+        if self.done {
+            return None;
+        }
+        let entry = match &self.last_key {
+            Some(last_key) => self
+                .table
+                .data
+                .lower_bound::<[u8]>(Bound::Excluded(last_key.as_ref())),
+            None => self
+                .table
+                .data
+                .lower_bound::<[u8]>(Bound::Included(self.bounds.start())),
+        }?;
+        let key = Bytes::from(entry.key().clone());
+        if self.bounds.past_end(&key) {
+            self.done = true;
+            return None;
+        }
+        self.last_key = Some(key.clone());
+        if !self.bounds.contains(&key) {
+            self.done = true;
+            return None;
+        }
+        let table_entry = entry.value();
+        Some(SourceEntry {
+            key,
+            order: VersionOrder::memory(table_entry.sequence, self.generation_rank),
+            value: if table_entry.is_tombstone() {
+                CandidateValue::Tombstone
+            } else {
+                CandidateValue::Memory(Arc::clone(&self.table))
+            },
+        })
+    }
+}
+
+struct SstableSource {
+    info: SSTableInfo,
+    cursor: SSTableRangeCursor,
+    bounds: Arc<ScanBounds>,
+    done: bool,
+}
+
+impl SstableSource {
+    fn new(source: ScanSstable, bounds: Arc<ScanBounds>) -> Self {
+        let cursor = SSTableRangeCursor::new(source.reader, bounds.start());
+        Self {
+            info: source.info,
+            cursor,
+            bounds,
+            done: false,
+        }
+    }
+
+    fn next_entry(&mut self) -> std::result::Result<Option<SourceEntry>, StorageError> {
+        if self.done {
+            return Ok(None);
+        }
+        loop {
+            let Some(entry) = self.cursor.next_versioned_ref() else {
+                self.done = true;
+                return Ok(None);
+            };
+            let (key, entry) = entry.map_err(|error| StorageError::SSTable(error.to_string()))?;
+            if self.bounds.past_end(&key) {
+                self.done = true;
+                return Ok(None);
+            }
+            if !self.bounds.contains(&key) {
+                continue;
+            }
+            return Ok(Some(SourceEntry::from_sstable(key, entry, &self.info)));
+        }
+    }
+}
+
+struct SourceEntry {
+    key: Bytes,
+    order: VersionOrder,
+    value: CandidateValue,
+}
+
+impl SourceEntry {
+    fn from_sstable(key: Bytes, entry: SSTableEntryRef, info: &SSTableInfo) -> Self {
+        let order = VersionOrder::sstable(entry.sequence, info.id);
+        let value = entry
+            .value_range
+            .map_or(CandidateValue::Tombstone, |range| CandidateValue::Block {
+                block: entry.block,
+                range,
+            });
+        Self { key, order, value }
+    }
+}
+
+enum CandidateValue {
+    Tombstone,
+    Memory(Arc<MemTable>),
+    Block { block: Bytes, range: Range<usize> },
+}
+
+struct HeapEntry {
+    source: usize,
+    entry: SourceEntry,
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry.key == other.entry.key && self.source == other.source
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.entry
+            .key
+            .cmp(&other.entry.key)
+            .then_with(|| self.source.cmp(&other.source))
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_entry_guard_key_access() {
-        let guard = EntryGuard::new(b"key1".to_vec(), b"value1".to_vec());
-        assert_eq!(guard.key(), b"key1");
-        assert_eq!(guard.value(), b"value1");
+    fn binary_prefix_bounds_do_not_overflow() {
+        let all = ScanBounds::prefix(b"");
+        assert!(all.contains(b""));
+        assert!(all.contains(&[0xff, 0xff]));
+        assert!(!all.past_end(&[0xff, 0xff]));
+
+        let terminal = ScanBounds::prefix(&[0xff, 0xff]);
+        assert!(terminal.contains(&[0xff, 0xff, 0x00]));
+        assert!(!terminal.contains(&[0xff]));
+        assert!(!terminal.past_end(&[0xff, 0xff, 0xff]));
     }
 
     #[test]
-    fn test_entry_guard_into_pair() {
-        let guard = EntryGuard::new(b"key1".to_vec(), b"value1".to_vec());
-        let (k, v) = guard.into_pair();
-        assert_eq!(k, b"key1");
-        assert_eq!(v, b"value1");
-    }
-
-    #[test]
-    fn test_range_iter_count() {
-        let entries = vec![
-            (b"a".to_vec(), b"1".to_vec()),
-            (b"b".to_vec(), b"2".to_vec()),
-            (b"c".to_vec(), b"3".to_vec()),
-        ];
-        let iter = RangeIter::new(entries);
-        assert_eq!(iter.count(), 3);
-    }
-
-    #[test]
-    fn test_range_iter_keys() {
-        let entries = vec![
-            (b"a".to_vec(), b"1".to_vec()),
-            (b"b".to_vec(), b"2".to_vec()),
-        ];
-        let iter = RangeIter::new(entries);
-        let keys = iter.keys();
-        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
-    }
-
-    #[test]
-    fn test_range_iter_filter() {
-        let entries = vec![
-            (b"user:1:name".to_vec(), b"alice".to_vec()),
-            (b"user:1:email".to_vec(), b"alice@example.com".to_vec()),
-            (b"user:2:name".to_vec(), b"bob".to_vec()),
-            (b"user:2:email".to_vec(), b"bob@example.com".to_vec()),
-        ];
-        let iter = RangeIter::new(entries);
-
-        // Only get names (filter by key pattern)
-        let names: Vec<_> = iter
-            .filter(|g| g.key().ends_with(b":name"))
-            .map(|g| g.into_value())
-            .collect();
-
-        assert_eq!(names, vec![b"alice".to_vec(), b"bob".to_vec()]);
-    }
-
-    #[test]
-    fn test_range_iter_paginate() {
-        let entries = vec![
-            (b"a".to_vec(), b"1".to_vec()),
-            (b"b".to_vec(), b"2".to_vec()),
-            (b"c".to_vec(), b"3".to_vec()),
-            (b"d".to_vec(), b"4".to_vec()),
-            (b"e".to_vec(), b"5".to_vec()),
-        ];
-        let iter = RangeIter::new(entries);
-
-        // Skip 2, take 2
-        let page: Vec<_> = iter.paginate(2, 2).map(|g| g.into_key()).collect();
-        assert_eq!(page, vec![b"c".to_vec(), b"d".to_vec()]);
+    fn pagination_reports_an_error_before_its_offset_and_fuses() {
+        let iterator = RangeIter {
+            sources: Vec::new(),
+            heap: BinaryHeap::new(),
+            equal: Vec::new(),
+            pending_error: Some(StorageError::SSTable("corrupt".to_string())),
+            done: false,
+            _directory_lock: None,
+        };
+        let mut page = iterator.paginate(10, 2);
+        assert!(page.next().unwrap().is_err());
+        assert!(page.next().is_none());
     }
 }

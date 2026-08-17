@@ -192,6 +192,11 @@ impl DbOptions {
 /// state before it or the complete batch. WAL recovery applies a batch only
 /// after validating its complete checksummed envelope.
 ///
+/// Creating a range or prefix scan freezes a nonempty active memtable so the
+/// iterator can retain a bounded-memory, point-in-time view. Frequent scans
+/// interleaved with small write bursts can therefore create more immutable
+/// generations and increase later flush/compaction write amplification.
+///
 /// # Operational errors
 ///
 /// Except for [`DbError::InvalidOptions`], an error can occur after storage
@@ -332,17 +337,20 @@ impl Db {
 
     /// Scan a range of keys with guard iterator for lazy value access.
     ///
-    /// Returns an iterator of [`EntryGuard`] that allows inspecting keys
-    /// without loading values, enabling efficient filtering.
+    /// Iterator construction reports [`DbError`]; failures discovered while
+    /// advancing it use the purpose-specific [`ScanError`]. Inspecting a key
+    /// does not copy its value; each SSTable block is decompressed as a unit
+    /// because the on-disk format interleaves keys and values.
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// // Count keys without loading values
-    /// let count = db.range_iter(b"user:", b"user:\xff").await?.count();
+    /// let count = db.range_iter(b"user:", b"user:\xff").await?.count()?;
     ///
     /// // Filter by key, only load matching values
     /// for guard in db.range_iter(b"user:", b"user:\xff").await? {
+    ///     let guard = guard?;
     ///     if guard.key().ends_with(b":active") {
     ///         let value = guard.value();
     ///         // process value
@@ -351,6 +359,7 @@ impl Db {
     /// ```
     ///
     /// [`EntryGuard`]: super::iter::EntryGuard
+    /// [`ScanError`]: super::iter::ScanError
     pub async fn range_iter<K: AsRef<[u8]>>(
         &self,
         start: K,
@@ -361,23 +370,24 @@ impl Db {
 
     /// Scan keys with a prefix using guard iterator for lazy value access.
     ///
-    /// Returns an iterator of [`EntryGuard`] that allows inspecting keys
-    /// without loading values, enabling efficient filtering.
+    /// Iterator construction reports [`DbError`]; failures discovered while
+    /// advancing it use the purpose-specific [`ScanError`].
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// // Get only keys
-    /// let keys = db.scan_prefix_iter(b"user:").await?.keys();
+    /// let keys = db.scan_prefix_iter(b"user:").await?.keys()?;
     ///
     /// // Paginate results
     /// let page: Vec<_> = db.scan_prefix_iter(b"user:").await?
     ///     .paginate(offset, limit)
-    ///     .map(|g| g.into_pair())
-    ///     .collect();
+    ///     .map(|g| g.map(|g| g.into_pair()))
+    ///     .collect::<Result<Vec<_>, _>>()?;
     /// ```
     ///
     /// [`EntryGuard`]: super::iter::EntryGuard
+    /// [`ScanError`]: super::iter::ScanError
     pub async fn scan_prefix_iter<K: AsRef<[u8]>>(
         &self,
         prefix: K,
@@ -605,7 +615,7 @@ mod tests {
         db.insert(b"d", b"4").await.unwrap();
 
         // Count without loading values
-        let count = db.range_iter(b"a", b"d").await.unwrap().count();
+        let count = db.range_iter(b"a", b"d").await.unwrap().count().unwrap();
         assert_eq!(count, 3); // a, b, c (exclusive end)
     }
 
@@ -620,7 +630,7 @@ mod tests {
         db.insert(b"user:2", b"bob").await.unwrap();
 
         // Get only keys
-        let keys = db.scan_prefix_iter(b"user:").await.unwrap().keys();
+        let keys = db.scan_prefix_iter(b"user:").await.unwrap().keys().unwrap();
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&b"user:1".to_vec()));
         assert!(keys.contains(&b"user:2".to_vec()));
@@ -647,8 +657,9 @@ mod tests {
             .scan_prefix_iter(b"user:")
             .await
             .unwrap()
-            .filter(|g| g.key().ends_with(b":name"))
-            .map(|g| g.into_value())
+            .map(|entry| entry.unwrap())
+            .filter(|guard| guard.key().ends_with(b":name"))
+            .map(super::super::iter::EntryGuard::into_value)
             .collect();
 
         assert_eq!(names.len(), 2);
@@ -675,7 +686,7 @@ mod tests {
             .await
             .unwrap()
             .paginate(3, 4)
-            .map(|g| String::from_utf8_lossy(g.key()).to_string())
+            .map(|g| String::from_utf8_lossy(g.unwrap().key()).to_string())
             .collect();
 
         assert_eq!(page.len(), 4);

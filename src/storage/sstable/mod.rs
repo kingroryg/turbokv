@@ -41,6 +41,7 @@
 
 pub mod bloom;
 mod builder;
+mod codec;
 mod compression;
 mod iterator;
 mod reader;
@@ -49,8 +50,10 @@ mod writer;
 
 pub use bloom::{BloomFilter, PrefixBloomFilter};
 pub use builder::{BlockBuilder, IndexBuilder};
+pub(crate) use codec::SSTableEntryRef;
 pub use compression::{compress_block, decompress_block, CompressionType};
 pub use iterator::SSTableIterator;
+pub(crate) use iterator::SSTableRangeCursor;
 pub(crate) use reader::SSTableEntry;
 pub use reader::SSTableReader;
 pub use types::{SSTableConfig, SSTableInfo, FOOTER_SIZE, SSTABLE_MAGIC, SSTABLE_VERSION};

@@ -42,7 +42,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info};
 
-use crate::core::{CompactionResult, DbConfig, StorageStats, WriteBatch};
+use crate::core::{CompactionResult, DbConfig, Error as CoreError, StorageStats, WriteBatch};
 
 use super::{
     compaction::{CompactionConfig, Compactor},
@@ -50,9 +50,11 @@ use super::{
         AcquireError as DirectoryLockAcquireError, DirectoryLock, LOCKED_DIRECTORY_GUIDANCE,
     },
     fd::{FdConfig, FdMonitor, SSTablePool},
+    iter::{RangeIter, ScanBounds, ScanSstable},
     manifest::{atomic_replace, sync_directory, Manifest, SSTableManifestEntry},
     memtable::{MemTableConfig, MemTableManager},
     sstable::{SSTableConfig, SSTableInfo, SSTableReader, SSTableWriter},
+    version::VersionOrder,
     wal::{WalConfig, WriteAheadLog},
     InProgressGuard,
 };
@@ -445,6 +447,7 @@ impl Engine {
             )?;
             self.wal_bytes_written
                 .fetch_add(wal_data_entry_size(key, value), Ordering::Relaxed);
+            let _publication = self.batch_visibility.read().await;
             self.memtable_manager
                 .insert_with_sequence(key, value, sequence)
                 .map_err(StorageError::MemTable)?;
@@ -483,6 +486,7 @@ impl Engine {
             )?;
             self.wal_bytes_written
                 .fetch_add(appended.bytes_written, Ordering::Relaxed);
+            let _publication = self.batch_visibility.read().await;
             self.memtable_manager
                 .insert_many_with_sequences(entries, &appended.sequences)
                 .map_err(StorageError::MemTable)?;
@@ -524,6 +528,7 @@ impl Engine {
             )?;
             self.wal_bytes_written
                 .fetch_add(wal_delete_entry_size(key), Ordering::Relaxed);
+            let _publication = self.batch_visibility.read().await;
             self.memtable_manager
                 .delete_with_sequence(key, sequence)
                 .map_err(StorageError::MemTable)?;
@@ -546,9 +551,13 @@ impl Engine {
 
         // Resolve all physical copies by sequence; physical list order is not
         // a version order after reopen or compaction.
-        let sstables = self.sstables.read().await;
-        for sst in sstables.iter() {
-            if let Some(candidate) = self.read_from_sstable(sst, key).await? {
+        for source in self.pin_sstables(|_| true).await? {
+            if let Some(entry) = source
+                .reader
+                .get_entry(key)
+                .map_err(|error| StorageError::SSTable(error.to_string()))?
+            {
+                let candidate = VersionedValue::from_sstable(entry, &source.info);
                 retain_newest(&mut newest, candidate);
             }
         }
@@ -563,82 +572,40 @@ impl Engine {
 
     /// Scan a range of keys
     pub async fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        use std::collections::BTreeMap;
-
-        let memtable_entries = self
-            .snapshot_memtable(|manager| manager.range_entries(start, end))
-            .await?;
-
-        let mut merged: BTreeMap<Vec<u8>, VersionedValue> = BTreeMap::new();
-
-        // Get from SSTables first (older data)
-        let sstables = self.sstables.read().await;
-        for sst in sstables.iter() {
-            let entries = self.range_from_sstable(sst, start, end).await?;
-            for (key, entry) in entries {
-                merge_versioned(&mut merged, key, entry);
-            }
-        }
-        drop(sstables);
-
-        // Get from memtable last (newer data overrides SSTables)
-        for (key, entry) in memtable_entries {
-            merge_versioned(&mut merged, key, VersionedValue::from_memtable(entry));
-        }
-
-        // Filter out tombstones
-        Ok(merged
-            .into_iter()
-            .filter_map(|(key, entry)| entry.value.map(|value| (key, value)))
-            .collect())
+        self.range_iter(start, end)
+            .await?
+            .collect_pairs()
+            .map_err(super::iter::ScanError::into_storage_error)
     }
 
     /// Scan all keys with a given prefix
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        use std::collections::BTreeMap;
-
-        let memtable_entries = self
-            .snapshot_memtable(|manager| manager.scan_prefix_entries(prefix))
-            .await?;
-
-        let mut merged: BTreeMap<Vec<u8>, VersionedValue> = BTreeMap::new();
-
-        // Get from SSTables first (older data)
-        let sstables = self.sstables.read().await;
-        for sst in sstables.iter() {
-            let entries = self.prefix_from_sstable(sst, prefix).await?;
-            for (key, entry) in entries {
-                merge_versioned(&mut merged, key, entry);
-            }
-        }
-        drop(sstables);
-
-        // Get from memtable last (newer data overrides SSTables)
-        for (key, entry) in memtable_entries {
-            merge_versioned(&mut merged, key, VersionedValue::from_memtable(entry));
-        }
-
-        // Filter out tombstones
-        Ok(merged
-            .into_iter()
-            .filter_map(|(key, entry)| entry.value.map(|value| (key, value)))
-            .collect())
+        self.scan_prefix_iter(prefix)
+            .await?
+            .collect_pairs()
+            .map_err(super::iter::ScanError::into_storage_error)
     }
 
     /// Scan a range of keys, returning a guard iterator for lazy value access.
     ///
     /// This allows filtering by key without loading values until needed.
-    pub async fn range_iter(&self, start: &[u8], end: &[u8]) -> Result<super::iter::RangeIter> {
-        let entries = self.range(start, end).await?;
-        Ok(super::iter::RangeIter::new(entries))
+    pub async fn range_iter(&self, start: &[u8], end: &[u8]) -> Result<RangeIter> {
+        if start >= end {
+            return Ok(RangeIter::empty(Arc::clone(&self.directory_lock)));
+        }
+        self.scan_iter(
+            ScanBounds::range(start, end),
+            Arc::clone(&self.directory_lock),
+        )
+        .await
     }
 
     /// Scan keys with a prefix, returning a guard iterator for lazy value access.
     ///
     /// This allows filtering by key without loading values until needed.
     pub async fn scan_prefix_iter(&self, prefix: &[u8]) -> Result<super::iter::PrefixIter> {
-        let entries = self.scan_prefix(prefix).await?;
-        Ok(super::iter::RangeIter::new(entries))
+        self.scan_iter(ScanBounds::prefix(prefix), Arc::clone(&self.directory_lock))
+            .await
     }
 
     /// Write a batch of operations atomically
@@ -921,90 +888,95 @@ impl Engine {
         Ok(snapshot(&self.memtable_manager))
     }
 
-    /// Read a key from an SSTable
-    async fn read_from_sstable(
+    /// Freeze and retain a coherent source set for a streaming scan.
+    async fn scan_iter(
         &self,
-        sst: &SSTableInfo,
-        key: &[u8],
-    ) -> Result<Option<VersionedValue>> {
-        // Check bloom filter first (if available)
-        // Then search the SSTable
+        bounds: ScanBounds,
+        directory_lock: Arc<DirectoryLock>,
+    ) -> Result<RangeIter> {
+        // WAL-backed mutations enter the publication gate only for their short
+        // memtable apply. This lets a scan freeze the old state while another
+        // mutation is still waiting on WAL I/O. Fast-mode scans additionally
+        // exclude sequence allocation while draining all thread-local buffers.
+        let memtables = {
+            let _publication = self.batch_visibility.write().await;
+            let _mutations = if self.wal.is_none() {
+                let mutations = self.mutation_barrier.write().await;
+                self.memtable_manager
+                    .flush_thread_local()
+                    .map_err(StorageError::MemTable)?;
+                Some(mutations)
+            } else {
+                None
+            };
+            self.memtable_manager
+                .force_rotate()
+                .map_err(StorageError::MemTable)?;
+            self.memtable_manager.snapshot_immutable_tables()
+        };
 
-        let reader = self
-            .sstable_pool
-            .get(&sst.path)
-            .map_err(|e| StorageError::SSTable(e.to_string()))?;
+        // Capture memtables before SSTables. Flush installs the SSTable before
+        // removing its immutable, so this order cannot miss either side of the
+        // handoff. The SSTable list itself is cloned under its lock; reader I/O
+        // happens after release and retries if compaction unlinked an input.
+        let sstables = self
+            .pin_sstables(|info| bounds.overlaps_table(info))
+            .await?;
 
-        match reader.get_entry(key) {
-            Ok(Some(entry)) => Ok(Some(VersionedValue::from_sstable(entry, sst))),
-            Ok(None) => Ok(None),
-            Err(e) => Err(StorageError::SSTable(e.to_string())),
-        }
+        RangeIter::from_sources(bounds, memtables, sstables, directory_lock)
     }
 
-    /// Range scan from an SSTable
-    async fn range_from_sstable(
+    /// Pin one coherent reader set without holding the live-list lock over I/O.
+    async fn pin_sstables(
         &self,
-        sst: &SSTableInfo,
-        start: &[u8],
-        end: &[u8],
-    ) -> Result<Vec<(Vec<u8>, VersionedValue)>> {
-        // Skip SSTable if its key range doesn't overlap with query range
-        if !sst.min_key.is_empty() && sst.min_key.as_slice() >= end {
-            return Ok(Vec::new());
-        }
-        if !sst.max_key.is_empty() && sst.max_key.as_slice() < start {
-            return Ok(Vec::new());
-        }
+        include: impl Fn(&SSTableInfo) -> bool,
+    ) -> Result<Vec<ScanSstable>> {
+        loop {
+            let (snapshot_identity, selected) = {
+                let live_sstables = self.sstables.read().await;
+                let identity = live_sstables
+                    .iter()
+                    .map(|info| (info.id, info.path.clone()))
+                    .collect::<Vec<_>>();
+                let selected = live_sstables
+                    .iter()
+                    .filter(|info| include(info))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (identity, selected)
+            };
 
-        let reader = self
-            .sstable_pool
-            .get(&sst.path)
-            .map_err(|e| StorageError::SSTable(e.to_string()))?;
-
-        // Use iterator to scan range
-        let mut results = Vec::new();
-        let mut iterator = reader.iter();
-        while let Some(entry) = iterator.next_versioned() {
-            let (key, entry) = entry.map_err(|e| StorageError::SSTable(e.to_string()))?;
-            if key.as_ref() >= start && key.as_ref() < end {
-                results.push((key.to_vec(), VersionedValue::from_sstable(entry, sst)));
-            } else if key.as_ref() >= end {
-                break;
+            let mut pinned = Vec::with_capacity(selected.len());
+            let mut missing = None;
+            for info in selected {
+                match self.sstable_pool.get(&info.path) {
+                    Ok(reader) => pinned.push(ScanSstable { info, reader }),
+                    Err(error) if sstable_open_was_not_found(&error) => {
+                        missing = Some(error);
+                        break;
+                    }
+                    Err(error) => return Err(StorageError::SSTable(error.to_string())),
+                }
             }
-        }
-        Ok(results)
-    }
+            let Some(error) = missing else {
+                return Ok(pinned);
+            };
 
-    /// Prefix scan from an SSTable
-    async fn prefix_from_sstable(
-        &self,
-        sst: &SSTableInfo,
-        prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, VersionedValue)>> {
-        // Skip SSTable if all its keys are before the prefix range
-        if !sst.max_key.is_empty() && sst.max_key.as_slice() < prefix {
-            return Ok(Vec::new());
-        }
-
-        let reader = self
-            .sstable_pool
-            .get(&sst.path)
-            .map_err(|e| StorageError::SSTable(e.to_string()))?;
-
-        // Use iterator to scan prefix
-        let mut results = Vec::new();
-        let mut iterator = reader.iter();
-        while let Some(entry) = iterator.next_versioned() {
-            let (key, entry) = entry.map_err(|e| StorageError::SSTable(e.to_string()))?;
-            if key.starts_with(prefix) {
-                results.push((key.to_vec(), VersionedValue::from_sstable(entry, sst)));
-            } else if key.as_ref() > prefix && !key.starts_with(prefix) {
-                // Past the prefix range, can stop
-                break;
+            // Compaction publishes the replacement list before unlinking its
+            // inputs. If an input disappeared after capture, discard every
+            // partial pin and retry from one new coherent list snapshot.
+            let live_sstables = self.sstables.read().await;
+            let unchanged = live_sstables.len() == snapshot_identity.len()
+                && live_sstables
+                    .iter()
+                    .zip(&snapshot_identity)
+                    .all(|(info, (id, path))| info.id == *id && info.path == *path);
+            drop(live_sstables);
+            if unchanged {
+                return Err(StorageError::SSTable(error.to_string()));
             }
+            tokio::task::yield_now().await;
         }
-        Ok(results)
     }
 
     /// Flush a memtable to SSTable
@@ -1101,6 +1073,10 @@ impl Engine {
             .fetch_add(result.bytes_read, Ordering::Relaxed);
         self.compaction_bytes_written
             .fetch_add(result.bytes_written, Ordering::Relaxed);
+
+        // The live source swap is complete. Manifest I/O and unlinking old
+        // inputs must not hold the global reader-list lock.
+        drop(sstables);
 
         // Update manifest
         {
@@ -1379,6 +1355,10 @@ impl BackgroundEngine {
             .fetch_add(result.bytes_read, Ordering::Relaxed);
         self.compaction_bytes_written
             .fetch_add(result.bytes_written, Ordering::Relaxed);
+
+        // The live source swap is complete. Manifest I/O and unlinking old
+        // inputs must not hold the global reader-list lock.
+        drop(sstables);
 
         {
             let mut manifest = self.manifest.lock();
@@ -1718,49 +1698,38 @@ async fn truncate_wal(wal: Option<&Arc<WriteAheadLog>>, checkpoint: u64) {
     }
 }
 
+fn sstable_open_was_not_found(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// A present value or tombstone that remains distinct from a missing key until
 /// the newest physical version has been selected.
 struct VersionedValue {
-    sequence: u64,
-    source: VersionSource,
+    order: VersionOrder,
     value: Option<Vec<u8>>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum VersionSource {
-    /// Exact per-entry ordering is unavailable; table id orders generations.
-    Legacy(u64),
-    /// Table id deterministically breaks ties between exact sequences.
-    Versioned(u64),
-    /// A replayed copy at the same sequence supersedes its persisted copy.
-    Memory,
 }
 
 impl VersionedValue {
     fn from_memtable(entry: super::memtable::MemTableEntry) -> Self {
         Self {
-            sequence: entry.sequence,
-            source: VersionSource::Memory,
+            order: VersionOrder::memory(entry.sequence, u64::MAX),
             value: entry.value,
         }
     }
 
     fn from_sstable(entry: super::sstable::SSTableEntry, table: &SSTableInfo) -> Self {
         let value = entry.value.into_option().map(|value| value.to_vec());
-        let (sequence, source) = entry
-            .sequence
-            .map_or((0, VersionSource::Legacy(table.id)), |sequence| {
-                (sequence, VersionSource::Versioned(table.id))
-            });
         Self {
-            sequence,
-            source,
+            order: VersionOrder::sstable(entry.sequence, table.id),
             value,
         }
     }
 
     fn is_newer_than(&self, other: &Self) -> bool {
-        (self.sequence, self.source) > (other.sequence, other.source)
+        self.order > other.order
     }
 }
 
@@ -1770,27 +1739,6 @@ fn retain_newest(current: &mut Option<VersionedValue>, candidate: VersionedValue
         .map_or(true, |entry| candidate.is_newer_than(entry))
     {
         *current = Some(candidate);
-    }
-}
-
-fn retain_newest_entry(current: &mut VersionedValue, candidate: VersionedValue) {
-    if candidate.is_newer_than(current) {
-        *current = candidate;
-    }
-}
-
-fn merge_versioned(
-    merged: &mut std::collections::BTreeMap<Vec<u8>, VersionedValue>,
-    key: Vec<u8>,
-    candidate: VersionedValue,
-) {
-    use std::collections::btree_map::Entry;
-
-    match merged.entry(key) {
-        Entry::Vacant(entry) => {
-            entry.insert(candidate);
-        }
-        Entry::Occupied(mut entry) => retain_newest_entry(entry.get_mut(), candidate),
     }
 }
 
@@ -1868,6 +1816,35 @@ mod tests {
         };
         let mut writer = SSTableWriter::new_legacy_v2(path, config).unwrap();
         writer.add(b"scope:key", value).unwrap();
+        let info = writer.finish().unwrap();
+        SSTableManifestEntry {
+            id,
+            level: 0,
+            path: info.path,
+            size: info.file_size,
+            entry_count: info.entry_count,
+            min_key: info.min_key,
+            max_key: info.max_key,
+            min_sequence: 0,
+            max_sequence: manifest_max_sequence,
+            creation_time: id,
+        }
+    }
+
+    fn write_legacy_scan_table(
+        path: &std::path::Path,
+        id: u64,
+        entries: &[(&[u8], Option<&[u8]>)],
+        manifest_max_sequence: u64,
+    ) -> SSTableManifestEntry {
+        let config = SSTableConfig {
+            compression: super::super::sstable::CompressionType::None,
+            ..SSTableConfig::default()
+        };
+        let mut writer = SSTableWriter::new_legacy_v2(path, config).unwrap();
+        for (key, value) in entries {
+            writer.add(key, *value).unwrap();
+        }
         let info = writer.finish().unwrap();
         SSTableManifestEntry {
             id,
@@ -2333,6 +2310,13 @@ mod tests {
                 .unwrap(),
             Some(b"old".to_vec())
         );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), engine.scan_prefix(b"blocked:"))
+                .await
+                .expect("scan waited for a batch WAL fsync")
+                .unwrap(),
+            vec![(b"blocked:key".to_vec(), b"old".to_vec())]
+        );
 
         release_tx.send(()).unwrap();
         lock_holder.await.unwrap();
@@ -2672,5 +2656,448 @@ mod tests {
             Some(b"upgraded".to_vec())
         );
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamed_winners_match_point_reads_across_legacy_v3_and_memory_sources() {
+        use std::collections::BTreeMap;
+
+        let directory = TempDir::new().unwrap();
+        let sstable_directory = directory.path().join("sstables");
+        std::fs::create_dir_all(&sstable_directory).unwrap();
+        let legacy_old = write_legacy_scan_table(
+            &sstable_directory.join("legacy-old.sst"),
+            1,
+            &[
+                (b"scan:a", Some(b"legacy-a")),
+                (b"scan:b", Some(b"legacy-b")),
+                (b"scan:c", Some(b"legacy-c-old")),
+            ],
+            10,
+        );
+        let legacy_new = write_legacy_scan_table(
+            &sstable_directory.join("legacy-new.sst"),
+            2,
+            &[
+                (b"scan:a", None),
+                (b"scan:c", Some(b"legacy-c-new")),
+                (b"scan:d", Some(b"legacy-d")),
+            ],
+            20,
+        );
+        let mut manifest = Manifest::new();
+        manifest.sstables = vec![legacy_old, legacy_new];
+        manifest.save(directory.path()).unwrap();
+
+        let engine = Engine::open(isolated_config(directory.path(), true))
+            .await
+            .unwrap();
+        engine.insert(b"scan:a", b"memory-a").await.unwrap();
+        engine.insert(b"scan:b", b"v3-b").await.unwrap();
+        engine.flush().await.unwrap();
+        engine.delete(b"scan:b").await.unwrap();
+        engine.insert(b"scan:e", b"memory-e").await.unwrap();
+
+        let streamed: BTreeMap<_, _> = engine
+            .scan_prefix_iter(b"scan:")
+            .await
+            .unwrap()
+            .map(|entry| entry.unwrap().into_pair())
+            .collect();
+        for key in [b"scan:a", b"scan:b", b"scan:c", b"scan:d", b"scan:e"] {
+            assert_eq!(
+                streamed.get(key.as_slice()).cloned(),
+                engine.get(key).await.unwrap()
+            );
+        }
+        assert_eq!(
+            streamed.get(b"scan:a".as_slice()),
+            Some(&b"memory-a".to_vec())
+        );
+        assert!(!streamed.contains_key(b"scan:b".as_slice()));
+        assert_eq!(
+            streamed.get(b"scan:c".as_slice()),
+            Some(&b"legacy-c-new".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_memory_sequence_ties_match_point_read_source_order() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), true))
+            .await
+            .unwrap();
+        engine
+            .memtable_manager
+            .insert_with_sequence(b"tie:key", b"first", 7)
+            .unwrap();
+        engine.memtable_manager.force_rotate().unwrap();
+        engine
+            .memtable_manager
+            .insert_with_sequence(b"tie:key", b"second", 7)
+            .unwrap();
+        engine.memtable_manager.force_rotate().unwrap();
+
+        assert_eq!(
+            engine.get(b"tie:key").await.unwrap(),
+            Some(b"second".to_vec())
+        );
+        assert_eq!(
+            engine.scan_prefix(b"tie:").await.unwrap(),
+            vec![(b"tie:key".to_vec(), b"second".to_vec())]
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_freeze_preserves_newest_memory_generation_on_exact_sequence_ties() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), true))
+            .await
+            .unwrap();
+        engine
+            .memtable_manager
+            .insert_with_sequence(b"freeze:value", b"old", 7)
+            .unwrap();
+        engine
+            .memtable_manager
+            .insert_with_sequence(b"freeze:deleted", b"old", 8)
+            .unwrap();
+        engine.memtable_manager.force_rotate().unwrap();
+        engine
+            .memtable_manager
+            .insert_with_sequence(b"freeze:value", b"new", 7)
+            .unwrap();
+        engine
+            .memtable_manager
+            .delete_with_sequence(b"freeze:deleted", 8)
+            .unwrap();
+
+        assert_eq!(
+            engine.get(b"freeze:value").await.unwrap(),
+            Some(b"new".to_vec())
+        );
+        assert_eq!(engine.get(b"freeze:deleted").await.unwrap(), None);
+
+        let prefix = engine.scan_prefix_iter(b"freeze:").await.unwrap();
+        let range = engine.range_iter(b"freeze:", b"freeze;").await.unwrap();
+        let expected = vec![(b"freeze:value".to_vec(), b"new".to_vec())];
+        assert_eq!(prefix.collect_pairs().unwrap(), expected);
+        assert_eq!(range.collect_pairs().unwrap(), expected);
+        assert_eq!(
+            engine.get(b"freeze:value").await.unwrap(),
+            Some(b"new".to_vec())
+        );
+        assert_eq!(engine.get(b"freeze:deleted").await.unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn point_reads_do_not_miss_the_generation_moving_during_scan_freeze() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), true))
+            .await
+            .unwrap();
+
+        for generation in 0..32_u8 {
+            let value = vec![generation];
+            engine
+                .memtable_manager
+                .insert_with_sequence(b"handoff-tie", &value, 7)
+                .unwrap();
+            let (point, scan) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(
+                    engine.get(b"handoff-tie"),
+                    engine.scan_prefix(b"handoff-tie")
+                )
+            })
+            .await
+            .expect("point read deadlocked with scan freeze");
+            assert_eq!(point.unwrap(), Some(value.clone()));
+            assert_eq!(
+                scan.unwrap(),
+                vec![(b"handoff-tie".to_vec(), value.clone())]
+            );
+            assert_eq!(engine.get(b"handoff-tie").await.unwrap(), Some(value));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_and_terminal_binary_prefixes_and_range_bounds_cross_sources() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), false))
+            .await
+            .unwrap();
+        for (key, value) in [
+            (b"".as_slice(), b"empty".as_slice()),
+            (&[0x00], b"zero"),
+            (&[0x7f], b"middle"),
+            (&[0xff], b"ff"),
+        ] {
+            engine.insert(key, value).await.unwrap();
+        }
+        engine.flush().await.unwrap();
+        engine.insert(&[0xff, 0x00], b"ff-zero").await.unwrap();
+        engine.insert(&[0xff, 0xff], b"ff-ff").await.unwrap();
+
+        assert_eq!(engine.scan_prefix(b"").await.unwrap().len(), 6);
+        assert_eq!(
+            engine.scan_prefix(&[0xff]).await.unwrap(),
+            vec![
+                (vec![0xff], b"ff".to_vec()),
+                (vec![0xff, 0x00], b"ff-zero".to_vec()),
+                (vec![0xff, 0xff], b"ff-ff".to_vec()),
+            ]
+        );
+        assert_eq!(
+            engine.scan_prefix(&[0xff, 0xff]).await.unwrap(),
+            vec![(vec![0xff, 0xff], b"ff-ff".to_vec())]
+        );
+        assert_eq!(
+            engine.range(&[0x00], &[0xff]).await.unwrap(),
+            vec![
+                (vec![0x00], b"zero".to_vec()),
+                (vec![0x7f], b"middle".to_vec()),
+            ]
+        );
+        assert!(engine.range(b"same", b"same").await.unwrap().is_empty());
+        assert!(engine.range(b"z", b"a").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn guard_values_are_lazy_and_scan_creation_records_its_freeze_cost() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), true))
+            .await
+            .unwrap();
+        engine.insert(b"lazy:key", b"large-value").await.unwrap();
+        assert_eq!(engine.memtable_manager.immutable_count(), 0);
+
+        let mut iterator = engine.range_iter(b"lazy:", b"lazy;").await.unwrap();
+        assert_eq!(engine.memtable_manager.immutable_count(), 1);
+        let guard = iterator.next().unwrap().unwrap();
+        assert!(!guard.value_loaded_for_test());
+        assert_eq!(guard.key(), b"lazy:key");
+        assert!(!guard.value_loaded_for_test());
+        assert_eq!(guard.value(), b"large-value");
+        assert!(guard.value_loaded_for_test());
+        assert!(iterator.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn large_stream_retains_only_source_heads_and_one_block_per_table() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.block_cache_size = 0;
+        config.sstable_config = SSTableConfig {
+            block_size: 1024,
+            compression: super::super::sstable::CompressionType::None,
+            ..SSTableConfig::default()
+        };
+        let engine = Engine::open(config).await.unwrap();
+        const KEYS: usize = 2_000;
+        const GENERATIONS: usize = 3;
+        for generation in 0..GENERATIONS {
+            for key in 0..KEYS {
+                engine
+                    .insert(
+                        format!("large:{key:05}").as_bytes(),
+                        format!("generation-{generation:02}-{:064}", key).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            engine.flush().await.unwrap();
+        }
+
+        let mut iterator = engine.range_iter(b"large:", b"large;").await.unwrap();
+        let mut count = 0;
+        while let Some(entry) = iterator.next() {
+            let key = entry.unwrap().into_key();
+            assert!(key.starts_with(b"large:"));
+            count += 1;
+            if count % 127 == 0 {
+                let (sources, heads, blocks, bytes) = iterator.working_set_for_test();
+                assert_eq!(sources, GENERATIONS);
+                assert!(heads <= sources);
+                assert!(blocks <= GENERATIONS);
+                assert!(bytes <= GENERATIONS * 2048);
+            }
+        }
+        assert_eq!(count, KEYS);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pinned_readers_survive_compaction_unlink_without_holding_the_live_list_lock() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.block_cache_size = 0;
+        config.compaction_config.l0_compaction_trigger = 2;
+        config.sstable_config = SSTableConfig {
+            block_size: 256,
+            compression: super::super::sstable::CompressionType::None,
+            ..SSTableConfig::default()
+        };
+        let engine = Engine::open(config).await.unwrap();
+        for generation in 0..2 {
+            for key in 0..200 {
+                engine
+                    .insert(
+                        format!("pin:{key:04}").as_bytes(),
+                        format!("value-{generation}-{key:04}").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            engine.flush().await.unwrap();
+        }
+        let input_paths: Vec<_> = engine
+            .sstables
+            .read()
+            .await
+            .iter()
+            .map(|table| table.path.clone())
+            .collect();
+        let iterator = engine.scan_prefix_iter(b"pin:").await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), engine.compact())
+            .await
+            .expect("iterator retained the global SSTable list lock")
+            .unwrap();
+        assert!(input_paths.iter().all(|path| !path.exists()));
+        let pairs = iterator.collect_pairs().unwrap();
+        assert_eq!(pairs.len(), 200);
+        assert!(pairs
+            .iter()
+            .all(|(_, value)| value.starts_with(b"value-1-")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn source_capture_never_falls_through_the_flush_handoff() {
+        let directory = TempDir::new().unwrap();
+        let engine = Arc::new(
+            Engine::open(isolated_config(directory.path(), true))
+                .await
+                .unwrap(),
+        );
+        for round in 0..12 {
+            for key in 0..64 {
+                engine
+                    .insert(
+                        format!("handoff:{round:02}:{key:02}").as_bytes(),
+                        b"visible",
+                    )
+                    .await
+                    .unwrap();
+            }
+            let flush_engine = Arc::clone(&engine);
+            let scan_engine = Arc::clone(&engine);
+            let prefix = format!("handoff:{round:02}:").into_bytes();
+            let (flush, scan) =
+                tokio::join!(async move { flush_engine.flush().await }, async move {
+                    scan_engine.scan_prefix(&prefix).await
+                });
+            flush.unwrap();
+            assert_eq!(scan.unwrap().len(), 64);
+        }
+    }
+
+    #[tokio::test]
+    async fn iterator_retains_sources_and_directory_ownership_after_engine_drop() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), false);
+        let engine = Engine::open(config.clone()).await.unwrap();
+        engine.insert(b"owned:key", b"value").await.unwrap();
+        engine.flush().await.unwrap();
+        let iterator = engine.scan_prefix_iter(b"owned:").await.unwrap();
+        drop(engine);
+
+        assert!(matches!(
+            Engine::open(config.clone()).await,
+            Err(StorageError::DirectoryLocked { .. })
+        ));
+        assert_eq!(
+            iterator.collect_pairs().unwrap(),
+            vec![(b"owned:key".to_vec(), b"value".to_vec())]
+        );
+        let reopened = Engine::open(config).await.unwrap();
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fast_batch_queued_behind_a_scan_freeze_is_seen_only_when_complete() {
+        let directory = TempDir::new().unwrap();
+        let engine = Arc::new(
+            Engine::open(isolated_config(directory.path(), false))
+                .await
+                .unwrap(),
+        );
+        let mutation = engine.mutation_barrier.write().await;
+        let batch_engine = Arc::clone(&engine);
+        let batch = tokio::spawn(async move {
+            let mut batch = WriteBatch::new();
+            batch.put(b"queued:a", b"one");
+            batch.put(b"queued:b", b"two");
+            batch_engine.write_batch(&batch).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if engine.batch_visibility.try_read().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fast batch did not acquire its publication gate");
+        let scan_engine = Arc::clone(&engine);
+        let scan = tokio::spawn(async move { scan_engine.scan_prefix(b"queued:").await });
+        drop(mutation);
+
+        batch.await.unwrap().unwrap();
+        assert_eq!(scan.await.unwrap().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn range_iterator_reports_a_late_block_error_once_then_fuses() {
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.block_cache_size = 0;
+        config.sstable_config = SSTableConfig {
+            block_size: 40,
+            compression: super::super::sstable::CompressionType::None,
+            ..SSTableConfig::default()
+        };
+        let engine = Engine::open(config).await.unwrap();
+        engine.insert(b"error:a", b"first-value").await.unwrap();
+        engine.insert(b"error:b", b"second-value").await.unwrap();
+        engine.flush().await.unwrap();
+        let mut iterator = engine.scan_prefix_iter(b"error:").await.unwrap();
+
+        let path = engine.sstables.read().await[0].path.clone();
+        let reader = SSTableReader::open(&path).unwrap();
+        assert!(reader.index().entries().len() >= 2);
+        let offset = reader.index().entries()[1].block_offset;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x80;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+
+        assert_eq!(
+            iterator.next().unwrap().unwrap().into_key(),
+            b"error:a".to_vec()
+        );
+        assert!(iterator.next().unwrap().is_err());
+        assert!(iterator.next().is_none());
+        assert!(iterator.next().is_none());
     }
 }

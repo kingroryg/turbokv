@@ -195,8 +195,8 @@ the corresponding clean-tree JSON evidence artifact.
 | `contains_key(key)` | Check if key exists |
 | `range(start, end)` | Scan keys in range [start, end) |
 | `scan_prefix(prefix)` | Scan all keys with prefix |
-| `range_iter(start, end)` | Range scan with guard-based value access |
-| `scan_prefix_iter(prefix)` | Prefix scan with guard-based value access |
+| `range_iter(start, end)` | Fallible streaming range scan with guard-based value access |
+| `scan_prefix_iter(prefix)` | Fallible streaming prefix scan with guard-based value access |
 | `write_batch(batch)` | Batch write operations |
 | `flush()` | Flush memtable to disk |
 | `compact()` | Trigger manual compaction |
