@@ -1,12 +1,14 @@
 //! Executable production contracts exercised through TurboKV's public API.
 
-use std::process::Command;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 use turbokv::{Db, DbError, DbOptions, WriteBatch};
 
 const CRASH_WRITER_PATH: &str = "TURBOKV_CONTRACT_CRASH_WRITER_PATH";
 const CRASH_WRITER_MODE: &str = "TURBOKV_CONTRACT_CRASH_WRITER_MODE";
+const CRASH_WRITER_READY: &str = "TURBOKV_CONTRACT_CRASH_WRITER_READY";
 
 fn durability_modes() -> [(&'static str, DbOptions); 3] {
     [
@@ -225,18 +227,50 @@ async fn wal_modes_recover_after_writer_process_exits_without_destructors() {
         ("paranoid", DbOptions::paranoid()),
     ] {
         let database_path = temp.path().join(mode);
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut child = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("crash_writer_process")
             .arg("--nocapture")
             .env(CRASH_WRITER_PATH, &database_path)
             .env(CRASH_WRITER_MODE, mode)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut ready = false;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes_read = reader.read_line(&mut line).unwrap();
+            if bytes_read == 0 {
+                break;
+            }
+            if line.contains(CRASH_WRITER_READY) {
+                ready = true;
+                break;
+            }
+        }
+
+        if !ready {
+            let status = child.wait().unwrap();
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("{mode}: crash writer exited before readiness ({status}): {stderr}");
+        }
+
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
         assert!(
-            output.status.success(),
-            "{mode}: crash writer failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            !status.success(),
+            "{mode}: crash writer must be terminated by the parent"
         );
 
         let recovered = Db::open_with_options(&database_path, options)
@@ -290,8 +324,13 @@ fn crash_writer_process() {
         batch.delete(b"wal:deleted");
         db.write_batch(&batch).await.unwrap();
 
-        // Terminate without dropping Db, the runtime, the WAL, or any other
-        // Rust value. The parent reopens the database and verifies recovery.
-        std::process::exit(0);
+        println!("{CRASH_WRITER_READY}");
+        std::io::stdout().flush().unwrap();
+
+        // Wait for the parent to terminate the process. No Db, runtime, WAL, or
+        // other Rust value gets a graceful drop before recovery is verified.
+        loop {
+            std::thread::park();
+        }
     });
 }

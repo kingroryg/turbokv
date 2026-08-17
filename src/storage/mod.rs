@@ -14,6 +14,8 @@ pub mod compaction;
 pub mod db;
 pub mod direct_io;
 pub mod engine;
+#[cfg(test)]
+mod failpoints;
 pub mod fd;
 pub mod iter;
 pub mod manifest;

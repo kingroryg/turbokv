@@ -109,6 +109,8 @@ pub struct StorageConfig {
     pub max_l0_files_before_stall: u64,
     /// Controlled stall duration when thresholds are exceeded
     pub write_stall_micros: u64,
+    #[cfg(test)]
+    pub(crate) background_tasks_enabled: bool,
 }
 
 impl Default for StorageConfig {
@@ -127,6 +129,8 @@ impl Default for StorageConfig {
             max_immutable_memtables_before_stall: 8,
             max_l0_files_before_stall: 24,
             write_stall_micros: 250,
+            #[cfg(test)]
+            background_tasks_enabled: true,
         }
     }
 }
@@ -335,7 +339,12 @@ impl Engine {
         };
 
         // Start background tasks
+        #[cfg(not(test))]
         engine.start_background_tasks();
+        #[cfg(test)]
+        if engine.config.background_tasks_enabled {
+            engine.start_background_tasks();
+        }
 
         Ok(engine)
     }
@@ -351,6 +360,11 @@ impl Engine {
         if let Some(ref wal) = self.wal {
             // Durable path: WAL write then memtable
             wal.append(key, value).await?;
+            #[cfg(test)]
+            super::failpoints::check(
+                &self.config.data_dir,
+                super::failpoints::PersistenceBoundary::Wal,
+            )?;
             self.wal_bytes_written
                 .fetch_add(wal_data_entry_size(key, value), Ordering::Relaxed);
             self.memtable_manager
@@ -380,6 +394,11 @@ impl Engine {
                 .map(|(key, value)| (key.as_slice(), Some(value.as_slice())))
                 .collect();
             wal.append_batch(&wal_entries).await?;
+            #[cfg(test)]
+            super::failpoints::check(
+                &self.config.data_dir,
+                super::failpoints::PersistenceBoundary::Wal,
+            )?;
             let wal_bytes = entries
                 .iter()
                 .map(|(key, value)| wal_data_entry_size(key, value))
@@ -413,6 +432,11 @@ impl Engine {
         // Write to WAL first (if enabled)
         if let Some(ref wal) = self.wal {
             wal.append_delete(key).await?;
+            #[cfg(test)]
+            super::failpoints::check(
+                &self.config.data_dir,
+                super::failpoints::PersistenceBoundary::Wal,
+            )?;
             self.wal_bytes_written
                 .fetch_add(wal_delete_entry_size(key), Ordering::Relaxed);
         }
@@ -569,6 +593,11 @@ impl Engine {
         // Write to WAL (if enabled)
         if let Some(ref wal) = self.wal {
             wal.append_batch(&ops).await?;
+            #[cfg(test)]
+            super::failpoints::check(
+                &self.config.data_dir,
+                super::failpoints::PersistenceBoundary::Wal,
+            )?;
             let wal_bytes = batch
                 .ops()
                 .iter()
@@ -606,6 +635,11 @@ impl Engine {
         self.memtable_manager
             .force_rotate()
             .map_err(StorageError::MemTable)?;
+        #[cfg(test)]
+        super::failpoints::check(
+            &self.config.data_dir,
+            super::failpoints::PersistenceBoundary::MemtableFreeze,
+        )?;
 
         // Flush all immutable memtables
         while let Some(memtable) = self.memtable_manager.get_immutable_for_flush() {
@@ -881,6 +915,11 @@ impl Engine {
 
         // Set the proper id (writer returns id: 0 as placeholder)
         info.id = id;
+        #[cfg(test)]
+        super::failpoints::check(
+            &self.config.data_dir,
+            super::failpoints::PersistenceBoundary::SstablePublication,
+        )?;
 
         // Update manifest
         {
@@ -902,6 +941,11 @@ impl Engine {
                 .save(&self.config.data_dir)
                 .map_err(|e| StorageError::Manifest(e.to_string()))?;
         }
+        #[cfg(test)]
+        super::failpoints::check(
+            &self.config.data_dir,
+            super::failpoints::PersistenceBoundary::ManifestInstallation,
+        )?;
 
         // Add to SSTable list
         self.sstables.write().await.push(info.clone());
@@ -917,6 +961,12 @@ impl Engine {
             .fetch_add(info.file_size, Ordering::Relaxed);
 
         info!("Flushed memtable to SSTable: {:?}", path);
+
+        #[cfg(test)]
+        super::failpoints::check(
+            &self.config.data_dir,
+            super::failpoints::PersistenceBoundary::Checkpoint,
+        )?;
 
         // Truncate old WAL files
         if let Some(ref wal) = self.wal {
@@ -944,6 +994,11 @@ impl Engine {
             .compactor
             .execute(job)
             .map_err(|e| StorageError::Compaction(e.to_string()))?;
+        #[cfg(test)]
+        super::failpoints::check(
+            &self.config.data_dir,
+            super::failpoints::PersistenceBoundary::Compaction,
+        )?;
 
         // Update SSTable list
         let mut sstables = self.sstables.write().await;
@@ -1182,6 +1237,11 @@ impl BackgroundEngine {
 
         // Set the proper id (writer returns id: 0 as placeholder)
         info.id = id;
+        #[cfg(test)]
+        super::failpoints::check(
+            &self.config.data_dir,
+            super::failpoints::PersistenceBoundary::SstablePublication,
+        )?;
 
         {
             let mut manifest = self.manifest.lock();
@@ -1202,6 +1262,11 @@ impl BackgroundEngine {
                 .save(&self.config.data_dir)
                 .map_err(|e| StorageError::Manifest(e.to_string()))?;
         }
+        #[cfg(test)]
+        super::failpoints::check(
+            &self.config.data_dir,
+            super::failpoints::PersistenceBoundary::ManifestInstallation,
+        )?;
 
         self.sstables.write().await.push(info.clone());
 
@@ -1216,6 +1281,12 @@ impl BackgroundEngine {
             .fetch_add(info.file_size, Ordering::Relaxed);
 
         info!("Background flushed memtable to SSTable: {:?}", path);
+
+        #[cfg(test)]
+        super::failpoints::check(
+            &self.config.data_dir,
+            super::failpoints::PersistenceBoundary::Checkpoint,
+        )?;
 
         // Truncate old WAL files
         if let Some(ref wal) = self.wal {
@@ -1241,6 +1312,11 @@ impl BackgroundEngine {
             .compactor
             .execute(job)
             .map_err(|e| StorageError::Compaction(e.to_string()))?;
+        #[cfg(test)]
+        super::failpoints::check(
+            &self.config.data_dir,
+            super::failpoints::PersistenceBoundary::Compaction,
+        )?;
 
         let mut sstables = self.sstables.write().await;
         sstables.retain(|sst| !input_ids.contains(&sst.id));
