@@ -330,11 +330,11 @@
 //! Run benchmarks:
 //!
 //! ```bash
-//! # Quick comparison (TurboKV vs RocksDB vs fjall)
-//! cargo bench --bench large_scale_bench
+//! # Bounded TurboKV/fjall protocol smoke run
+//! cargo bench --bench benchmarks -- --profile quick
 //!
-//! # Detailed statistical analysis
-//! cargo bench --bench kv_benchmarks
+//! # Release-scale runs require an explicit large-workload confirmation
+//! cargo bench --bench benchmarks -- --profile release --confirm-release
 //! ```
 //!
 //! Profile with:
