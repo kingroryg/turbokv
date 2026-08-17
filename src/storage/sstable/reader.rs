@@ -12,7 +12,7 @@ use bytes::Bytes;
 use memmap2::{Mmap, MmapOptions};
 
 use super::super::cache::{BlockCache, CacheKey};
-use super::types::SSTABLE_VERSION_V1;
+use super::types::{SSTABLE_VERSION_V1, SSTABLE_VERSION_V2};
 use super::{
     decompress_block, BloomFilter, CompressionType, SSTableIterator, FOOTER_SIZE, SSTABLE_MAGIC,
     SSTABLE_VERSION,
@@ -51,6 +51,23 @@ pub(crate) struct BlockInfo {
 pub(crate) enum SSTableValue {
     Value(Bytes),
     Tombstone,
+}
+
+impl SSTableValue {
+    pub(crate) fn into_option(self) -> Option<Bytes> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Tombstone => None,
+        }
+    }
+}
+
+/// A persisted value state and its engine-wide mutation sequence.
+#[derive(Debug, Clone)]
+pub(crate) struct SSTableEntry {
+    /// Legacy v1/v2 tables do not contain per-entry sequence numbers.
+    pub(crate) sequence: Option<u64>,
+    pub(crate) value: SSTableValue,
 }
 
 impl SSTableReader {
@@ -94,7 +111,10 @@ impl SSTableReader {
         }
 
         let version = cursor.read_u32::<LittleEndian>()?;
-        if version != SSTABLE_VERSION && version != SSTABLE_VERSION_V1 {
+        if version != SSTABLE_VERSION
+            && version != SSTABLE_VERSION_V2
+            && version != SSTABLE_VERSION_V1
+        {
             return Err(Error::SSTable {
                 message: format!("Unsupported SSTable version: {}", version),
                 source: None,
@@ -185,13 +205,20 @@ impl SSTableReader {
     /// Get value by key
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         Ok(match self.get_entry(key)? {
-            Some(SSTableValue::Value(value)) => Some(value),
-            Some(SSTableValue::Tombstone) | None => None,
+            Some(SSTableEntry {
+                value: SSTableValue::Value(value),
+                ..
+            }) => Some(value),
+            Some(SSTableEntry {
+                value: SSTableValue::Tombstone,
+                ..
+            })
+            | None => None,
         })
     }
 
     /// Get raw SSTable entry by key, preserving tombstones.
-    pub(crate) fn get_entry(&self, key: &[u8]) -> Result<Option<SSTableValue>> {
+    pub(crate) fn get_entry(&self, key: &[u8]) -> Result<Option<SSTableEntry>> {
         // Check bloom filter first
         if let Some(ref bloom) = self.bloom_filter {
             if !bloom.contains(key) {
@@ -267,7 +294,7 @@ impl SSTableReader {
         &self,
         block_data: &[u8],
         target_key: &[u8],
-    ) -> Result<Option<SSTableValue>> {
+    ) -> Result<Option<SSTableEntry>> {
         let mut cursor = Cursor::new(block_data);
 
         // First, read the footer to get entry count and offsets
@@ -305,7 +332,7 @@ impl SSTableReader {
             match key.as_slice().cmp(target_key) {
                 std::cmp::Ordering::Equal => {
                     // Found it, read value
-                    return self.read_value(&mut cursor).map(Some);
+                    return self.read_entry_value(&mut cursor).map(Some);
                 }
                 std::cmp::Ordering::Less => left = mid + 1,
                 std::cmp::Ordering::Greater => right = mid,
@@ -315,17 +342,26 @@ impl SSTableReader {
         Ok(None)
     }
 
-    pub(crate) fn read_value(&self, cursor: &mut Cursor<&[u8]>) -> Result<SSTableValue> {
+    pub(crate) fn read_entry_value(&self, cursor: &mut Cursor<&[u8]>) -> Result<SSTableEntry> {
         if self.format_version == SSTABLE_VERSION_V1 {
             let value_len = cursor.read_u32::<LittleEndian>()? as usize;
             let mut value = vec![0u8; value_len];
             cursor.read_exact(&mut value)?;
-            return Ok(if value.is_empty() {
-                SSTableValue::Tombstone
-            } else {
-                SSTableValue::Value(Bytes::from(value))
+            return Ok(SSTableEntry {
+                sequence: None,
+                value: if value.is_empty() {
+                    SSTableValue::Tombstone
+                } else {
+                    SSTableValue::Value(Bytes::from(value))
+                },
             });
         }
+
+        let sequence = if self.format_version >= SSTABLE_VERSION {
+            Some(cursor.read_u64::<LittleEndian>()?)
+        } else {
+            None
+        };
 
         let marker = cursor.read_u8()?;
         let value_len = cursor.read_u32::<LittleEndian>()? as usize;
@@ -333,8 +369,14 @@ impl SSTableReader {
         cursor.read_exact(&mut value)?;
 
         match marker {
-            0 => Ok(SSTableValue::Tombstone),
-            1 => Ok(SSTableValue::Value(Bytes::from(value))),
+            0 => Ok(SSTableEntry {
+                sequence,
+                value: SSTableValue::Tombstone,
+            }),
+            1 => Ok(SSTableEntry {
+                sequence,
+                value: SSTableValue::Value(Bytes::from(value)),
+            }),
             other => Err(Error::SSTable {
                 message: format!("Invalid SSTable value marker: {}", other),
                 source: None,
@@ -429,5 +471,59 @@ impl SSTableIndex {
     /// Get all entries (for iterator)
     pub(crate) fn entries(&self) -> &[IndexEntry] {
         &self.entries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::sstable::{CompressionType, SSTableConfig, SSTableWriter};
+    use tempfile::TempDir;
+
+    fn uncompressed_config() -> SSTableConfig {
+        SSTableConfig {
+            compression: CompressionType::None,
+            ..SSTableConfig::default()
+        }
+    }
+
+    #[test]
+    fn current_format_round_trips_sequences_values_and_tombstones() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("versioned.sst");
+        let mut writer = SSTableWriter::new(&path, uncompressed_config()).unwrap();
+        writer.add_versioned(b"empty", Some(b""), 41).unwrap();
+        writer.add_versioned(b"removed", None, 42).unwrap();
+        let info = writer.finish().unwrap();
+
+        assert_eq!((info.min_sequence, info.max_sequence), (41, 42));
+        let reader = SSTableReader::open(path).unwrap();
+
+        let empty = reader.get_entry(b"empty").unwrap().unwrap();
+        assert_eq!(empty.sequence, Some(41));
+        assert!(matches!(empty.value, SSTableValue::Value(ref value) if value.is_empty()));
+
+        let removed = reader.get_entry(b"removed").unwrap().unwrap();
+        assert_eq!(removed.sequence, Some(42));
+        assert!(matches!(removed.value, SSTableValue::Tombstone));
+    }
+
+    #[test]
+    fn legacy_v2_tables_remain_readable_without_inventing_exact_sequences() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("legacy-v2.sst");
+        let mut writer = SSTableWriter::new_legacy_v2(&path, uncompressed_config()).unwrap();
+        writer.add(b"empty", Some(b"")).unwrap();
+        writer.add(b"removed", None).unwrap();
+        writer.finish().unwrap();
+
+        let reader = SSTableReader::open(path).unwrap();
+        let empty = reader.get_entry(b"empty").unwrap().unwrap();
+        assert_eq!(empty.sequence, None);
+        assert!(matches!(empty.value, SSTableValue::Value(ref value) if value.is_empty()));
+
+        let removed = reader.get_entry(b"removed").unwrap().unwrap();
+        assert_eq!(removed.sequence, None);
+        assert!(matches!(removed.value, SSTableValue::Tombstone));
     }
 }

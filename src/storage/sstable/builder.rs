@@ -20,9 +20,14 @@ impl BlockBuilder {
     }
 
     pub fn add(&mut self, key: &[u8], value: Option<&[u8]>) -> bool {
+        self.add_versioned(key, value, 0)
+    }
+
+    /// Add an entry using the current block format.
+    pub fn add_versioned(&mut self, key: &[u8], value: Option<&[u8]>, sequence: u64) -> bool {
         let value_len = value.map_or(0, <[u8]>::len);
-        // key_len + key + value_marker + value_len + value
-        let entry_size = 4 + key.len() + 1 + 4 + value_len;
+        // key_len + key + sequence + value_marker + value_len + value
+        let entry_size = 4 + key.len() + 8 + 1 + 4 + value_len;
 
         // Check if adding this entry would exceed max size
         // Always allow at least one entry
@@ -37,6 +42,9 @@ impl BlockBuilder {
         self.buffer.put_u32_le(key.len() as u32);
         self.buffer.put_slice(key);
 
+        // Preserve the engine-wide mutation order across flush and compaction.
+        self.buffer.put_u64_le(sequence);
+
         // Write value marker: 0 = tombstone, 1 = present value.
         self.buffer.put_u8(u8::from(value.is_some()));
 
@@ -49,6 +57,28 @@ impl BlockBuilder {
         // Update last key
         self.last_key = Some(Bytes::copy_from_slice(key));
 
+        true
+    }
+
+    /// Add an entry using the v2 layout, which predates per-entry sequences.
+    #[cfg(test)]
+    pub(crate) fn add_legacy_v2(&mut self, key: &[u8], value: Option<&[u8]>) -> bool {
+        let value_len = value.map_or(0, <[u8]>::len);
+        let entry_size = 4 + key.len() + 1 + 4 + value_len;
+
+        if !self.is_empty() && self.buffer.len() + entry_size > self.max_size {
+            return false;
+        }
+
+        self.offsets.push(self.buffer.len() as u32);
+        self.buffer.put_u32_le(key.len() as u32);
+        self.buffer.put_slice(key);
+        self.buffer.put_u8(u8::from(value.is_some()));
+        self.buffer.put_u32_le(value_len as u32);
+        if let Some(value) = value {
+            self.buffer.put_slice(value);
+        }
+        self.last_key = Some(Bytes::copy_from_slice(key));
         true
     }
 

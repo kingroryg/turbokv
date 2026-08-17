@@ -8,6 +8,8 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use bytes::Bytes;
 use tracing::info;
 
+#[cfg(test)]
+use super::types::SSTABLE_VERSION_V2;
 use super::{
     compress_block, BlockBuilder, BloomFilter, IndexBuilder, SSTableConfig, SSTableInfo,
     FOOTER_SIZE, SSTABLE_MAGIC, SSTABLE_VERSION,
@@ -26,11 +28,22 @@ pub struct SSTableWriter {
     file_offset: u64,
     min_key: Option<Bytes>,
     max_key: Option<Bytes>,
+    min_sequence: Option<u64>,
+    max_sequence: Option<u64>,
+    format_version: u32,
 }
 
 impl SSTableWriter {
     /// Create new SSTable writer
     pub fn new(path: impl AsRef<Path>, config: SSTableConfig) -> Result<Self> {
+        Self::new_with_format(path, config, SSTABLE_VERSION)
+    }
+
+    fn new_with_format(
+        path: impl AsRef<Path>,
+        config: SSTableConfig,
+        format_version: u32,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .create(true)
@@ -52,27 +65,48 @@ impl SSTableWriter {
             file_offset: 0,
             min_key: None,
             max_key: None,
+            min_sequence: None,
+            max_sequence: None,
+            format_version,
         })
+    }
+
+    /// Create a v2 table for on-disk compatibility tests.
+    #[cfg(test)]
+    pub(crate) fn new_legacy_v2(path: impl AsRef<Path>, config: SSTableConfig) -> Result<Self> {
+        Self::new_with_format(path, config, SSTABLE_VERSION_V2)
     }
 
     /// Add key-value pair (`None` represents a tombstone/deletion).
     pub fn add(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+        self.add_versioned(key, value, 0)
+    }
+
+    /// Add a key-value version with its engine-wide sequence number.
+    pub(crate) fn add_versioned(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        sequence: u64,
+    ) -> Result<()> {
         // Update min/max keys
         if self.min_key.is_none() {
             self.min_key = Some(Bytes::copy_from_slice(key));
         }
         self.max_key = Some(Bytes::copy_from_slice(key));
+        self.min_sequence = Some(self.min_sequence.map_or(sequence, |min| min.min(sequence)));
+        self.max_sequence = Some(self.max_sequence.map_or(sequence, |max| max.max(sequence)));
 
         // Add to bloom filter
         self.bloom_filter.insert(key);
 
         // Add to current block
-        if !self.current_block.add(key, value) {
+        if !self.add_to_current_block(key, value, sequence) {
             // Block is full, flush it
             self.flush_block()?;
 
             // Try again with new block
-            if !self.current_block.add(key, value) {
+            if !self.add_to_current_block(key, value, sequence) {
                 return Err(Error::SSTable {
                     message: "Entry too large for block".to_string(),
                     source: None,
@@ -82,6 +116,15 @@ impl SSTableWriter {
 
         self.entry_count += 1;
         Ok(())
+    }
+
+    fn add_to_current_block(&mut self, key: &[u8], value: Option<&[u8]>, sequence: u64) -> bool {
+        #[cfg(test)]
+        if self.format_version == SSTABLE_VERSION_V2 {
+            return self.current_block.add_legacy_v2(key, value);
+        }
+
+        self.current_block.add_versioned(key, value, sequence)
     }
 
     /// Flush current block to disk
@@ -155,7 +198,7 @@ impl SSTableWriter {
         self.writer.write_u64::<LittleEndian>(bloom_offset)?;
         self.writer.write_u32::<LittleEndian>(bloom_size)?;
         self.writer.write_all(SSTABLE_MAGIC)?;
-        self.writer.write_u32::<LittleEndian>(SSTABLE_VERSION)?;
+        self.writer.write_u32::<LittleEndian>(self.format_version)?;
 
         // Compute CRC32 over the footer fields (excluding the checksum itself)
         let mut footer_hasher = crc32fast::Hasher::new();
@@ -164,7 +207,7 @@ impl SSTableWriter {
         footer_hasher.update(&bloom_offset.to_le_bytes());
         footer_hasher.update(&bloom_size.to_le_bytes());
         footer_hasher.update(SSTABLE_MAGIC);
-        footer_hasher.update(&SSTABLE_VERSION.to_le_bytes());
+        footer_hasher.update(&self.format_version.to_le_bytes());
         let checksum = footer_hasher.finalize();
         self.writer.write_u32::<LittleEndian>(checksum)?;
 
@@ -191,6 +234,8 @@ impl SSTableWriter {
                 .unwrap_or_default()
                 .as_secs(),
             level: 0,
+            min_sequence: self.min_sequence.unwrap_or(0),
+            max_sequence: self.max_sequence.unwrap_or(0),
         })
     }
 

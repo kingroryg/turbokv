@@ -5,7 +5,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use byteorder::{LittleEndian, ReadBytesExt};
 use bytes::Bytes;
 
-use super::reader::SSTableValue;
+use super::reader::SSTableEntry;
 use super::SSTableReader;
 use crate::core::error::Result;
 
@@ -88,7 +88,7 @@ impl<'a> SSTableIterator<'a> {
     }
 
     /// Read next key-value pair from current block
-    fn read_next_entry(&mut self) -> Result<Option<(Bytes, Option<Bytes>)>> {
+    fn read_next_entry(&mut self) -> Result<Option<(Bytes, SSTableEntry)>> {
         if self.current_entry_idx >= self.current_block_entries.len() {
             return Ok(None);
         }
@@ -107,14 +107,30 @@ impl<'a> SSTableIterator<'a> {
         cursor.read_exact(&mut key)?;
 
         // Read value - no need to seek, we're already positioned after the key
-        let value = match self.reader.read_value(&mut cursor)? {
-            SSTableValue::Value(value) => Some(value),
-            SSTableValue::Tombstone => None,
-        };
+        let entry = self.reader.read_entry_value(&mut cursor)?;
 
         self.current_entry_idx += 1;
 
-        Ok(Some((Bytes::from(key), value)))
+        Ok(Some((Bytes::from(key), entry)))
+    }
+
+    /// Advance while preserving tombstones and sequence metadata.
+    pub(crate) fn next_versioned(&mut self) -> Option<Result<(Bytes, SSTableEntry)>> {
+        loop {
+            if self.current_block_data.is_some() {
+                match self.read_next_entry() {
+                    Ok(Some(entry)) => return Some(Ok(entry)),
+                    Ok(None) => self.current_block_data = None,
+                    Err(error) => return Some(Err(error)),
+                }
+            }
+
+            match self.load_next_block() {
+                Ok(true) => continue,
+                Ok(false) => return None,
+                Err(error) => return Some(Err(error)),
+            }
+        }
     }
 }
 
@@ -122,25 +138,7 @@ impl<'a> Iterator for SSTableIterator<'a> {
     type Item = Result<(Bytes, Option<Bytes>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            // Try to read from current block
-            if self.current_block_data.is_some() {
-                match self.read_next_entry() {
-                    Ok(Some(entry)) => return Some(Ok(entry)),
-                    Ok(None) => {
-                        // Current block exhausted, load next
-                        self.current_block_data = None;
-                    }
-                    Err(e) => return Some(Err(e)),
-                }
-            }
-
-            // Load next block
-            match self.load_next_block() {
-                Ok(true) => continue,
-                Ok(false) => return None,
-                Err(e) => return Some(Err(e)),
-            }
-        }
+        self.next_versioned()
+            .map(|entry| entry.map(|(key, entry)| (key, entry.value.into_option())))
     }
 }

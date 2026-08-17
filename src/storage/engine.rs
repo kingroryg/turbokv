@@ -235,6 +235,13 @@ impl Engine {
         let manifest = Manifest::load_or_create(&config.data_dir)
             .map_err(|e| StorageError::Manifest(e.to_string()))?;
         let wal_checkpoint = manifest.wal_checkpoint;
+        let persisted_next_sequence = manifest
+            .sstables
+            .iter()
+            .map(|sstable| sstable.max_sequence)
+            .max()
+            .map_or(0, |sequence| sequence.saturating_add(1))
+            .max(wal_checkpoint);
 
         let next_sstable_id = manifest.sstables.iter().map(|s| s.id).max().unwrap_or(0) + 1;
 
@@ -246,15 +253,21 @@ impl Engine {
 
         // Create WAL if enabled
         let wal = if config.wal_enabled {
-            Some(Arc::new(
-                WriteAheadLog::new(&wal_dir, config.wal_config.clone()).await?,
-            ))
+            let wal = Arc::new(WriteAheadLog::new(&wal_dir, config.wal_config.clone()).await?);
+            wal.ensure_next_sequence_at_least(persisted_next_sequence);
+            Some(wal)
         } else {
             None
         };
 
         // Create memtable manager
-        let memtable_manager = Arc::new(MemTableManager::new(config.memtable_config.clone()));
+        let next_sequence = wal
+            .as_ref()
+            .map_or(persisted_next_sequence, |wal| wal.current_sequence());
+        let memtable_manager = Arc::new(MemTableManager::new_with_next_sequence(
+            config.memtable_config.clone(),
+            next_sequence,
+        ));
 
         // Load SSTable info
         let sstables: Vec<SSTableInfo> = manifest
@@ -269,6 +282,8 @@ impl Engine {
                 max_key: entry.max_key.clone(),
                 creation_time: entry.creation_time,
                 level: entry.level,
+                min_sequence: entry.min_sequence,
+                max_sequence: entry.max_sequence,
             })
             .collect();
 
@@ -359,7 +374,7 @@ impl Engine {
 
         if let Some(ref wal) = self.wal {
             // Durable path: WAL write then memtable
-            wal.append(key, value).await?;
+            let sequence = wal.append(key, value).await?;
             #[cfg(test)]
             super::failpoints::check(
                 &self.config.data_dir,
@@ -368,7 +383,7 @@ impl Engine {
             self.wal_bytes_written
                 .fetch_add(wal_data_entry_size(key, value), Ordering::Relaxed);
             self.memtable_manager
-                .insert(key, value)
+                .insert_with_sequence(key, value, sequence)
                 .map_err(StorageError::MemTable)?;
         } else {
             // Fast path: thread-local buffered insert, no async overhead
@@ -393,7 +408,7 @@ impl Engine {
                 .iter()
                 .map(|(key, value)| (key.as_slice(), Some(value.as_slice())))
                 .collect();
-            wal.append_batch(&wal_entries).await?;
+            let sequences = wal.append_batch(&wal_entries).await?;
             #[cfg(test)]
             super::failpoints::check(
                 &self.config.data_dir,
@@ -405,11 +420,14 @@ impl Engine {
                 .sum();
             self.wal_bytes_written
                 .fetch_add(wal_bytes, Ordering::Relaxed);
+            self.memtable_manager
+                .insert_many_with_sequences(entries, &sequences)
+                .map_err(StorageError::MemTable)?;
+        } else {
+            self.memtable_manager
+                .insert_many(entries)
+                .map_err(StorageError::MemTable)?;
         }
-
-        self.memtable_manager
-            .insert_many(entries)
-            .map_err(StorageError::MemTable)?;
 
         Ok(())
     }
@@ -431,7 +449,7 @@ impl Engine {
 
         // Write to WAL first (if enabled)
         if let Some(ref wal) = self.wal {
-            wal.append_delete(key).await?;
+            let sequence = wal.append_delete(key).await?;
             #[cfg(test)]
             super::failpoints::check(
                 &self.config.data_dir,
@@ -439,12 +457,14 @@ impl Engine {
             )?;
             self.wal_bytes_written
                 .fetch_add(wal_delete_entry_size(key), Ordering::Relaxed);
+            self.memtable_manager
+                .delete_with_sequence(key, sequence)
+                .map_err(StorageError::MemTable)?;
+        } else {
+            self.memtable_manager
+                .delete(key)
+                .map_err(StorageError::MemTable)?;
         }
-
-        // Insert tombstone into memtable
-        self.memtable_manager
-            .delete(key)
-            .map_err(StorageError::MemTable)?;
 
         Ok(())
     }
@@ -458,27 +478,21 @@ impl Engine {
                 .map_err(StorageError::MemTable)?;
         }
 
-        // Check memtable first
-        if let Some(value) = self.memtable_manager.get(key) {
-            return Ok(Some(value));
-        }
+        let mut newest = self
+            .memtable_manager
+            .get_entry(key)
+            .map(VersionedValue::from_memtable);
 
-        // Check if memtable has a tombstone
-        if let Some(entry) = self.memtable_manager.get_entry(key) {
-            if entry.is_tombstone() {
-                return Ok(None);
-            }
-        }
-
-        // Search SSTables (newest to oldest)
+        // Resolve all physical copies by sequence; physical list order is not
+        // a version order after reopen or compaction.
         let sstables = self.sstables.read().await;
-        for sst in sstables.iter().rev() {
-            if let Some(value) = self.read_from_sstable(sst, key).await? {
-                return Ok(Some(value));
+        for sst in sstables.iter() {
+            if let Some(candidate) = self.read_from_sstable(sst, key).await? {
+                retain_newest(&mut newest, candidate);
             }
         }
 
-        Ok(None)
+        Ok(newest.and_then(|entry| entry.value))
     }
 
     /// Check if a key exists
@@ -497,27 +511,27 @@ impl Engine {
                 .map_err(StorageError::MemTable)?;
         }
 
-        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        let mut merged: BTreeMap<Vec<u8>, VersionedValue> = BTreeMap::new();
 
         // Get from SSTables first (older data)
         let sstables = self.sstables.read().await;
         for sst in sstables.iter() {
             let entries = self.range_from_sstable(sst, start, end).await?;
-            for (key, value) in entries {
-                merged.insert(key, value);
+            for (key, entry) in entries {
+                merge_versioned(&mut merged, key, entry);
             }
         }
         drop(sstables);
 
         // Get from memtable last (newer data overrides SSTables)
-        for (key, value) in self.memtable_manager.range(start, end) {
-            merged.insert(key, Some(value));
+        for (key, entry) in self.memtable_manager.range_entries(start, end) {
+            merge_versioned(&mut merged, key, VersionedValue::from_memtable(entry));
         }
 
         // Filter out tombstones
         Ok(merged
             .into_iter()
-            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .filter_map(|(key, entry)| entry.value.map(|value| (key, value)))
             .collect())
     }
 
@@ -532,27 +546,27 @@ impl Engine {
                 .map_err(StorageError::MemTable)?;
         }
 
-        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        let mut merged: BTreeMap<Vec<u8>, VersionedValue> = BTreeMap::new();
 
         // Get from SSTables first (older data)
         let sstables = self.sstables.read().await;
         for sst in sstables.iter() {
             let entries = self.prefix_from_sstable(sst, prefix).await?;
-            for (key, value) in entries {
-                merged.insert(key, value);
+            for (key, entry) in entries {
+                merge_versioned(&mut merged, key, entry);
             }
         }
         drop(sstables);
 
         // Get from memtable last (newer data overrides SSTables)
-        for (key, value) in self.memtable_manager.scan_prefix(prefix) {
-            merged.insert(key, Some(value));
+        for (key, entry) in self.memtable_manager.scan_prefix_entries(prefix) {
+            merge_versioned(&mut merged, key, VersionedValue::from_memtable(entry));
         }
 
         // Filter out tombstones
         Ok(merged
             .into_iter()
-            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .filter_map(|(key, entry)| entry.value.map(|value| (key, value)))
             .collect())
     }
 
@@ -591,8 +605,8 @@ impl Engine {
             .collect();
 
         // Write to WAL (if enabled)
-        if let Some(ref wal) = self.wal {
-            wal.append_batch(&ops).await?;
+        let wal_sequences = if let Some(ref wal) = self.wal {
+            let sequences = wal.append_batch(&ops).await?;
             #[cfg(test)]
             super::failpoints::check(
                 &self.config.data_dir,
@@ -608,20 +622,35 @@ impl Engine {
                 .sum();
             self.wal_bytes_written
                 .fetch_add(wal_bytes, Ordering::Relaxed);
-        }
+            Some(sequences)
+        } else {
+            None
+        };
 
         // Apply to memtable
-        for op in batch.ops() {
+        for (index, op) in batch.ops().iter().enumerate() {
             match op {
                 crate::core::BatchOp::Put { key, value } => {
-                    self.memtable_manager
-                        .insert(key, value)
-                        .map_err(StorageError::MemTable)?;
+                    if let Some(sequences) = wal_sequences.as_ref() {
+                        self.memtable_manager
+                            .insert_with_sequence(key, value, sequences[index])
+                            .map_err(StorageError::MemTable)?;
+                    } else {
+                        self.memtable_manager
+                            .insert(key, value)
+                            .map_err(StorageError::MemTable)?;
+                    }
                 }
                 crate::core::BatchOp::Delete { key } => {
-                    self.memtable_manager
-                        .delete(key)
-                        .map_err(StorageError::MemTable)?;
+                    if let Some(sequences) = wal_sequences.as_ref() {
+                        self.memtable_manager
+                            .delete_with_sequence(key, sequences[index])
+                            .map_err(StorageError::MemTable)?;
+                    } else {
+                        self.memtable_manager
+                            .delete(key)
+                            .map_err(StorageError::MemTable)?;
+                    }
                 }
             }
         }
@@ -670,8 +699,8 @@ impl Engine {
                 entry_count: sst.entry_count,
                 min_key: sst.min_key.clone(),
                 max_key: sst.max_key.clone(),
-                min_sequence: 0,
-                max_sequence: 0,
+                min_sequence: sst.min_sequence,
+                max_sequence: sst.max_sequence,
                 creation_time: sst.creation_time,
             })
             .collect();
@@ -765,12 +794,12 @@ impl Engine {
                 match value {
                     Some(v) => {
                         memtable_manager
-                            .insert(key, v)
+                            .insert_with_sequence(key, v, entry.sequence)
                             .map_err(StorageError::MemTable)?;
                     }
                     None => {
                         memtable_manager
-                            .delete(key)
+                            .delete_with_sequence(key, entry.sequence)
                             .map_err(StorageError::MemTable)?;
                     }
                 }
@@ -796,7 +825,11 @@ impl Engine {
     }
 
     /// Read a key from an SSTable
-    async fn read_from_sstable(&self, sst: &SSTableInfo, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    async fn read_from_sstable(
+        &self,
+        sst: &SSTableInfo,
+        key: &[u8],
+    ) -> Result<Option<VersionedValue>> {
         // Check bloom filter first (if available)
         // Then search the SSTable
 
@@ -806,8 +839,7 @@ impl Engine {
             .map_err(|e| StorageError::SSTable(e.to_string()))?;
 
         match reader.get_entry(key) {
-            Ok(Some(super::sstable::SSTableValue::Value(value))) => Ok(Some(value.to_vec())),
-            Ok(Some(super::sstable::SSTableValue::Tombstone)) => Ok(None),
+            Ok(Some(entry)) => Ok(Some(VersionedValue::from_sstable(entry, sst))),
             Ok(None) => Ok(None),
             Err(e) => Err(StorageError::SSTable(e.to_string())),
         }
@@ -819,7 +851,7 @@ impl Engine {
         sst: &SSTableInfo,
         start: &[u8],
         end: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+    ) -> Result<Vec<(Vec<u8>, VersionedValue)>> {
         // Skip SSTable if its key range doesn't overlap with query range
         if !sst.min_key.is_empty() && sst.min_key.as_slice() >= end {
             return Ok(Vec::new());
@@ -835,10 +867,11 @@ impl Engine {
 
         // Use iterator to scan range
         let mut results = Vec::new();
-        for entry in reader.iter() {
-            let (key, value) = entry.map_err(|e| StorageError::SSTable(e.to_string()))?;
+        let mut iterator = reader.iter();
+        while let Some(entry) = iterator.next_versioned() {
+            let (key, entry) = entry.map_err(|e| StorageError::SSTable(e.to_string()))?;
             if key.as_ref() >= start && key.as_ref() < end {
-                results.push((key.to_vec(), value.map(|v| v.to_vec())));
+                results.push((key.to_vec(), VersionedValue::from_sstable(entry, sst)));
             } else if key.as_ref() >= end {
                 break;
             }
@@ -851,7 +884,7 @@ impl Engine {
         &self,
         sst: &SSTableInfo,
         prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+    ) -> Result<Vec<(Vec<u8>, VersionedValue)>> {
         // Skip SSTable if all its keys are before the prefix range
         if !sst.max_key.is_empty() && sst.max_key.as_slice() < prefix {
             return Ok(Vec::new());
@@ -864,10 +897,11 @@ impl Engine {
 
         // Use iterator to scan prefix
         let mut results = Vec::new();
-        for entry in reader.iter() {
-            let (key, value) = entry.map_err(|e| StorageError::SSTable(e.to_string()))?;
+        let mut iterator = reader.iter();
+        while let Some(entry) = iterator.next_versioned() {
+            let (key, entry) = entry.map_err(|e| StorageError::SSTable(e.to_string()))?;
             if key.starts_with(prefix) {
-                results.push((key.to_vec(), value.map(|v| v.to_vec())));
+                results.push((key.to_vec(), VersionedValue::from_sstable(entry, sst)));
             } else if key.as_ref() > prefix && !key.starts_with(prefix) {
                 // Past the prefix range, can stop
                 break;
@@ -895,7 +929,7 @@ impl Engine {
         let flush_checkpoint = self.wal.as_ref().map(|w| w.current_sequence()).unwrap_or(0);
 
         // Get all entries from memtable
-        let entries = memtable.get_all_kv();
+        let entries = memtable.get_all_entries();
 
         // Write SSTable
         let mut writer =
@@ -903,9 +937,9 @@ impl Engine {
                 StorageError::SSTable(format!("Failed to create SSTable writer: {}", e))
             })?;
 
-        for (key, value) in &entries {
+        for (key, entry) in &entries {
             writer
-                .add(&key, value.as_deref())
+                .add_versioned(&key, entry.value.as_deref(), entry.sequence)
                 .map_err(|e| StorageError::SSTable(format!("Failed to write entry: {}", e)))?;
         }
 
@@ -931,8 +965,8 @@ impl Engine {
                 entry_count: info.entry_count,
                 min_key: info.min_key.clone(),
                 max_key: info.max_key.clone(),
-                min_sequence: 0, // Sequence tracking handled by WAL
-                max_sequence: self.memtable_manager.current_sequence(),
+                min_sequence: info.min_sequence,
+                max_sequence: info.max_sequence,
                 creation_time: info.creation_time,
                 level: 0,
             });
@@ -1027,6 +1061,8 @@ impl Engine {
                 min_key: output.min_key.clone(),
                 max_key: output.max_key.clone(),
                 creation_time: output.creation_time,
+                min_sequence: output.min_sequence,
+                max_sequence: output.max_sequence,
             });
 
             // Update atomic counters: add new SSTable
@@ -1181,8 +1217,8 @@ impl BackgroundEngine {
                 entry_count: sst.entry_count,
                 min_key: sst.min_key.clone(),
                 max_key: sst.max_key.clone(),
-                min_sequence: 0,
-                max_sequence: 0,
+                min_sequence: sst.min_sequence,
+                max_sequence: sst.max_sequence,
                 creation_time: sst.creation_time,
             })
             .collect();
@@ -1218,16 +1254,16 @@ impl BackgroundEngine {
         // Snapshot WAL sequence before flush (not live counter which advances during flush)
         let flush_checkpoint = self.wal.as_ref().map(|w| w.current_sequence()).unwrap_or(0);
 
-        let entries = memtable.get_all_kv();
+        let entries = memtable.get_all_entries();
 
         let mut writer =
             SSTableWriter::new(&path, self.config.sstable_config.clone()).map_err(|e| {
                 StorageError::SSTable(format!("Failed to create SSTable writer: {}", e))
             })?;
 
-        for (key, value) in &entries {
+        for (key, entry) in &entries {
             writer
-                .add(&key, value.as_deref())
+                .add_versioned(&key, entry.value.as_deref(), entry.sequence)
                 .map_err(|e| StorageError::SSTable(format!("Failed to write entry: {}", e)))?;
         }
 
@@ -1252,8 +1288,8 @@ impl BackgroundEngine {
                 entry_count: info.entry_count,
                 min_key: info.min_key.clone(),
                 max_key: info.max_key.clone(),
-                min_sequence: 0,
-                max_sequence: self.memtable_manager.current_sequence(),
+                min_sequence: info.min_sequence,
+                max_sequence: info.max_sequence,
                 creation_time: info.creation_time,
                 level: 0,
             });
@@ -1341,6 +1377,8 @@ impl BackgroundEngine {
                 min_key: output.min_key.clone(),
                 max_key: output.max_key.clone(),
                 creation_time: output.creation_time,
+                min_sequence: output.min_sequence,
+                max_sequence: output.max_sequence,
             });
 
             // Update atomic counters: add new SSTable
@@ -1380,6 +1418,82 @@ impl BackgroundEngine {
     }
 }
 
+/// A present value or tombstone that remains distinct from a missing key until
+/// the newest physical version has been selected.
+struct VersionedValue {
+    sequence: u64,
+    source: VersionSource,
+    value: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum VersionSource {
+    /// Exact per-entry ordering is unavailable; table id orders generations.
+    Legacy(u64),
+    /// Table id deterministically breaks ties between exact sequences.
+    Versioned(u64),
+    /// A replayed copy at the same sequence supersedes its persisted copy.
+    Memory,
+}
+
+impl VersionedValue {
+    fn from_memtable(entry: super::memtable::MemTableEntry) -> Self {
+        Self {
+            sequence: entry.sequence,
+            source: VersionSource::Memory,
+            value: entry.value,
+        }
+    }
+
+    fn from_sstable(entry: super::sstable::SSTableEntry, table: &SSTableInfo) -> Self {
+        let value = entry.value.into_option().map(|value| value.to_vec());
+        let (sequence, source) = entry
+            .sequence
+            .map_or((0, VersionSource::Legacy(table.id)), |sequence| {
+                (sequence, VersionSource::Versioned(table.id))
+            });
+        Self {
+            sequence,
+            source,
+            value,
+        }
+    }
+
+    fn is_newer_than(&self, other: &Self) -> bool {
+        (self.sequence, self.source) > (other.sequence, other.source)
+    }
+}
+
+fn retain_newest(current: &mut Option<VersionedValue>, candidate: VersionedValue) {
+    if current
+        .as_ref()
+        .map_or(true, |entry| candidate.is_newer_than(entry))
+    {
+        *current = Some(candidate);
+    }
+}
+
+fn retain_newest_entry(current: &mut VersionedValue, candidate: VersionedValue) {
+    if candidate.is_newer_than(current) {
+        *current = candidate;
+    }
+}
+
+fn merge_versioned(
+    merged: &mut std::collections::BTreeMap<Vec<u8>, VersionedValue>,
+    key: Vec<u8>,
+    candidate: VersionedValue,
+) {
+    use std::collections::btree_map::Entry;
+
+    match merged.entry(key) {
+        Entry::Vacant(entry) => {
+            entry.insert(candidate);
+        }
+        Entry::Occupied(mut entry) => retain_newest_entry(entry.get_mut(), candidate),
+    }
+}
+
 struct InProgressGuard {
     counter: Arc<AtomicU64>,
 }
@@ -1411,6 +1525,48 @@ fn wal_delete_entry_size(key: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn isolated_config(path: &std::path::Path, wal_enabled: bool) -> StorageConfig {
+        StorageConfig {
+            data_dir: path.to_path_buf(),
+            wal_enabled,
+            background_tasks_enabled: false,
+            ..Default::default()
+        }
+    }
+
+    async fn assert_scope_key_absent(engine: &Engine) {
+        assert_eq!(engine.get(b"scope:key").await.unwrap(), None);
+        assert!(engine.range(b"scope:", b"scope;").await.unwrap().is_empty());
+        assert!(engine.scan_prefix(b"scope:").await.unwrap().is_empty());
+    }
+
+    fn write_legacy_table(
+        path: &std::path::Path,
+        id: u64,
+        value: Option<&[u8]>,
+        manifest_max_sequence: u64,
+    ) -> SSTableManifestEntry {
+        let config = SSTableConfig {
+            compression: super::super::sstable::CompressionType::None,
+            ..SSTableConfig::default()
+        };
+        let mut writer = SSTableWriter::new_legacy_v2(path, config).unwrap();
+        writer.add(b"scope:key", value).unwrap();
+        let info = writer.finish().unwrap();
+        SSTableManifestEntry {
+            id,
+            level: 0,
+            path: info.path,
+            size: info.file_size,
+            entry_count: info.entry_count,
+            min_key: info.min_key,
+            max_key: info.max_key,
+            min_sequence: 0,
+            max_sequence: manifest_max_sequence,
+            creation_time: id,
+        }
+    }
 
     #[test]
     fn in_progress_guard_tracks_scope_and_drop() {
@@ -1489,6 +1645,121 @@ mod tests {
         assert_eq!(stats.write_stall_count, 1);
         assert_eq!(stats.write_stall_micros, 1);
 
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tombstone_wins_across_sstable_generations_reopen_and_compaction() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), false);
+        let engine = Engine::open(config.clone()).await.unwrap();
+
+        engine.insert(b"scope:key", b"old").await.unwrap();
+        engine.flush_write_buffers().unwrap();
+        engine.flush().await.unwrap();
+
+        engine.delete(b"scope:key").await.unwrap();
+        assert_scope_key_absent(&engine).await;
+        engine.flush().await.unwrap();
+
+        for generation in 0..2 {
+            let key = format!("unrelated:{generation}");
+            engine.insert(key.as_bytes(), b"value").await.unwrap();
+            engine.flush_write_buffers().unwrap();
+            engine.flush().await.unwrap();
+        }
+        assert_eq!(engine.sstables.read().await.len(), 4);
+        assert_scope_key_absent(&engine).await;
+
+        engine.compact().await.unwrap();
+        assert_eq!(engine.sstables.read().await.len(), 1);
+        assert_scope_key_absent(&engine).await;
+        let next_before_reopen = engine.memtable_manager.current_sequence();
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_scope_key_absent(&reopened).await;
+        assert!(reopened.memtable_manager.current_sequence() >= next_before_reopen);
+
+        let new_sequence = reopened.memtable_manager.current_sequence();
+        reopened.insert(b"scope:key", b"new").await.unwrap();
+        reopened.flush_write_buffers().unwrap();
+        assert_eq!(
+            reopened
+                .memtable_manager
+                .get_entry(b"scope:key")
+                .unwrap()
+                .sequence,
+            new_sequence
+        );
+        assert_eq!(
+            reopened.get(b"scope:key").await.unwrap(),
+            Some(b"new".to_vec())
+        );
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wal_replay_preserves_original_mutation_sequence() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), true);
+        let engine = Engine::open(config.clone()).await.unwrap();
+
+        engine.insert(b"replay:key", b"value").await.unwrap();
+        engine.delete(b"replay:key").await.unwrap();
+        let tombstone_sequence = engine
+            .memtable_manager
+            .get_entry(b"replay:key")
+            .unwrap()
+            .sequence;
+        engine.wal.as_ref().unwrap().flush().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        let replayed = reopened.memtable_manager.get_entry(b"replay:key").unwrap();
+        assert_eq!(replayed.sequence, tombstone_sequence);
+        assert!(replayed.is_tombstone());
+        assert!(reopened.memtable_manager.current_sequence() > tombstone_sequence);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_generations_use_table_order_until_versioned_writes_begin() {
+        let directory = TempDir::new().unwrap();
+        let sstable_directory = directory.path().join("sstables");
+        std::fs::create_dir_all(&sstable_directory).unwrap();
+
+        let old_value =
+            write_legacy_table(&sstable_directory.join("old.sst"), 1, Some(b"old"), 100);
+        // Older versions reset sequences per memtable, so this newer table can
+        // legitimately have a lower manifest maximum.
+        let newer_tombstone = write_legacy_table(&sstable_directory.join("new.sst"), 2, None, 0);
+        let mut manifest = Manifest::new();
+        manifest.sstables = vec![old_value, newer_tombstone];
+        manifest.save(directory.path()).unwrap();
+
+        let engine = Engine::open(isolated_config(directory.path(), false))
+            .await
+            .unwrap();
+        assert_scope_key_absent(&engine).await;
+
+        let expected_sequence = engine.memtable_manager.current_sequence();
+        assert_eq!(expected_sequence, 101);
+        engine.insert(b"scope:key", b"upgraded").await.unwrap();
+        engine.flush_write_buffers().unwrap();
+        assert_eq!(
+            engine
+                .memtable_manager
+                .get_entry(b"scope:key")
+                .unwrap()
+                .sequence,
+            expected_sequence
+        );
+        assert_eq!(
+            engine.get(b"scope:key").await.unwrap(),
+            Some(b"upgraded".to_vec())
+        );
         engine.shutdown().await.unwrap();
     }
 }

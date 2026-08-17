@@ -27,12 +27,19 @@ use super::types::{MemTableConfig, MemTableEntry, MemTableManagerStats};
 
 /// Thread-local write buffer size (number of entries before flush to main memtable)
 const THREAD_LOCAL_BUFFER_SIZE: usize = 64;
+/// Shared key-lock stripes keep same-key conditional updates atomic without
+/// serializing independent writes or allocating one lock per key.
+const MUTATION_LOCK_STRIPES: usize = 65_536;
 
 /// Global counter for assigning unique manager IDs
 static MANAGER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Type alias for buffer entries: (key, value)
-type BufferEntry = (Vec<u8>, Vec<u8>);
+/// A buffered insert with the sequence assigned when the mutation was issued.
+struct BufferEntry {
+    key: Vec<u8>,
+    value: Vec<u8>,
+    sequence: u64,
+}
 
 /// Registry key: (thread ID, manager ID)
 type RegistryKey = (ThreadId, u64);
@@ -45,6 +52,9 @@ type BufferRegistry = Mutex<HashMap<RegistryKey, Arc<Mutex<Vec<BufferEntry>>>>>;
 static BUFFER_REGISTRY: std::sync::LazyLock<BufferRegistry> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+static MUTATION_LOCKS: std::sync::LazyLock<Box<[Mutex<()>]>> =
+    std::sync::LazyLock::new(|| (0..MUTATION_LOCK_STRIPES).map(|_| Mutex::new(())).collect());
+
 /// Manages active and immutable memtables
 pub struct MemTableManager {
     /// Unique identifier for this manager (used for buffer registry)
@@ -55,11 +65,18 @@ pub struct MemTableManager {
     pub immutable: Arc<RwLock<Vec<Arc<MemTable>>>>,
     /// Configuration for new memtables
     config: MemTableConfig,
+    /// Next engine-wide mutation sequence.
+    next_sequence: AtomicU64,
 }
 
 impl MemTableManager {
     /// Create a new MemTableManager
     pub fn new(config: MemTableConfig) -> Self {
+        Self::new_with_next_sequence(config, 0)
+    }
+
+    /// Create a manager whose next mutation receives `next_sequence`.
+    pub(crate) fn new_with_next_sequence(config: MemTableConfig, next_sequence: u64) -> Self {
         let active = Arc::new(MemTable::new(config.clone()));
         let id = MANAGER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
@@ -68,6 +85,7 @@ impl MemTableManager {
             active: Arc::new(RwLock::new(active)),
             immutable: Arc::new(RwLock::new(Vec::new())),
             config,
+            next_sequence: AtomicU64::new(next_sequence),
         }
     }
 
@@ -85,10 +103,24 @@ impl MemTableManager {
     ///
     /// Automatically rotates the memtable if full.
     pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<u64> {
+        let sequence = self.allocate_sequence();
+        self.insert_with_sequence(key, value, sequence)?;
+        Ok(sequence)
+    }
+
+    /// Apply an insert using a sequence assigned by the engine or WAL.
+    pub(crate) fn insert_with_sequence(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        sequence: u64,
+    ) -> Result<()> {
+        self.observe_sequence(sequence);
+        let _mutation = self.lock_key(key);
         for _ in 0..5 {
             let active = self.active.read();
-            match active.insert(key, value) {
-                Ok(seq) => return Ok(seq),
+            match active.insert_with_sequence(key, value, sequence) {
+                Ok(()) => return Ok(()),
                 Err(MemTableError::Full) => {
                     drop(active);
                     self.rotate_memtable()?;
@@ -108,9 +140,14 @@ impl MemTableManager {
     /// ~25-35% faster than `insert()` by reducing lock acquisitions.
     #[inline]
     pub fn insert_buffered(&self, key: &[u8], value: &[u8]) -> Result<u64> {
+        let sequence = self.allocate_sequence();
         let buffer = self.get_buffer();
         let mut buf = buffer.lock();
-        buf.push((key.to_vec(), value.to_vec()));
+        buf.push(BufferEntry {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            sequence,
+        });
 
         // Flush buffer when full
         if buf.len() >= THREAD_LOCAL_BUFFER_SIZE {
@@ -118,25 +155,56 @@ impl MemTableManager {
             drop(buf); // Release lock before calling flush
             self.flush_buffer(&entries)?;
         }
-        Ok(0) // Sequence number not meaningful for buffered writes
+        Ok(sequence)
     }
 
     /// Insert multiple key-value pairs while rotating at batch boundaries.
     pub fn insert_many(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
-        self.flush_buffer(entries)
+        let buffered: Vec<_> = entries
+            .iter()
+            .map(|(key, value)| BufferEntry {
+                key: key.clone(),
+                value: value.clone(),
+                sequence: self.allocate_sequence(),
+            })
+            .collect();
+        self.flush_buffer(&buffered)
+    }
+
+    /// Apply inserts using sequences already assigned by the WAL.
+    pub(crate) fn insert_many_with_sequences(
+        &self,
+        entries: &[(Vec<u8>, Vec<u8>)],
+        sequences: &[u64],
+    ) -> Result<()> {
+        debug_assert_eq!(entries.len(), sequences.len());
+        let buffered: Vec<_> = entries
+            .iter()
+            .zip(sequences)
+            .map(|((key, value), &sequence)| {
+                self.observe_sequence(sequence);
+                BufferEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                    sequence,
+                }
+            })
+            .collect();
+        self.flush_buffer(&buffered)
     }
 
     /// Flush thread-local buffer to main memtable
-    fn flush_buffer(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+    fn flush_buffer(&self, entries: &[BufferEntry]) -> Result<()> {
+        let _mutations = self.lock_keys(entries);
         let mut start_idx = 0;
         for _ in 0..5 {
             let active = self.active.read();
 
             // Try to insert remaining entries
             let mut success = true;
-            for (i, (key, value)) in entries[start_idx..].iter().enumerate() {
-                match active.insert(key, value) {
-                    Ok(_) => {}
+            for (i, entry) in entries[start_idx..].iter().enumerate() {
+                match active.insert_with_sequence(&entry.key, &entry.value, entry.sequence) {
+                    Ok(()) => {}
                     Err(MemTableError::Full) => {
                         start_idx += i;
                         success = false;
@@ -185,10 +253,19 @@ impl MemTableManager {
     ///
     /// Automatically rotates the memtable if full.
     pub fn delete(&self, key: &[u8]) -> Result<u64> {
+        let sequence = self.allocate_sequence();
+        self.delete_with_sequence(key, sequence)?;
+        Ok(sequence)
+    }
+
+    /// Apply a tombstone using a sequence assigned by the engine or WAL.
+    pub(crate) fn delete_with_sequence(&self, key: &[u8], sequence: u64) -> Result<()> {
+        self.observe_sequence(sequence);
+        let _mutation = self.lock_key(key);
         for _ in 0..5 {
             let active = self.active.read();
-            match active.delete(key) {
-                Ok(seq) => return Ok(seq),
+            match active.delete_with_sequence(key, sequence) {
+                Ok(()) => return Ok(()),
                 Err(MemTableError::Full) => {
                     drop(active);
                     self.rotate_memtable()?;
@@ -203,125 +280,55 @@ impl MemTableManager {
     ///
     /// Searches active memtable first, then immutable memtables.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        // Check active memtable first
-        if let Some(value) = self.active.read().get(key) {
-            return Some(value);
-        }
-
-        // Check immutable memtables (most recent first)
-        for table in self.immutable.read().iter().rev() {
-            if let Some(value) = table.get(key) {
-                return Some(value);
-            }
-            // Check if it's a tombstone (deleted)
-            if let Some(entry) = table.get_entry(key) {
-                if entry.is_tombstone() {
-                    return None; // Key was deleted
-                }
-            }
-        }
-
-        None
+        self.get_entry(key).and_then(|entry| entry.value)
     }
 
     /// Check if a key exists
     pub fn contains_key(&self, key: &[u8]) -> bool {
-        // Check active memtable first
-        if self.active.read().contains_key(key) {
-            return true;
-        }
-
-        // Check immutable memtables
-        for table in self.immutable.read().iter().rev() {
-            if table.contains_key(key) {
-                return true;
-            }
-            // Check if it's a tombstone
-            if let Some(entry) = table.get_entry(key) {
-                if entry.is_tombstone() {
-                    return false;
-                }
-            }
-        }
-
-        false
+        self.get_entry(key)
+            .is_some_and(|entry| !entry.is_tombstone())
     }
 
     /// Get the raw entry (including tombstones) for compaction
     pub fn get_entry(&self, key: &[u8]) -> Option<MemTableEntry> {
-        // Check active memtable first
-        if let Some(entry) = self.active.read().get_entry(key) {
-            return Some(entry);
-        }
-
-        // Check immutable memtables (most recent first)
-        for table in self.immutable.read().iter().rev() {
+        let mut newest = self.active.read().get_entry(key);
+        for table in self.immutable.read().iter() {
             if let Some(entry) = table.get_entry(key) {
-                return Some(entry);
+                if newest
+                    .as_ref()
+                    .map_or(true, |current| entry.sequence > current.sequence)
+                {
+                    newest = Some(entry);
+                }
             }
         }
-
-        None
+        newest
     }
 
     /// Scan a range of keys across all memtables
     pub fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        use std::collections::BTreeMap;
-
-        // Merge results from all memtables
-        // Later entries override earlier ones
-        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-
-        // Add from immutable tables (oldest first)
-        for table in self.immutable.read().iter() {
-            for (key, entry) in table.get_all_entries() {
-                if key.as_slice() >= start && key.as_slice() < end {
-                    merged.insert(key, entry.value);
-                }
-            }
-        }
-
-        // Add from active table (newest, overrides all)
-        for (key, entry) in self.active.read().get_all_entries() {
-            if key.as_slice() >= start && key.as_slice() < end {
-                merged.insert(key, entry.value);
-            }
-        }
-
-        // Filter out tombstones and collect
-        merged
+        self.range_entries(start, end)
             .into_iter()
-            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .filter_map(|(key, entry)| entry.value.map(|value| (key, value)))
             .collect()
+    }
+
+    /// Scan a range while retaining sequence numbers and tombstones.
+    pub(crate) fn range_entries(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, MemTableEntry)> {
+        self.merge_entries(|key| key >= start && key < end)
     }
 
     /// Scan all keys with a given prefix across all memtables
     pub fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        use std::collections::BTreeMap;
-
-        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-
-        // Add from immutable tables (oldest first)
-        for table in self.immutable.read().iter() {
-            for (key, entry) in table.get_all_entries() {
-                if key.starts_with(prefix) {
-                    merged.insert(key, entry.value);
-                }
-            }
-        }
-
-        // Add from active table (newest)
-        for (key, entry) in self.active.read().get_all_entries() {
-            if key.starts_with(prefix) {
-                merged.insert(key, entry.value);
-            }
-        }
-
-        // Filter out tombstones
-        merged
+        self.scan_prefix_entries(prefix)
             .into_iter()
-            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .filter_map(|(key, entry)| entry.value.map(|value| (key, value)))
             .collect()
+    }
+
+    /// Scan a prefix while retaining sequence numbers and tombstones.
+    pub(crate) fn scan_prefix_entries(&self, prefix: &[u8]) -> Vec<(Vec<u8>, MemTableEntry)> {
+        self.merge_entries(|key| key.starts_with(prefix))
     }
 
     /// Rotate the active memtable to immutable
@@ -372,7 +379,67 @@ impl MemTableManager {
 
     /// Get the current sequence number from the active memtable
     pub fn current_sequence(&self) -> u64 {
-        self.active.read().current_sequence()
+        self.next_sequence.load(Ordering::Acquire)
+    }
+
+    fn allocate_sequence(&self) -> u64 {
+        self.next_sequence.fetch_add(1, Ordering::AcqRel)
+    }
+
+    fn observe_sequence(&self, sequence: u64) {
+        self.next_sequence
+            .fetch_max(sequence.saturating_add(1), Ordering::AcqRel);
+    }
+
+    fn lock_key(&self, key: &[u8]) -> parking_lot::MutexGuard<'static, ()> {
+        MUTATION_LOCKS[self.lock_index(key)].lock()
+    }
+
+    fn lock_keys(&self, entries: &[BufferEntry]) -> Vec<parking_lot::MutexGuard<'static, ()>> {
+        let mut indices: Vec<_> = entries
+            .iter()
+            .map(|entry| self.lock_index(&entry.key))
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+            .into_iter()
+            .map(|index| MUTATION_LOCKS[index].lock())
+            .collect()
+    }
+
+    fn lock_index(&self, key: &[u8]) -> usize {
+        // FNV-1a is sufficient for lock striping and avoids constructing a
+        // stateful hasher on every mutation.
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ self.id;
+        for byte in key {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash as usize % MUTATION_LOCK_STRIPES
+    }
+
+    fn merge_entries(&self, include: impl Fn(&[u8]) -> bool) -> Vec<(Vec<u8>, MemTableEntry)> {
+        use std::collections::BTreeMap;
+
+        let mut merged: BTreeMap<Vec<u8>, MemTableEntry> = BTreeMap::new();
+        let mut merge_table = |table: &MemTable| {
+            for (key, entry) in table.get_all_entries() {
+                if include(&key)
+                    && merged
+                        .get(&key)
+                        .map_or(true, |current| entry.sequence > current.sequence)
+                {
+                    merged.insert(key, entry);
+                }
+            }
+        };
+
+        for table in self.immutable.read().iter() {
+            merge_table(table);
+        }
+        merge_table(&self.active.read());
+        merged.into_iter().collect()
     }
 
     /// Get statistics for all memtables
@@ -494,5 +561,43 @@ mod tests {
         for i in 0..12 {
             assert!(manager.get(format!("key{}", i).as_bytes()).is_some());
         }
+    }
+
+    #[test]
+    fn sequence_and_tombstone_order_survive_multiple_rotations() {
+        let config = MemTableConfig {
+            max_entries: 1,
+            ..test_config()
+        };
+        let manager = MemTableManager::new_with_next_sequence(config, 40);
+
+        let value_sequence = manager.insert(b"ordered:key", b"old").unwrap();
+        manager.insert(b"rotate:one", b"value").unwrap();
+        let tombstone_sequence = manager.delete(b"ordered:key").unwrap();
+        manager.insert(b"rotate:two", b"value").unwrap();
+
+        let entry = manager.get_entry(b"ordered:key").unwrap();
+        assert_eq!(value_sequence, 40);
+        assert!(tombstone_sequence > value_sequence);
+        assert_eq!(entry.sequence, tombstone_sequence);
+        assert!(entry.is_tombstone());
+        assert_eq!(manager.get(b"ordered:key"), None);
+        assert!(manager.range_entries(b"ordered:", b"ordered;")[0]
+            .1
+            .is_tombstone());
+    }
+
+    #[test]
+    fn delayed_buffered_insert_cannot_overtake_newer_tombstone() {
+        let manager = MemTableManager::new(test_config());
+
+        let insert_sequence = manager.insert_buffered(b"buffered:key", b"old").unwrap();
+        let delete_sequence = manager.delete(b"buffered:key").unwrap();
+        assert!(delete_sequence > insert_sequence);
+
+        manager.flush_thread_local().unwrap();
+        let entry = manager.get_entry(b"buffered:key").unwrap();
+        assert_eq!(entry.sequence, delete_sequence);
+        assert!(entry.is_tombstone());
     }
 }
