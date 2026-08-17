@@ -37,6 +37,9 @@ pub struct SSTableInfo {
     pub path: PathBuf,
     pub file_size: u64,
     pub entry_count: u64,
+    /// Number of entries whose value is a tombstone.
+    #[serde(default)]
+    pub tombstone_count: u64,
     #[serde(with = "serde_bytes")]
     pub min_key: Vec<u8>,
     #[serde(with = "serde_bytes")]

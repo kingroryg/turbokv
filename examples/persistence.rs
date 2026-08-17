@@ -40,10 +40,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  - 3 config entries");
         println!("  - 5 user entries");
 
-        let stats = db.stats();
+        let stats = db.logical_stats().await?;
         println!(
             "  - Total: {} keys, {} bytes\n",
-            stats.total_keys, stats.total_bytes
+            stats.live_keys, stats.total_bytes
         );
 
         // Simulate a clean shutdown

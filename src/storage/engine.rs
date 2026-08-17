@@ -37,12 +37,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock as SyncRwLock};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info};
 
-use crate::core::{CompactionResult, DbConfig, Error as CoreError, StorageStats, WriteBatch};
+use crate::core::{
+    CompactionResult, DbConfig, Error as CoreError, LogicalStats, PhysicalCacheStats,
+    PhysicalMemTableStats, PhysicalSSTableStats, PhysicalStats, PhysicalVersionStats, StorageStats,
+    WalStats, WriteAmplificationStats, WriteBatch, WriteStallStats,
+};
 
 use super::{
     compaction::{CompactionConfig, Compactor},
@@ -51,7 +55,7 @@ use super::{
     },
     fd::{FdConfig, FdMonitor, SSTablePool},
     iter::{RangeIter, ScanBounds, ScanSstable},
-    manifest::{atomic_replace, sync_directory, Manifest, SSTableManifestEntry},
+    manifest::{atomic_replace, sync_directory, Manifest, SSTableManifestEntry, MANIFEST_VERSION},
     memtable::{MemTableConfig, MemTableManager},
     sstable::{SSTableConfig, SSTableInfo, SSTableReader, SSTableWriter},
     version::VersionOrder,
@@ -234,18 +238,177 @@ pub struct Engine {
     #[allow(dead_code)]
     fd_monitor: Arc<FdMonitor>,
     compactor: Arc<Compactor>,
-    // Atomic counters for SSTable stats (updated on flush/compaction)
-    sstable_total_keys: Arc<AtomicU64>,
-    sstable_total_bytes: Arc<AtomicU64>,
-    sstable_count: Arc<AtomicU64>,
-    l0_sstable_count: Arc<AtomicU64>,
-    wal_bytes_written: Arc<AtomicU64>,
-    sstable_flush_bytes_written: Arc<AtomicU64>,
-    compaction_bytes_read: Arc<AtomicU64>,
-    compaction_bytes_written: Arc<AtomicU64>,
+    sstable_stats: Arc<SstableStatistics>,
+    logical_bytes_ingested: Arc<AtomicU64>,
     compactions_in_progress: Arc<AtomicU64>,
     write_stall_count: Arc<AtomicU64>,
     write_stall_micros: Arc<AtomicU64>,
+}
+
+/// Related SSTable gauges and maintenance counters shared by foreground and
+/// background paths. The publication lock covers only the short live-gauge
+/// transition; compaction selection and I/O remain independently concurrent.
+struct SstableStatistics {
+    versions: AtomicU64,
+    bytes: AtomicU64,
+    tombstones: AtomicU64,
+    files: AtomicU64,
+    level_zero_files: AtomicU64,
+    publication: SyncRwLock<()>,
+    flush_bytes_written: AtomicU64,
+    compaction_input_bytes: AtomicU64,
+    compaction_output_bytes: AtomicU64,
+    versions_reclaimed: AtomicU64,
+    tombstones_reclaimed: AtomicU64,
+}
+
+struct SstableStatisticsSnapshot {
+    versions: u64,
+    bytes: u64,
+    tombstones: u64,
+    files: u64,
+    level_zero_files: u64,
+    flush_bytes_written: u64,
+    compaction_input_bytes: u64,
+    compaction_output_bytes: u64,
+    versions_reclaimed: u64,
+    tombstones_reclaimed: u64,
+}
+
+/// Exclusive ownership of one compaction attempt's output path. Claiming the
+/// path before input I/O prevents stale orphan bytes from a prior process from
+/// being attributed to this process-lifetime attempt counter.
+struct CompactionOutputAttempt {
+    path: PathBuf,
+}
+
+impl CompactionOutputAttempt {
+    fn claim(path: PathBuf) -> Result<Self> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                StorageError::Compaction(format!(
+                    "failed to claim compaction output {}: {error}",
+                    path.display()
+                ))
+            })?;
+        Ok(Self { path })
+    }
+
+    fn produced_bytes(&self) -> u64 {
+        std::fs::metadata(&self.path).map_or(0, |metadata| metadata.len())
+    }
+}
+
+impl SstableStatistics {
+    fn new(sstables: &[SSTableInfo]) -> Self {
+        Self {
+            versions: AtomicU64::new(sstables.iter().map(|table| table.entry_count).sum()),
+            bytes: AtomicU64::new(sstables.iter().map(|table| table.file_size).sum()),
+            tombstones: AtomicU64::new(sstables.iter().map(|table| table.tombstone_count).sum()),
+            files: AtomicU64::new(sstables.len() as u64),
+            level_zero_files: AtomicU64::new(
+                sstables.iter().filter(|table| table.level == 0).count() as u64,
+            ),
+            publication: SyncRwLock::new(()),
+            flush_bytes_written: AtomicU64::new(0),
+            compaction_input_bytes: AtomicU64::new(0),
+            compaction_output_bytes: AtomicU64::new(0),
+            versions_reclaimed: AtomicU64::new(0),
+            tombstones_reclaimed: AtomicU64::new(0),
+        }
+    }
+
+    fn sample(&self) -> SstableStatisticsSnapshot {
+        let _publication = self.publication.read();
+        SstableStatisticsSnapshot {
+            versions: self.versions.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            tombstones: self.tombstones.load(Ordering::Relaxed),
+            files: self.files.load(Ordering::Relaxed),
+            level_zero_files: self.level_zero_files.load(Ordering::Relaxed),
+            flush_bytes_written: self.flush_bytes_written.load(Ordering::Relaxed),
+            compaction_input_bytes: self.compaction_input_bytes.load(Ordering::Relaxed),
+            compaction_output_bytes: self.compaction_output_bytes.load(Ordering::Relaxed),
+            versions_reclaimed: self.versions_reclaimed.load(Ordering::Relaxed),
+            tombstones_reclaimed: self.tombstones_reclaimed.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_flush_output(&self, bytes: u64) {
+        self.flush_bytes_written.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn level_zero_file_count(&self) -> u64 {
+        self.level_zero_files.load(Ordering::Relaxed)
+    }
+
+    fn record_compaction_attempt(&self, input_bytes: u64, output_bytes: u64) {
+        self.compaction_input_bytes
+            .fetch_add(input_bytes, Ordering::Relaxed);
+        self.compaction_output_bytes
+            .fetch_add(output_bytes, Ordering::Relaxed);
+    }
+
+    fn install_if_absent(&self, live: &mut Vec<SSTableInfo>, info: &SSTableInfo) {
+        let _publication = self.publication.write();
+        if live.iter().any(|table| table.id == info.id) {
+            return;
+        }
+        live.push(info.clone());
+        self.versions.fetch_add(info.entry_count, Ordering::Relaxed);
+        self.bytes.fetch_add(info.file_size, Ordering::Relaxed);
+        self.tombstones
+            .fetch_add(info.tombstone_count, Ordering::Relaxed);
+        self.files.fetch_add(1, Ordering::Relaxed);
+        if info.level == 0 {
+            self.level_zero_files.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn publish_compaction(
+        &self,
+        live: &mut Vec<SSTableInfo>,
+        inputs: &[SSTableManifestEntry],
+        result: &super::compaction::CompactionResult,
+    ) {
+        let input_ids: Vec<u64> = inputs.iter().map(|table| table.id).collect();
+        let removed_versions: u64 = inputs.iter().map(|table| table.entry_count).sum();
+        let removed_bytes: u64 = inputs.iter().map(|table| table.size).sum();
+        let removed_tombstones: u64 = inputs.iter().map(|table| table.tombstone_count).sum();
+        let removed_level_zero = inputs.iter().filter(|table| table.level == 0).count() as u64;
+
+        let _publication = self.publication.write();
+        live.retain(|table| !input_ids.contains(&table.id));
+        self.versions.fetch_sub(removed_versions, Ordering::Relaxed);
+        self.bytes.fetch_sub(removed_bytes, Ordering::Relaxed);
+        self.tombstones
+            .fetch_sub(removed_tombstones, Ordering::Relaxed);
+        self.files.fetch_sub(inputs.len() as u64, Ordering::Relaxed);
+        self.level_zero_files
+            .fetch_sub(removed_level_zero, Ordering::Relaxed);
+
+        if let Some(output) = &result.output_sstable {
+            let info = sstable_info_from_manifest(output);
+            live.push(info);
+            self.versions
+                .fetch_add(output.entry_count, Ordering::Relaxed);
+            self.bytes.fetch_add(output.size, Ordering::Relaxed);
+            self.tombstones
+                .fetch_add(output.tombstone_count, Ordering::Relaxed);
+            self.files.fetch_add(1, Ordering::Relaxed);
+            if output.level == 0 {
+                self.level_zero_files.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        self.versions_reclaimed
+            .fetch_add(result.entries_dropped, Ordering::Relaxed);
+        self.tombstones_reclaimed
+            .fetch_add(result.tombstones_dropped, Ordering::Relaxed);
+    }
 }
 
 impl Engine {
@@ -279,8 +442,16 @@ impl Engine {
         }
 
         // Load manifest
-        let manifest = Manifest::load_or_create(&config.data_dir)
+        let mut manifest = Manifest::load_or_create(&config.data_dir)
             .map_err(|e| StorageError::Manifest(e.to_string()))?;
+        if manifest.loaded_format_version < u64::from(MANIFEST_VERSION) {
+            for entry in &mut manifest.sstables {
+                entry.tombstone_count = count_sstable_tombstones(&entry.path)?;
+            }
+            manifest
+                .persist_format_upgrade(&config.data_dir)
+                .map_err(|error| StorageError::Manifest(error.to_string()))?;
+        }
         let wal_checkpoint = manifest.wal_checkpoint;
         let persisted_next_sequence = manifest
             .sstables
@@ -332,6 +503,7 @@ impl Engine {
                 path: entry.path.clone(),
                 file_size: entry.size,
                 entry_count: entry.entry_count,
+                tombstone_count: entry.tombstone_count,
                 min_key: entry.min_key.clone(),
                 max_key: entry.max_key.clone(),
                 creation_time: entry.creation_time,
@@ -377,11 +549,7 @@ impl Engine {
             Arc::clone(&next_sstable_id),
         ));
 
-        // Initialize SSTable stats from existing SSTables
-        let initial_sstable_keys: u64 = sstables.iter().map(|s| s.entry_count).sum();
-        let initial_sstable_bytes: u64 = sstables.iter().map(|s| s.file_size).sum();
-        let initial_sstable_count = sstables.len() as u64;
-        let initial_l0_sstable_count = sstables.iter().filter(|s| s.level == 0).count() as u64;
+        let sstable_stats = Arc::new(SstableStatistics::new(&sstables));
 
         let engine = Self {
             config,
@@ -402,14 +570,8 @@ impl Engine {
             sstable_pool,
             fd_monitor,
             compactor,
-            sstable_total_keys: Arc::new(AtomicU64::new(initial_sstable_keys)),
-            sstable_total_bytes: Arc::new(AtomicU64::new(initial_sstable_bytes)),
-            sstable_count: Arc::new(AtomicU64::new(initial_sstable_count)),
-            l0_sstable_count: Arc::new(AtomicU64::new(initial_l0_sstable_count)),
-            wal_bytes_written: Arc::new(AtomicU64::new(0)),
-            sstable_flush_bytes_written: Arc::new(AtomicU64::new(0)),
-            compaction_bytes_read: Arc::new(AtomicU64::new(0)),
-            compaction_bytes_written: Arc::new(AtomicU64::new(0)),
+            sstable_stats,
+            logical_bytes_ingested: Arc::new(AtomicU64::new(0)),
             compactions_in_progress: Arc::new(AtomicU64::new(0)),
             write_stall_count: Arc::new(AtomicU64::new(0)),
             write_stall_micros: Arc::new(AtomicU64::new(0)),
@@ -445,8 +607,6 @@ impl Engine {
                 &self.config.data_dir,
                 super::failpoints::PersistenceBoundary::Wal,
             )?;
-            self.wal_bytes_written
-                .fetch_add(wal_data_entry_size(key, value), Ordering::Relaxed);
             let _publication = self.batch_visibility.read().await;
             self.memtable_manager
                 .insert_with_sequence(key, value, sequence)
@@ -458,6 +618,8 @@ impl Engine {
                 .insert_buffered(key, value)
                 .map_err(StorageError::MemTable)?;
         }
+
+        self.record_logical_bytes_ingested(payload_bytes(key, Some(value)));
 
         Ok(())
     }
@@ -484,8 +646,6 @@ impl Engine {
                 &self.config.data_dir,
                 super::failpoints::PersistenceBoundary::Wal,
             )?;
-            self.wal_bytes_written
-                .fetch_add(appended.bytes_written, Ordering::Relaxed);
             let _publication = self.batch_visibility.read().await;
             self.memtable_manager
                 .insert_many_with_sequences(entries, &appended.sequences)
@@ -496,6 +656,11 @@ impl Engine {
                 .insert_many(entries)
                 .map_err(StorageError::MemTable)?;
         }
+
+        let bytes = entries.iter().fold(0_u64, |total, (key, value)| {
+            total.saturating_add(payload_bytes(key, Some(value)))
+        });
+        self.record_logical_bytes_ingested(bytes);
 
         Ok(())
     }
@@ -526,8 +691,6 @@ impl Engine {
                 &self.config.data_dir,
                 super::failpoints::PersistenceBoundary::Wal,
             )?;
-            self.wal_bytes_written
-                .fetch_add(wal_delete_entry_size(key), Ordering::Relaxed);
             let _publication = self.batch_visibility.read().await;
             self.memtable_manager
                 .delete_with_sequence(key, sequence)
@@ -538,6 +701,8 @@ impl Engine {
                 .delete(key)
                 .map_err(StorageError::MemTable)?;
         }
+
+        self.record_logical_bytes_ingested(payload_bytes(key, None));
 
         Ok(())
     }
@@ -640,9 +805,6 @@ impl Engine {
                 &self.config.data_dir,
                 super::failpoints::PersistenceBoundary::Wal,
             )?;
-            self.wal_bytes_written
-                .fetch_add(appended.bytes_written, Ordering::Relaxed);
-
             let _publication = self.batch_visibility.write().await;
             self.memtable_manager
                 .apply_batch_with_sequences(&ops, &appended.sequences)
@@ -663,6 +825,11 @@ impl Engine {
                 .apply_batch_with_sequences(&ops, &sequences)
                 .map_err(StorageError::MemTable)?;
         }
+
+        let bytes = ops.iter().fold(0_u64, |total, (key, value)| {
+            total.saturating_add(payload_bytes(key, *value))
+        });
+        self.record_logical_bytes_ingested(bytes);
 
         Ok(())
     }
@@ -721,6 +888,7 @@ impl Engine {
                 path: sst.path.clone(),
                 size: sst.file_size,
                 entry_count: sst.entry_count,
+                tombstone_count: sst.tombstone_count,
                 min_key: sst.min_key.clone(),
                 max_key: sst.max_key.clone(),
                 min_sequence: sst.min_sequence,
@@ -743,46 +911,169 @@ impl Engine {
         }
     }
 
-    /// Get storage statistics
+    /// Get legacy mixed physical storage statistics.
+    ///
+    /// `total_keys` counts physical versions and `total_bytes` combines
+    /// approximate in-memory bytes with SSTable file bytes. Use
+    /// [`Self::logical_stats`] and [`Self::physical_stats`] instead.
+    #[deprecated(note = "use logical_stats() and physical_stats()")]
     pub fn stats(&self) -> StorageStats {
-        let memtable_stats = self.memtable_manager.stats();
+        self.legacy_stats()
+    }
 
-        // Count keys from active + immutable memtables
-        let memtable_keys = memtable_stats.active.entry_count as u64
-            + memtable_stats
-                .immutable
-                .iter()
-                .map(|s| s.entry_count as u64)
-                .sum::<u64>();
-
-        let memtable_bytes = memtable_stats.active.size_bytes as u64
-            + memtable_stats
-                .immutable
-                .iter()
-                .map(|s| s.size_bytes as u64)
-                .sum::<u64>();
-
-        // Add SSTable stats from atomic counters
-        let sstable_keys = self.sstable_total_keys.load(Ordering::Relaxed);
-        let sstable_bytes = self.sstable_total_bytes.load(Ordering::Relaxed);
-        let sstable_count = self.sstable_count.load(Ordering::Relaxed) as u32;
+    pub(crate) fn legacy_stats(&self) -> StorageStats {
+        let physical = self.physical_stats();
 
         StorageStats {
-            total_keys: memtable_keys + sstable_keys,
-            total_bytes: memtable_bytes + sstable_bytes,
-            wal_size: self.wal.as_ref().map(|w| w.current_size()).unwrap_or(0),
-            sstable_count,
-            memtable_size: memtable_stats.active.size_bytes as u64,
-            compaction_pending: !memtable_stats.immutable.is_empty(),
-            wal_bytes_written: self.wal_bytes_written.load(Ordering::Relaxed),
-            sstable_flush_bytes_written: self.sstable_flush_bytes_written.load(Ordering::Relaxed),
-            compaction_bytes_read: self.compaction_bytes_read.load(Ordering::Relaxed),
-            compaction_bytes_written: self.compaction_bytes_written.load(Ordering::Relaxed),
+            total_keys: physical.versions.current,
+            total_bytes: physical
+                .memtables
+                .buffered_bytes
+                .saturating_add(physical.memtables.active_bytes)
+                .saturating_add(physical.memtables.immutable_bytes)
+                .saturating_add(physical.sstables.bytes),
+            wal_size: physical.wal.active_segment_bytes,
+            sstable_count: physical.sstables.files as u32,
+            memtable_size: physical.memtables.active_bytes,
+            compaction_pending: physical.memtables.immutable_tables != 0,
+            wal_bytes_written: physical.wal.bytes_written_since_open,
+            sstable_flush_bytes_written: physical.amplification.flush_bytes_written_since_open,
+            compaction_bytes_read: physical.amplification.compaction_input_bytes_since_open,
+            compaction_bytes_written: physical.amplification.compaction_output_bytes_since_open,
+            compactions_in_progress: physical.compactions_in_progress,
+            immutable_memtables: physical.memtables.immutable_tables,
+            l0_sstable_count: physical.sstables.level_zero_files,
+            write_stall_count: physical.stalls.count_since_open,
+            write_stall_micros: physical.stalls.micros_since_open,
+        }
+    }
+
+    /// Scan one coherent database snapshot for exact logical statistics.
+    ///
+    /// This is an O(physical versions) operation that reads SSTable blocks and
+    /// freezes a nonempty active memtable while capturing the snapshot. The
+    /// freeze can cause additional bytes to be written by a later flush and
+    /// compaction. Tombstones and superseded versions are resolved by the same
+    /// streaming merge used for range scans and never inflate these counts.
+    pub async fn logical_stats(&self) -> Result<LogicalStats> {
+        let mut iterator = self.scan_prefix_iter(b"").await?;
+        let mut stats = LogicalStats::default();
+        for entry in &mut iterator {
+            let entry = entry.map_err(super::iter::ScanError::into_storage_error)?;
+            let key_bytes = entry.key().len() as u64;
+            let value_bytes = entry.value_len() as u64;
+            stats.live_keys = stats
+                .live_keys
+                .checked_add(1)
+                .ok_or_else(logical_stats_overflow)?;
+            stats.key_bytes = stats
+                .key_bytes
+                .checked_add(key_bytes)
+                .ok_or_else(logical_stats_overflow)?;
+            stats.value_bytes = stats
+                .value_bytes
+                .checked_add(value_bytes)
+                .ok_or_else(logical_stats_overflow)?;
+        }
+        stats.total_bytes = stats
+            .key_bytes
+            .checked_add(stats.value_bytes)
+            .ok_or_else(logical_stats_overflow)?;
+        Ok(stats)
+    }
+
+    /// Get cheap physical gauges and process-lifetime cumulative counters.
+    ///
+    /// This method performs no database scan. Current gauges are sampled for
+    /// monitoring and are not one transactional snapshot across components.
+    /// Every `_since_open` counter resets when the engine is reopened.
+    pub fn physical_stats(&self) -> PhysicalStats {
+        let memtable_stats = self.memtable_manager.stats();
+        let buffered_versions = memtable_stats.buffered_versions;
+        let active_versions = memtable_stats.active.entry_count as u64;
+        let immutable_versions = memtable_stats
+            .immutable
+            .iter()
+            .map(|stats| stats.entry_count as u64)
+            .sum::<u64>();
+        let active_bytes = memtable_stats.active.size_bytes as u64;
+        let immutable_bytes = memtable_stats
+            .immutable
+            .iter()
+            .map(|stats| stats.size_bytes as u64)
+            .sum::<u64>();
+        let memtable_tombstones = memtable_stats.active.tombstone_count as u64
+            + memtable_stats
+                .immutable
+                .iter()
+                .map(|stats| stats.tombstone_count as u64)
+                .sum::<u64>();
+        let sstable = self.sstable_stats.sample();
+        let wal_bytes_written = self
+            .wal
+            .as_ref()
+            .map_or(0, |wal| wal.bytes_written_since_open());
+        let reader_cache = self.sstable_pool.stats();
+        let block_cache = self.sstable_pool.block_cache_stats();
+
+        PhysicalStats {
+            wal: WalStats {
+                enabled: self.wal.is_some(),
+                active_segment_bytes: self.wal.as_ref().map_or(0, |wal| wal.current_size()),
+                retained_valid_bytes: self.wal.as_ref().map_or(0, |wal| wal.retained_size()),
+                bytes_written_since_open: wal_bytes_written,
+            },
+            memtables: PhysicalMemTableStats {
+                buffered_bytes: memtable_stats.buffered_bytes,
+                active_bytes,
+                immutable_bytes,
+                active_versions,
+                buffered_versions,
+                immutable_versions,
+                tombstones: memtable_tombstones,
+                immutable_tables: memtable_stats.immutable.len() as u64,
+            },
+            sstables: PhysicalSSTableStats {
+                bytes: sstable.bytes,
+                files: sstable.files,
+                level_zero_files: sstable.level_zero_files,
+                versions: sstable.versions,
+                tombstones: sstable.tombstones,
+            },
+            versions: PhysicalVersionStats {
+                current: buffered_versions
+                    + active_versions
+                    + immutable_versions
+                    + sstable.versions,
+                tombstones: memtable_tombstones + sstable.tombstones,
+                reclaimed_by_compaction_since_open: sstable.versions_reclaimed,
+                tombstones_reclaimed_by_compaction_since_open: sstable.tombstones_reclaimed,
+            },
+            cache: PhysicalCacheStats {
+                block_cache_enabled: block_cache.is_some(),
+                block_cache_entries: block_cache.as_ref().map_or(0, |stats| stats.entries as u64),
+                block_cache_bytes: block_cache.as_ref().map_or(0, |stats| stats.size_bytes),
+                block_cache_hits_since_open: block_cache.as_ref().map_or(0, |stats| stats.hits),
+                block_cache_misses_since_open: block_cache.as_ref().map_or(0, |stats| stats.misses),
+                sstable_readers: reader_cache.open_sstables as u64,
+                sstable_reader_hits_since_open: reader_cache.cache_hits,
+                sstable_reader_misses_since_open: reader_cache.cache_misses,
+                sstable_reader_evictions_since_open: reader_cache.evictions,
+            },
+            stalls: WriteStallStats {
+                count_since_open: self.write_stall_count.load(Ordering::Relaxed),
+                micros_since_open: self.write_stall_micros.load(Ordering::Relaxed),
+            },
+            amplification: WriteAmplificationStats {
+                logical_bytes_ingested_since_open: self
+                    .logical_bytes_ingested
+                    .load(Ordering::Relaxed),
+                wal_bytes_written_since_open: wal_bytes_written,
+                flush_bytes_written_since_open: sstable.flush_bytes_written,
+                compaction_input_bytes_since_open: sstable.compaction_input_bytes,
+                compaction_output_bytes_since_open: sstable.compaction_output_bytes,
+            },
             compactions_in_progress: self.compactions_in_progress.load(Ordering::Acquire),
-            immutable_memtables: memtable_stats.immutable.len() as u64,
-            l0_sstable_count: self.l0_sstable_count.load(Ordering::Relaxed),
-            write_stall_count: self.write_stall_count.load(Ordering::Relaxed),
-            write_stall_micros: self.write_stall_micros.load(Ordering::Relaxed),
         }
     }
 
@@ -854,9 +1145,17 @@ impl Engine {
         Ok(count)
     }
 
+    fn record_logical_bytes_ingested(&self, bytes: u64) {
+        let _ = self.logical_bytes_ingested.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(bytes)),
+        );
+    }
+
     async fn maybe_stall_writes(&self) {
         let immutable_count = self.memtable_manager.immutable_count();
-        let l0_count = self.l0_sstable_count.load(Ordering::Relaxed);
+        let l0_count = self.sstable_stats.level_zero_file_count();
         let should_stall = immutable_count >= self.config.max_immutable_memtables_before_stall
             || l0_count >= self.config.max_l0_files_before_stall;
 
@@ -994,11 +1293,7 @@ impl Engine {
                 mutation_barrier: &self.mutation_barrier,
                 unapplied_wal_sequences: &self.unapplied_wal_sequences,
                 next_sstable_id: &self.next_sstable_id,
-                sstable_total_keys: &self.sstable_total_keys,
-                sstable_total_bytes: &self.sstable_total_bytes,
-                sstable_count: &self.sstable_count,
-                l0_sstable_count: &self.l0_sstable_count,
-                sstable_flush_bytes_written: &self.sstable_flush_bytes_written,
+                sstable_stats: &self.sstable_stats,
             },
             memtable,
         )
@@ -1010,69 +1305,33 @@ impl Engine {
         // Get paths of input files before compaction
         let input_paths: Vec<PathBuf> = job.input_sstables.iter().map(|s| s.path.clone()).collect();
         let input_ids: Vec<u64> = job.input_sstables.iter().map(|s| s.id).collect();
+        let input_sstables = job.input_sstables.clone();
+        let selected_input_bytes = input_sstables
+            .iter()
+            .fold(0_u64, |total, table| total.saturating_add(table.size));
+        let output_path = job.output_path.clone();
 
-        // Track stats of removed SSTables for counter updates
-        let removed_keys: u64 = job.input_sstables.iter().map(|s| s.entry_count).sum();
-        let removed_bytes: u64 = job.input_sstables.iter().map(|s| s.size).sum();
-        let removed_count = job.input_sstables.len() as u64;
-        let removed_l0_count = job.input_sstables.iter().filter(|s| s.level == 0).count() as u64;
-
-        let result = self
-            .compactor
-            .execute(job)
-            .map_err(|e| StorageError::Compaction(e.to_string()))?;
+        let output_attempt = match CompactionOutputAttempt::claim(output_path) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                self.sstable_stats
+                    .record_compaction_attempt(selected_input_bytes, 0);
+                return Err(error);
+            }
+        };
+        let execution = self.compactor.execute(job);
+        self.sstable_stats
+            .record_compaction_attempt(selected_input_bytes, output_attempt.produced_bytes());
+        let result = execution.map_err(|e| StorageError::Compaction(e.to_string()))?;
         #[cfg(test)]
         super::failpoints::check(
             &self.config.data_dir,
             super::failpoints::PersistenceBoundary::Compaction,
         )?;
 
-        // Update SSTable list
         let mut sstables = self.sstables.write().await;
-
-        // Remove old files by id
-        sstables.retain(|sst| !input_ids.contains(&sst.id));
-
-        // Update atomic counters: subtract removed SSTables
-        self.sstable_total_keys
-            .fetch_sub(removed_keys, Ordering::Relaxed);
-        self.sstable_total_bytes
-            .fetch_sub(removed_bytes, Ordering::Relaxed);
-        self.sstable_count
-            .fetch_sub(removed_count, Ordering::Relaxed);
-        self.l0_sstable_count
-            .fetch_sub(removed_l0_count, Ordering::Relaxed);
-
-        // Add new file if compaction produced output
-        if let Some(ref output) = result.output_sstable {
-            sstables.push(SSTableInfo {
-                id: output.id,
-                level: output.level,
-                path: output.path.clone(),
-                file_size: output.size,
-                entry_count: output.entry_count,
-                min_key: output.min_key.clone(),
-                max_key: output.max_key.clone(),
-                creation_time: output.creation_time,
-                min_sequence: output.min_sequence,
-                max_sequence: output.max_sequence,
-            });
-
-            // Update atomic counters: add new SSTable
-            self.sstable_total_keys
-                .fetch_add(output.entry_count, Ordering::Relaxed);
-            self.sstable_total_bytes
-                .fetch_add(output.size, Ordering::Relaxed);
-            self.sstable_count.fetch_add(1, Ordering::Relaxed);
-            if output.level == 0 {
-                self.l0_sstable_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        self.compaction_bytes_read
-            .fetch_add(result.bytes_read, Ordering::Relaxed);
-        self.compaction_bytes_written
-            .fetch_add(result.bytes_written, Ordering::Relaxed);
+        self.sstable_stats
+            .publish_compaction(&mut sstables, &input_sstables, &result);
 
         // The live source swap is complete. Manifest I/O and unlinking old
         // inputs must not hold the global reader-list lock.
@@ -1169,13 +1428,7 @@ impl Engine {
             next_sstable_id: self.next_sstable_id.clone(),
             compactor: self.compactor.clone(),
             config: self.config.clone(),
-            sstable_total_keys: self.sstable_total_keys.clone(),
-            sstable_total_bytes: self.sstable_total_bytes.clone(),
-            sstable_count: self.sstable_count.clone(),
-            l0_sstable_count: self.l0_sstable_count.clone(),
-            sstable_flush_bytes_written: self.sstable_flush_bytes_written.clone(),
-            compaction_bytes_read: self.compaction_bytes_read.clone(),
-            compaction_bytes_written: self.compaction_bytes_written.clone(),
+            sstable_stats: self.sstable_stats.clone(),
             compactions_in_progress: self.compactions_in_progress.clone(),
         }
     }
@@ -1203,14 +1456,7 @@ struct BackgroundEngine {
     compactor: Arc<Compactor>,
     config: StorageConfig,
     wal: Option<Arc<WriteAheadLog>>,
-    // Atomic counters for SSTable stats
-    sstable_total_keys: Arc<AtomicU64>,
-    sstable_total_bytes: Arc<AtomicU64>,
-    sstable_count: Arc<AtomicU64>,
-    l0_sstable_count: Arc<AtomicU64>,
-    sstable_flush_bytes_written: Arc<AtomicU64>,
-    compaction_bytes_read: Arc<AtomicU64>,
-    compaction_bytes_written: Arc<AtomicU64>,
+    sstable_stats: Arc<SstableStatistics>,
     compactions_in_progress: Arc<AtomicU64>,
 }
 
@@ -1246,6 +1492,7 @@ impl BackgroundEngine {
                 path: sst.path.clone(),
                 size: sst.file_size,
                 entry_count: sst.entry_count,
+                tombstone_count: sst.tombstone_count,
                 min_key: sst.min_key.clone(),
                 max_key: sst.max_key.clone(),
                 min_sequence: sst.min_sequence,
@@ -1282,11 +1529,7 @@ impl BackgroundEngine {
                 mutation_barrier: &self.mutation_barrier,
                 unapplied_wal_sequences: &self.unapplied_wal_sequences,
                 next_sstable_id: &self.next_sstable_id,
-                sstable_total_keys: &self.sstable_total_keys,
-                sstable_total_bytes: &self.sstable_total_bytes,
-                sstable_count: &self.sstable_count,
-                l0_sstable_count: &self.l0_sstable_count,
-                sstable_flush_bytes_written: &self.sstable_flush_bytes_written,
+                sstable_stats: &self.sstable_stats,
             },
             memtable,
         )
@@ -1296,17 +1539,24 @@ impl BackgroundEngine {
     async fn run_compaction(&self, job: super::compaction::CompactionJob) -> Result<()> {
         let input_paths: Vec<PathBuf> = job.input_sstables.iter().map(|s| s.path.clone()).collect();
         let input_ids: Vec<u64> = job.input_sstables.iter().map(|s| s.id).collect();
+        let input_sstables = job.input_sstables.clone();
+        let selected_input_bytes = input_sstables
+            .iter()
+            .fold(0_u64, |total, table| total.saturating_add(table.size));
+        let output_path = job.output_path.clone();
 
-        // Track stats of removed SSTables for counter updates
-        let removed_keys: u64 = job.input_sstables.iter().map(|s| s.entry_count).sum();
-        let removed_bytes: u64 = job.input_sstables.iter().map(|s| s.size).sum();
-        let removed_count = job.input_sstables.len() as u64;
-        let removed_l0_count = job.input_sstables.iter().filter(|s| s.level == 0).count() as u64;
-
-        let result = self
-            .compactor
-            .execute(job)
-            .map_err(|e| StorageError::Compaction(e.to_string()))?;
+        let output_attempt = match CompactionOutputAttempt::claim(output_path) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                self.sstable_stats
+                    .record_compaction_attempt(selected_input_bytes, 0);
+                return Err(error);
+            }
+        };
+        let execution = self.compactor.execute(job);
+        self.sstable_stats
+            .record_compaction_attempt(selected_input_bytes, output_attempt.produced_bytes());
+        let result = execution.map_err(|e| StorageError::Compaction(e.to_string()))?;
         #[cfg(test)]
         super::failpoints::check(
             &self.config.data_dir,
@@ -1314,47 +1564,8 @@ impl BackgroundEngine {
         )?;
 
         let mut sstables = self.sstables.write().await;
-        sstables.retain(|sst| !input_ids.contains(&sst.id));
-
-        // Update atomic counters: subtract removed SSTables
-        self.sstable_total_keys
-            .fetch_sub(removed_keys, Ordering::Relaxed);
-        self.sstable_total_bytes
-            .fetch_sub(removed_bytes, Ordering::Relaxed);
-        self.sstable_count
-            .fetch_sub(removed_count, Ordering::Relaxed);
-        self.l0_sstable_count
-            .fetch_sub(removed_l0_count, Ordering::Relaxed);
-
-        if let Some(ref output) = result.output_sstable {
-            sstables.push(SSTableInfo {
-                id: output.id,
-                level: output.level,
-                path: output.path.clone(),
-                file_size: output.size,
-                entry_count: output.entry_count,
-                min_key: output.min_key.clone(),
-                max_key: output.max_key.clone(),
-                creation_time: output.creation_time,
-                min_sequence: output.min_sequence,
-                max_sequence: output.max_sequence,
-            });
-
-            // Update atomic counters: add new SSTable
-            self.sstable_total_keys
-                .fetch_add(output.entry_count, Ordering::Relaxed);
-            self.sstable_total_bytes
-                .fetch_add(output.size, Ordering::Relaxed);
-            self.sstable_count.fetch_add(1, Ordering::Relaxed);
-            if output.level == 0 {
-                self.l0_sstable_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        self.compaction_bytes_read
-            .fetch_add(result.bytes_read, Ordering::Relaxed);
-        self.compaction_bytes_written
-            .fetch_add(result.bytes_written, Ordering::Relaxed);
+        self.sstable_stats
+            .publish_compaction(&mut sstables, &input_sstables, &result);
 
         // The live source swap is complete. Manifest I/O and unlinking old
         // inputs must not hold the global reader-list lock.
@@ -1390,11 +1601,7 @@ struct FlushResources<'a> {
     mutation_barrier: &'a Arc<RwLock<()>>,
     unapplied_wal_sequences: &'a Arc<Mutex<BTreeSet<u64>>>,
     next_sstable_id: &'a Arc<AtomicU64>,
-    sstable_total_keys: &'a Arc<AtomicU64>,
-    sstable_total_bytes: &'a Arc<AtomicU64>,
-    sstable_count: &'a Arc<AtomicU64>,
-    l0_sstable_count: &'a Arc<AtomicU64>,
-    sstable_flush_bytes_written: &'a Arc<AtomicU64>,
+    sstable_stats: &'a SstableStatistics,
 }
 
 async fn flush_memtable_to_sstable(
@@ -1458,6 +1665,7 @@ async fn flush_memtable_to_sstable(
         let mut info = writer
             .finish()
             .map_err(|error| StorageError::SSTable(format!("Failed to finish SSTable: {error}")))?;
+        resources.sstable_stats.record_flush_output(info.file_size);
         validate_sstable_structure(&temp_path)?;
 
         #[cfg(test)]
@@ -1493,6 +1701,7 @@ async fn flush_memtable_to_sstable(
             path: info.path.clone(),
             size: info.file_size,
             entry_count: info.entry_count,
+            tombstone_count: info.tombstone_count,
             min_key: info.min_key.clone(),
             max_key: info.max_key.clone(),
             min_sequence: info.min_sequence,
@@ -1585,6 +1794,10 @@ fn reusable_sstable_info(
         path: path.to_path_buf(),
         file_size: metadata.len(),
         entry_count: expected.len() as u64,
+        tombstone_count: expected
+            .iter()
+            .filter(|(_, entry)| entry.is_tombstone())
+            .count() as u64,
         min_key: expected
             .first()
             .map_or_else(Vec::new, |(key, _)| key.clone()),
@@ -1635,12 +1848,28 @@ fn sstable_contents_match(
     Ok(actual.next_versioned().is_none())
 }
 
+fn count_sstable_tombstones(path: &std::path::Path) -> Result<u64> {
+    let reader =
+        SSTableReader::open(path).map_err(|error| StorageError::SSTable(error.to_string()))?;
+    let mut tombstones = 0_u64;
+    for entry in reader.iter() {
+        let (_, value) = entry.map_err(|error| StorageError::SSTable(error.to_string()))?;
+        if value.is_none() {
+            tombstones = tombstones
+                .checked_add(1)
+                .ok_or_else(physical_tombstone_stats_overflow)?;
+        }
+    }
+    Ok(tombstones)
+}
+
 fn sstable_info_from_manifest(entry: &SSTableManifestEntry) -> SSTableInfo {
     SSTableInfo {
         id: entry.id,
         path: entry.path.clone(),
         file_size: entry.size,
         entry_count: entry.entry_count,
+        tombstone_count: entry.tombstone_count,
         min_key: entry.min_key.clone(),
         max_key: entry.max_key.clone(),
         creation_time: entry.creation_time,
@@ -1651,32 +1880,10 @@ fn sstable_info_from_manifest(entry: &SSTableManifestEntry) -> SSTableInfo {
 }
 
 async fn install_live_sstable(resources: &FlushResources<'_>, info: &SSTableInfo) {
-    let inserted = {
-        let mut sstables = resources.sstables.write().await;
-        if sstables.iter().any(|table| table.id == info.id) {
-            false
-        } else {
-            sstables.push(info.clone());
-            true
-        }
-    };
-    if !inserted {
-        return;
-    }
-
+    let mut sstables = resources.sstables.write().await;
     resources
-        .sstable_total_keys
-        .fetch_add(info.entry_count, Ordering::Relaxed);
-    resources
-        .sstable_total_bytes
-        .fetch_add(info.file_size, Ordering::Relaxed);
-    resources.sstable_count.fetch_add(1, Ordering::Relaxed);
-    if info.level == 0 {
-        resources.l0_sstable_count.fetch_add(1, Ordering::Relaxed);
-    }
-    resources
-        .sstable_flush_bytes_written
-        .fetch_add(info.file_size, Ordering::Relaxed);
+        .sstable_stats
+        .install_if_absent(&mut sstables, info);
 }
 
 async fn reclaim_wal_after_checkpoint(resources: &FlushResources<'_>) -> Result<()> {
@@ -1774,17 +1981,26 @@ impl Drop for PendingWalApplication<'_> {
     }
 }
 
+fn payload_bytes(key: &[u8], value: Option<&[u8]>) -> u64 {
+    (key.len() as u64).saturating_add(value.map_or(0, |value| value.len() as u64))
+}
+
+fn logical_stats_overflow() -> StorageError {
+    StorageError::Other("logical statistics exceed u64 accounting limits".to_string())
+}
+
+fn physical_tombstone_stats_overflow() -> StorageError {
+    StorageError::Other("physical tombstone statistics exceed u64 accounting limits".to_string())
+}
+
+#[cfg(test)]
 fn wal_data_entry_size(key: &[u8], value: &[u8]) -> u64 {
     const WAL_ENTRY_HEADER_SIZE: usize = 32;
     (WAL_ENTRY_HEADER_SIZE + 4 + key.len() + value.len()) as u64
 }
 
-fn wal_delete_entry_size(key: &[u8]) -> u64 {
-    const WAL_ENTRY_HEADER_SIZE: usize = 32;
-    (WAL_ENTRY_HEADER_SIZE + 4 + key.len()) as u64
-}
-
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -1823,6 +2039,7 @@ mod tests {
             path: info.path,
             size: info.file_size,
             entry_count: info.entry_count,
+            tombstone_count: info.tombstone_count,
             min_key: info.min_key,
             max_key: info.max_key,
             min_sequence: 0,
@@ -1852,6 +2069,7 @@ mod tests {
             path: info.path,
             size: info.file_size,
             entry_count: info.entry_count,
+            tombstone_count: info.tombstone_count,
             min_key: info.min_key,
             max_key: info.max_key,
             min_sequence: 0,
@@ -1904,6 +2122,7 @@ mod tests {
             path: PathBuf::from("unused.sst"),
             size: 0,
             entry_count: 1,
+            tombstone_count: 0,
             min_key: Vec::new(),
             max_key: Vec::new(),
             min_sequence: 1,
@@ -2032,13 +2251,752 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = Engine::open(config).await.unwrap();
+        let engine = Engine::open(config.clone()).await.unwrap();
         engine.insert(b"stall-key", b"stall-value").await.unwrap();
 
-        let stats = engine.stats();
-        assert_eq!(stats.write_stall_count, 1);
-        assert_eq!(stats.write_stall_micros, 1);
+        let stats = engine.physical_stats();
+        assert_eq!(stats.stalls.count_since_open, 1);
+        assert_eq!(stats.stalls.micros_since_open, 1);
 
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(reopened.physical_stats().stalls, WriteStallStats::default());
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn logical_and_physical_stats_survive_versions_compaction_and_reopen() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 4;
+        let engine = Engine::open(config.clone()).await.unwrap();
+
+        engine.insert(b"a", b"old").await.unwrap();
+        engine.insert(b"b", b"bee").await.unwrap();
+        assert_eq!(
+            engine.logical_stats().await.unwrap(),
+            LogicalStats {
+                live_keys: 2,
+                key_bytes: 2,
+                value_bytes: 6,
+                total_bytes: 8,
+            }
+        );
+
+        engine.insert(b"a", b"new-value").await.unwrap();
+        engine.delete(b"b").await.unwrap();
+        engine.insert(b"c", b"").await.unwrap();
+        assert_eq!(
+            engine.logical_stats().await.unwrap(),
+            LogicalStats {
+                live_keys: 2,
+                key_bytes: 2,
+                value_bytes: 9,
+                total_bytes: 11,
+            }
+        );
+
+        let in_memory = engine.physical_stats();
+        assert_eq!(in_memory.memtables.immutable_tables, 2);
+        assert_eq!(in_memory.memtables.immutable_versions, 5);
+        assert_eq!(in_memory.memtables.tombstones, 1);
+        assert_eq!(in_memory.versions.current, 5);
+        assert_eq!(in_memory.versions.tombstones, 1);
+        assert!(!in_memory.wal.enabled);
+        assert_eq!(in_memory.wal.retained_valid_bytes, 0);
+        assert_eq!(
+            in_memory.amplification.logical_bytes_ingested_since_open,
+            1 + 3 + 1 + 3 + 1 + 9 + 1 + 1
+        );
+
+        engine.flush().await.unwrap();
+        let after_first_flush = engine.physical_stats();
+        assert_eq!(after_first_flush.sstables.files, 2);
+        assert_eq!(after_first_flush.sstables.versions, 5);
+        assert_eq!(after_first_flush.sstables.tombstones, 1);
+        assert_eq!(after_first_flush.memtables.immutable_versions, 0);
+        assert!(
+            after_first_flush
+                .amplification
+                .flush_bytes_written_since_open
+                > 0
+        );
+
+        engine.delete(b"c").await.unwrap();
+        engine.insert(b"d", b"four").await.unwrap();
+        engine.flush().await.unwrap();
+        engine.insert(b"c", b"see").await.unwrap();
+        engine.flush().await.unwrap();
+
+        let before_compaction = engine.physical_stats();
+        assert_eq!(before_compaction.sstables.files, 4);
+        assert_eq!(before_compaction.sstables.versions, 8);
+        assert_eq!(before_compaction.sstables.tombstones, 2);
+        assert_eq!(
+            before_compaction
+                .amplification
+                .logical_bytes_ingested_since_open,
+            30
+        );
+        assert!(
+            before_compaction
+                .amplification
+                .flush_bytes_written_since_open
+                > after_first_flush
+                    .amplification
+                    .flush_bytes_written_since_open
+        );
+        let flushed_bytes = before_compaction
+            .amplification
+            .flush_bytes_written_since_open;
+
+        engine.compact().await.unwrap();
+        let after_compaction = engine.physical_stats();
+        assert_eq!(after_compaction.sstables.files, 1);
+        assert_eq!(after_compaction.sstables.versions, 4);
+        assert_eq!(after_compaction.sstables.tombstones, 1);
+        assert_eq!(after_compaction.versions.current, 4);
+        assert_eq!(after_compaction.versions.tombstones, 1);
+        assert_eq!(
+            after_compaction.versions.reclaimed_by_compaction_since_open,
+            4
+        );
+        assert_eq!(
+            after_compaction
+                .versions
+                .tombstones_reclaimed_by_compaction_since_open,
+            1
+        );
+        assert_eq!(
+            after_compaction
+                .amplification
+                .flush_bytes_written_since_open,
+            flushed_bytes
+        );
+        assert_eq!(
+            after_compaction
+                .amplification
+                .compaction_input_bytes_since_open,
+            before_compaction.sstables.bytes
+        );
+        assert_eq!(
+            after_compaction
+                .amplification
+                .compaction_output_bytes_since_open,
+            after_compaction.sstables.bytes
+        );
+        assert!(
+            after_compaction
+                .amplification
+                .sstable_write_amplification()
+                .unwrap()
+                > 0.0
+        );
+        assert_eq!(
+            engine.logical_stats().await.unwrap(),
+            LogicalStats {
+                live_keys: 3,
+                key_bytes: 3,
+                value_bytes: 16,
+                total_bytes: 19,
+            }
+        );
+        assert_eq!(engine.logical_stats().await.unwrap().live_keys, 3);
+        let populated_cache = engine.physical_stats().cache;
+        assert!(populated_cache.block_cache_enabled);
+        assert!(populated_cache.block_cache_entries > 0);
+        assert!(populated_cache.block_cache_hits_since_open > 0);
+        assert!(populated_cache.block_cache_misses_since_open > 0);
+        assert!(populated_cache.sstable_reader_hits_since_open > 0);
+        assert!(populated_cache.sstable_reader_misses_since_open > 0);
+
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        let reopened_physical = reopened.physical_stats();
+        assert_eq!(reopened_physical.sstables.files, 1);
+        assert_eq!(
+            reopened_physical.sstables.bytes,
+            after_compaction.sstables.bytes
+        );
+        assert_eq!(reopened_physical.sstables.versions, 4);
+        assert_eq!(reopened_physical.sstables.tombstones, 1);
+        assert_eq!(reopened_physical.versions.current, 4);
+        assert_eq!(reopened_physical.versions.tombstones, 1);
+        assert_eq!(
+            reopened_physical
+                .versions
+                .reclaimed_by_compaction_since_open,
+            0
+        );
+        assert_eq!(
+            reopened_physical
+                .versions
+                .tombstones_reclaimed_by_compaction_since_open,
+            0
+        );
+        assert_eq!(
+            reopened_physical
+                .amplification
+                .logical_bytes_ingested_since_open,
+            0
+        );
+        assert_eq!(
+            reopened_physical
+                .amplification
+                .flush_bytes_written_since_open,
+            0
+        );
+        assert_eq!(
+            reopened_physical
+                .amplification
+                .compaction_input_bytes_since_open,
+            0
+        );
+        assert_eq!(
+            reopened_physical
+                .amplification
+                .compaction_output_bytes_since_open,
+            0
+        );
+        assert_eq!(reopened_physical.cache.block_cache_entries, 0);
+        assert_eq!(reopened_physical.cache.block_cache_bytes, 0);
+        assert_eq!(reopened_physical.cache.block_cache_hits_since_open, 0);
+        assert_eq!(reopened_physical.cache.block_cache_misses_since_open, 0);
+        assert_eq!(reopened_physical.cache.sstable_readers, 0);
+        assert_eq!(reopened_physical.cache.sstable_reader_hits_since_open, 0);
+        assert_eq!(reopened_physical.cache.sstable_reader_misses_since_open, 0);
+        assert_eq!(
+            reopened_physical.cache.sstable_reader_evictions_since_open,
+            0
+        );
+        assert_eq!(
+            reopened.logical_stats().await.unwrap(),
+            LogicalStats {
+                live_keys: 3,
+                key_bytes: 3,
+                value_bytes: 16,
+                total_bytes: 19,
+            }
+        );
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_counts_selected_inputs_and_partial_output_once() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.sstable_config = SSTableConfig {
+            block_size: 256,
+            compression: super::super::sstable::CompressionType::None,
+            ..SSTableConfig::default()
+        };
+        let input_config = config.sstable_config.clone();
+        let engine = Engine::open(config).await.unwrap();
+
+        let input_path = directory.path().join("sstables/L0/failed-input.sst");
+        let mut writer = SSTableWriter::new(&input_path, input_config).unwrap();
+        for index in 0..256 {
+            writer
+                .add_versioned(format!("a:{index:04}").as_bytes(), Some(&[b'v'; 64]), index)
+                .unwrap();
+        }
+        let mut input_info = writer.finish().unwrap();
+        input_info.id = 99;
+        {
+            use std::io::{Read, Seek, SeekFrom, Write};
+
+            let reader = SSTableReader::open(&input_path).unwrap();
+            let corrupt_offset = reader.index().entries().last().unwrap().block_offset;
+            drop(reader);
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&input_path)
+                .unwrap();
+            file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+            let mut byte = [0_u8; 1];
+            file.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0xff;
+            file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+            file.write_all(&byte).unwrap();
+            file.sync_all().unwrap();
+        }
+        let input = SSTableManifestEntry {
+            id: input_info.id,
+            level: 0,
+            path: input_info.path.clone(),
+            size: input_info.file_size,
+            entry_count: input_info.entry_count,
+            tombstone_count: input_info.tombstone_count,
+            min_key: input_info.min_key.clone(),
+            max_key: input_info.max_key.clone(),
+            min_sequence: input_info.min_sequence,
+            max_sequence: input_info.max_sequence,
+            creation_time: input_info.creation_time,
+        };
+        {
+            let mut live = engine.sstables.write().await;
+            engine
+                .sstable_stats
+                .install_if_absent(&mut live, &input_info);
+        }
+
+        let output_path = directory.path().join("sstables/L1/failed-output.sst");
+        let result = engine
+            .run_compaction(super::super::compaction::CompactionJob {
+                input_sstables: vec![input],
+                output_level: 1,
+                output_path: output_path.clone(),
+            })
+            .await;
+        assert!(matches!(result, Err(StorageError::Compaction(_))));
+
+        let partial_output_bytes = std::fs::metadata(&output_path).unwrap().len();
+        assert!(partial_output_bytes > 0);
+        let stats = engine.physical_stats();
+        assert_eq!(
+            stats.amplification.compaction_input_bytes_since_open,
+            input_info.file_size
+        );
+        assert_eq!(
+            stats.amplification.compaction_output_bytes_since_open,
+            partial_output_bytes
+        );
+        assert_eq!(stats.sstables.files, 1);
+        assert_eq!(stats.sstables.versions, input_info.entry_count);
+        assert_eq!(stats.versions.reclaimed_by_compaction_since_open, 0);
+    }
+
+    #[tokio::test]
+    async fn preexisting_compaction_output_is_not_charged_to_a_new_attempt() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), false))
+            .await
+            .unwrap();
+        let output_path = directory.path().join("sstables/L1/stale-output.sst");
+        let stale_bytes = vec![0x5a; 127];
+        std::fs::write(&output_path, &stale_bytes).unwrap();
+
+        let result = engine
+            .run_compaction(super::super::compaction::CompactionJob {
+                input_sstables: vec![SSTableManifestEntry {
+                    id: 404,
+                    level: 0,
+                    path: directory.path().join("sstables/L0/missing-input.sst"),
+                    size: 8_192,
+                    entry_count: 1,
+                    tombstone_count: 0,
+                    min_key: b"a".to_vec(),
+                    max_key: b"z".to_vec(),
+                    min_sequence: 0,
+                    max_sequence: 0,
+                    creation_time: 0,
+                }],
+                output_level: 1,
+                output_path: output_path.clone(),
+            })
+            .await;
+        assert!(matches!(result, Err(StorageError::Compaction(_))));
+
+        let stats = engine.physical_stats();
+        assert_eq!(stats.amplification.compaction_input_bytes_since_open, 8_192);
+        assert_eq!(stats.amplification.compaction_output_bytes_since_open, 0);
+        assert_eq!(std::fs::read(output_path).unwrap(), stale_bytes);
+    }
+
+    #[tokio::test]
+    async fn physical_stats_separate_active_immutable_and_sstable_versions() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.block_cache_size = 0;
+        let engine = Engine::open(config).await.unwrap();
+
+        engine.insert(b"disk", b"value").await.unwrap();
+        engine.flush_write_buffers().unwrap();
+        engine.flush().await.unwrap();
+        engine.delete(b"immutable").await.unwrap();
+        engine.flush_write_buffers().unwrap();
+        engine.memtable_manager.force_rotate().unwrap();
+        engine.insert(b"active", b"value").await.unwrap();
+        engine.flush_write_buffers().unwrap();
+
+        let physical = engine.physical_stats();
+        assert_eq!(physical.sstables.versions, 1);
+        assert_eq!(physical.sstables.tombstones, 0);
+        assert_eq!(physical.memtables.immutable_tables, 1);
+        assert_eq!(physical.memtables.immutable_versions, 1);
+        assert_eq!(physical.memtables.active_versions, 1);
+        assert_eq!(physical.memtables.tombstones, 1);
+        assert_eq!(physical.versions.current, 3);
+        assert_eq!(physical.versions.tombstones, 1);
+        assert!(!physical.cache.block_cache_enabled);
+        assert_eq!(physical.cache.block_cache_entries, 0);
+        assert_eq!(physical.cache.block_cache_bytes, 0);
+        assert_eq!(engine.logical_stats().await.unwrap().live_keys, 2);
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn physical_memtable_stats_follow_overwrite_and_tombstone_replacements() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), false))
+            .await
+            .unwrap();
+
+        engine.delete(b"key").await.unwrap();
+        let missing_delete = engine.physical_stats();
+        assert_eq!(missing_delete.memtables.active_versions, 1);
+        assert_eq!(missing_delete.memtables.tombstones, 1);
+
+        engine.delete(b"key").await.unwrap();
+        let repeated_delete = engine.physical_stats();
+        assert_eq!(repeated_delete.memtables.active_versions, 1);
+        assert_eq!(repeated_delete.memtables.tombstones, 1);
+
+        engine.insert(b"key", b"value").await.unwrap();
+        engine.flush_write_buffers().unwrap();
+        let tombstone_to_value = engine.physical_stats();
+        assert_eq!(tombstone_to_value.memtables.active_versions, 1);
+        assert_eq!(tombstone_to_value.memtables.tombstones, 0);
+
+        engine.insert(b"key", b"new-value").await.unwrap();
+        engine.flush_write_buffers().unwrap();
+        let overwritten = engine.physical_stats();
+        assert_eq!(overwritten.memtables.active_versions, 1);
+        assert_eq!(overwritten.memtables.tombstones, 0);
+
+        engine.delete(b"key").await.unwrap();
+        let value_to_tombstone = engine.physical_stats();
+        assert_eq!(value_to_tombstone.memtables.active_versions, 1);
+        assert_eq!(value_to_tombstone.memtables.tombstones, 1);
+        assert_eq!(engine.logical_stats().await.unwrap().live_keys, 0);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fast_mode_stats_include_acknowledged_thread_buffer_mutations() {
+        const BUFFER_CAPACITY: u64 = 64;
+
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.memtable_config.max_entries = 2;
+        let engine = Engine::open(config).await.unwrap();
+        let key = b"buffered";
+        let value = b"value";
+        let entry_bytes = (key.len() + value.len() + 32) as u64;
+
+        for _ in 0..BUFFER_CAPACITY - 1 {
+            engine.insert(key, value).await.unwrap();
+        }
+        let buffered = engine.physical_stats();
+        assert_eq!(buffered.memtables.buffered_versions, BUFFER_CAPACITY - 1);
+        assert_eq!(
+            buffered.memtables.buffered_bytes,
+            (BUFFER_CAPACITY - 1) * entry_bytes
+        );
+        assert_eq!(buffered.memtables.active_versions, 0);
+        assert_eq!(buffered.versions.current, BUFFER_CAPACITY - 1);
+
+        engine.insert(key, value).await.unwrap();
+        let published = engine.physical_stats();
+        assert_eq!(published.memtables.buffered_versions, 0);
+        assert_eq!(published.memtables.buffered_bytes, 0);
+        assert_eq!(published.memtables.active_versions, 1);
+        assert_eq!(published.memtables.active_bytes, entry_bytes);
+        assert_eq!(published.memtables.immutable_tables, 0);
+        assert_eq!(published.versions.current, 1);
+        assert_eq!(engine.logical_stats().await.unwrap().live_keys, 1);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_fast_mode_samples_never_omit_acknowledged_buffered_work() {
+        const WRITERS: usize = 4;
+        const WRITES_PER_WRITER: usize = 1_024;
+
+        let directory = TempDir::new().unwrap();
+        let engine = Arc::new(
+            Engine::open(isolated_config(directory.path(), false))
+                .await
+                .unwrap(),
+        );
+        engine.insert(b"anchor", b"value").await.unwrap();
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampled = Arc::new(AtomicU64::new(0));
+        let sampler_engine = Arc::clone(&engine);
+        let sampler_done = Arc::clone(&done);
+        let sampler_count = Arc::clone(&sampled);
+        let sampler = tokio::spawn(async move {
+            while !sampler_done.load(Ordering::Acquire) {
+                let stats = sampler_engine.physical_stats();
+                assert!(stats.versions.current >= 1);
+                sampler_count.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let writers = (0..WRITERS)
+            .map(|writer| {
+                let engine = Arc::clone(&engine);
+                tokio::spawn(async move {
+                    for index in 0..WRITES_PER_WRITER {
+                        engine
+                            .insert(format!("writer:{writer}:{index}").as_bytes(), b"value")
+                            .await
+                            .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.await.unwrap();
+        }
+        done.store(true, Ordering::Release);
+        sampler.await.unwrap();
+        assert!(sampled.load(Ordering::Relaxed) > 0);
+
+        let final_stats = engine.physical_stats();
+        assert_eq!(
+            final_stats.versions.current,
+            (1 + WRITERS * WRITES_PER_WRITER) as u64
+        );
+        assert_eq!(
+            engine.logical_stats().await.unwrap().live_keys,
+            (1 + WRITERS * WRITES_PER_WRITER) as u64
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wal_replay_reconstructs_replacement_counts_without_inflation() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), true);
+        let engine = Engine::open(config.clone()).await.unwrap();
+
+        engine.delete(b"replayed").await.unwrap();
+        engine.delete(b"replayed").await.unwrap();
+        engine.insert(b"replayed", b"first").await.unwrap();
+        engine.insert(b"replayed", b"second").await.unwrap();
+        engine.delete(b"replayed").await.unwrap();
+        engine.delete(b"replayed").await.unwrap();
+        engine.insert(b"replayed", b"final").await.unwrap();
+
+        let before = engine.physical_stats();
+        assert_eq!(before.memtables.active_versions, 1);
+        assert_eq!(before.memtables.tombstones, 0);
+        assert!(before.wal.bytes_written_since_open > 0);
+        engine.wal.as_ref().unwrap().flush().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        let after = reopened.physical_stats();
+        assert_eq!(after.memtables.active_versions, 1);
+        assert_eq!(after.memtables.tombstones, 0);
+        assert_eq!(after.versions.current, 1);
+        assert_eq!(after.versions.tombstones, 0);
+        assert_eq!(after.wal.bytes_written_since_open, 0);
+        assert_eq!(
+            reopened.get(b"replayed").await.unwrap(),
+            Some(b"final".to_vec())
+        );
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wal_stats_separate_retained_gauges_from_counters_that_reset_on_reopen() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), true);
+        let engine = Engine::open(config.clone()).await.unwrap();
+
+        engine.insert(b"wal-key", b"wal-value").await.unwrap();
+        let written = engine.physical_stats();
+        assert!(written.wal.enabled);
+        assert!(written.wal.active_segment_bytes > 0);
+        assert!(written.wal.retained_valid_bytes >= written.wal.active_segment_bytes);
+        assert_eq!(
+            written.wal.bytes_written_since_open,
+            wal_data_entry_size(b"wal-key", b"wal-value")
+        );
+        assert_eq!(
+            written.amplification.logical_bytes_ingested_since_open,
+            (b"wal-key".len() + b"wal-value".len()) as u64
+        );
+        assert_eq!(
+            written.amplification.wal_bytes_written_since_open,
+            written.wal.bytes_written_since_open
+        );
+
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        let reopened_stats = reopened.physical_stats();
+        assert!(reopened_stats.wal.retained_valid_bytes > 0);
+        assert_eq!(reopened_stats.wal.bytes_written_since_open, 0);
+        assert_eq!(
+            reopened_stats
+                .amplification
+                .logical_bytes_ingested_since_open,
+            0
+        );
+        assert_eq!(reopened.logical_stats().await.unwrap().live_keys, 1);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_manifests_are_recounted_and_persistently_upgraded() {
+        for legacy_version in [1_u32, 2_u32] {
+            let directory = TempDir::new().unwrap();
+            let sstable_directory = directory.path().join("sstables");
+            std::fs::create_dir_all(&sstable_directory).unwrap();
+            let path = sstable_directory.join("legacy.sst");
+            let mut writer = SSTableWriter::new(
+                &path,
+                SSTableConfig {
+                    compression: super::super::sstable::CompressionType::None,
+                    ..SSTableConfig::default()
+                },
+            )
+            .unwrap();
+            writer.add_versioned(b"live", Some(b"value"), 1).unwrap();
+            writer.add_versioned(b"removed", None, 2).unwrap();
+            let info = writer.finish().unwrap();
+            let mut manifest = Manifest::new();
+            manifest.sstables.push(SSTableManifestEntry {
+                id: 1,
+                level: 0,
+                path: info.path,
+                size: info.file_size,
+                entry_count: info.entry_count,
+                tombstone_count: 0,
+                min_key: info.min_key,
+                max_key: info.max_key,
+                min_sequence: info.min_sequence,
+                max_sequence: info.max_sequence,
+                creation_time: info.creation_time,
+            });
+            manifest
+                .save_legacy_for_test(directory.path(), legacy_version)
+                .unwrap();
+
+            let engine = Engine::open(isolated_config(directory.path(), false))
+                .await
+                .unwrap();
+            let stats = engine.physical_stats();
+            assert_eq!(stats.sstables.versions, 2);
+            assert_eq!(stats.sstables.tombstones, 1);
+            engine.shutdown().await.unwrap();
+            drop(engine);
+
+            let upgraded = Manifest::load_or_create(directory.path()).unwrap();
+            assert_eq!(upgraded.loaded_format_version, u64::from(MANIFEST_VERSION));
+            assert_eq!(upgraded.sstables[0].tombstone_count, 1);
+
+            let reopened = Engine::open(isolated_config(directory.path(), false))
+                .await
+                .unwrap();
+            assert_eq!(reopened.physical_stats().sstables.tombstones, 1);
+            reopened.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn logical_stats_never_observe_an_atomic_batch_prefix() {
+        const KEYS: usize = 512;
+
+        let directory = TempDir::new().unwrap();
+        let engine = Arc::new(
+            Engine::open(isolated_config(directory.path(), false))
+                .await
+                .unwrap(),
+        );
+        let mut batch = WriteBatch::with_capacity(KEYS);
+        for key in 0..KEYS {
+            batch.put(format!("stats:{key:04}"), b"value");
+        }
+
+        let scanning = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let scanner_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scanner_engine = Arc::clone(&engine);
+        let scanner_flag = Arc::clone(&scanning);
+        let scanner_started_flag = Arc::clone(&scanner_started);
+        let scanner = tokio::spawn(async move {
+            let mut observations = 0;
+            while scanner_flag.load(Ordering::Acquire) {
+                let stats = scanner_engine.logical_stats().await.unwrap();
+                assert!(
+                    stats.live_keys == 0 || stats.live_keys == KEYS as u64,
+                    "logical snapshot observed {} operations from an atomic batch",
+                    stats.live_keys
+                );
+                observations += 1;
+                scanner_started_flag.store(true, Ordering::Release);
+                tokio::task::yield_now().await;
+            }
+            observations
+        });
+
+        while !scanner_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        engine.write_batch(&batch).await.unwrap();
+        scanning.store(false, Ordering::Release);
+        assert!(scanner.await.unwrap() > 0);
+        assert_eq!(engine.logical_stats().await.unwrap().live_keys, KEYS as u64);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn physical_sstable_gauges_publish_consistently_during_compaction() {
+        const KEYS: usize = 512;
+
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 4;
+        let engine = Arc::new(Engine::open(config).await.unwrap());
+        for generation in 0..4 {
+            for key in 0..KEYS {
+                engine
+                    .insert(
+                        format!("gauge:{key:04}").as_bytes(),
+                        format!("generation-{generation}").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            engine.flush().await.unwrap();
+        }
+        assert_eq!(engine.physical_stats().sstables.versions, (4 * KEYS) as u64);
+
+        let compacting_engine = Arc::clone(&engine);
+        let compaction = tokio::spawn(async move { compacting_engine.compact().await.unwrap() });
+        let mut observations = 0;
+        while !compaction.is_finished() {
+            let stats = engine.physical_stats();
+            assert_eq!(stats.versions.current, stats.sstables.versions);
+            assert_eq!(stats.versions.tombstones, stats.sstables.tombstones);
+            assert!(
+                (stats.sstables.files == 4 && stats.sstables.versions == (4 * KEYS) as u64)
+                    || (stats.sstables.files == 1 && stats.sstables.versions == KEYS as u64)
+            );
+            observations += 1;
+            tokio::task::yield_now().await;
+        }
+        compaction.await.unwrap();
+        assert!(observations > 0);
+        let settled = engine.physical_stats();
+        assert_eq!(settled.sstables.files, 1);
+        assert_eq!(settled.sstables.versions, KEYS as u64);
+        assert_eq!(
+            settled.versions.reclaimed_by_compaction_since_open,
+            (3 * KEYS) as u64
+        );
         engine.shutdown().await.unwrap();
     }
 
@@ -2334,6 +3292,7 @@ mod tests {
         config.wal_config = WalConfig::paranoid();
         let engine = Arc::new(Engine::open(config.clone()).await.unwrap());
         let wal = Arc::clone(engine.wal.as_ref().unwrap());
+        let acknowledged_payload_bytes = Arc::clone(&engine.logical_bytes_ingested);
 
         let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -2376,9 +3335,91 @@ mod tests {
         })
         .await
         .expect("queued group commit did not finish");
+        assert_eq!(acknowledged_payload_bytes.load(Ordering::Relaxed), 0);
+        assert!(wal.bytes_written_since_open() > 0);
         drop(wal);
 
         let reopened = Engine::open(config).await.unwrap();
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_group_commit_is_physical_wal_work_but_not_acknowledged_ingestion() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), true);
+        config.wal_config = WalConfig::paranoid();
+        let engine = Arc::new(Engine::open(config.clone()).await.unwrap());
+        let wal = Arc::clone(engine.wal.as_ref().unwrap());
+        let retained_before = wal.retained_size();
+
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_wal = Arc::clone(&wal);
+        let lock_holder = tokio::task::spawn_blocking(move || {
+            let file_guard = lock_wal.lock_current_file_for_test();
+            let _ = locked_tx.send(());
+            release_rx.recv().unwrap();
+            drop(file_guard);
+        });
+        locked_rx.await.unwrap();
+
+        let queued_engine = Arc::clone(&engine);
+        let queued = tokio::spawn(async move {
+            queued_engine
+                .insert(b"cancelled:physical", b"persisted")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while wal.group_commit_in_progress_for_test() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued group commit did not start");
+        queued.abort();
+        assert!(queued.await.unwrap_err().is_cancelled());
+
+        release_tx.send(()).unwrap();
+        lock_holder.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while wal.group_commit_in_progress_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued group commit did not finish");
+
+        let physical = engine.physical_stats();
+        assert!(physical.wal.bytes_written_since_open > 0);
+        assert_eq!(
+            physical.wal.retained_valid_bytes - retained_before,
+            physical.wal.bytes_written_since_open
+        );
+        assert_eq!(
+            physical.amplification.wal_bytes_written_since_open,
+            physical.wal.bytes_written_since_open
+        );
+        assert_eq!(physical.amplification.logical_bytes_ingested_since_open, 0);
+        assert_eq!(
+            engine.legacy_stats().wal_bytes_written,
+            physical.wal.bytes_written_since_open
+        );
+        assert_eq!(engine.get(b"cancelled:physical").await.unwrap(), None);
+        wal.flush().await.unwrap();
+        let retained_after = wal.retained_size();
+        drop(wal);
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(reopened.physical_stats().wal.bytes_written_since_open, 0);
+        assert_eq!(
+            reopened.physical_stats().wal.retained_valid_bytes,
+            retained_after
+        );
+        assert_eq!(
+            reopened.get(b"cancelled:physical").await.unwrap(),
+            Some(b"persisted".to_vec())
+        );
         reopened.shutdown().await.unwrap();
     }
 
@@ -2876,6 +3917,7 @@ mod tests {
         let guard = iterator.next().unwrap().unwrap();
         assert!(!guard.value_loaded_for_test());
         assert_eq!(guard.key(), b"lazy:key");
+        assert_eq!(guard.value_len(), b"large-value".len());
         assert!(!guard.value_loaded_for_test());
         assert_eq!(guard.value(), b"large-value");
         assert!(guard.value_loaded_for_test());

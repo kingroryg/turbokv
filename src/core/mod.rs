@@ -23,7 +23,10 @@ pub use serialization::{
 };
 pub use traits::StorageEngine;
 pub use types::{
-    BatchOp, CompactionResult, CompactionStyle, Compression, DbConfig, StorageStats, WriteBatch,
+    BatchOp, CompactionResult, CompactionStyle, Compression, DbConfig, LogicalStats,
+    PhysicalCacheStats, PhysicalMemTableStats, PhysicalSSTableStats, PhysicalStats,
+    PhysicalVersionStats, StorageStats, WalStats, WriteAmplificationStats, WriteBatch,
+    WriteStallStats,
 };
 
 /// Protocol version for WAL format compatibility.

@@ -438,11 +438,11 @@ async fn test_stats_wal_size() {
     db.insert(b"stat_key_2", b"stat_val_2").await.unwrap();
     db.insert(b"stat_key_3", b"stat_val_3").await.unwrap();
 
-    let stats = db.stats();
+    let stats = db.physical_stats();
     assert!(
-        stats.wal_size > 0,
+        stats.wal.retained_valid_bytes > 0,
         "WAL size should be > 0 after inserting data in durable mode, got {}",
-        stats.wal_size
+        stats.wal.retained_valid_bytes
     );
 }
 
@@ -812,16 +812,17 @@ async fn test_stats_basic() {
     db.insert(b"stat_b", b"value_b").await.unwrap();
     db.insert(b"stat_c", b"value_c").await.unwrap();
 
-    let stats = db.stats();
+    let logical = db.logical_stats().await.unwrap();
+    assert_eq!(logical.live_keys, 3);
+    assert_eq!(logical.key_bytes, 18);
+    assert_eq!(logical.value_bytes, 21);
+    assert_eq!(logical.total_bytes, 39);
+    let stats = db.physical_stats();
     assert!(
-        stats.total_keys > 0,
-        "total_keys should be > 0 after inserting data, got {}",
-        stats.total_keys,
-    );
-    assert!(
-        stats.memtable_size > 0,
-        "memtable_size should be > 0 after inserting data, got {}",
-        stats.memtable_size,
+        stats.memtables.active_bytes + stats.memtables.immutable_bytes > 0,
+        "memtable bytes should be > 0 after inserting data, got active={} immutable={}",
+        stats.memtables.active_bytes,
+        stats.memtables.immutable_bytes,
     );
 }
 
@@ -840,15 +841,15 @@ async fn test_stats_include_durable_bulkload_counters() {
         .await
         .unwrap();
 
-    let before_flush = db.stats();
-    assert!(before_flush.wal_bytes_written > 0);
-    assert_eq!(before_flush.immutable_memtables, 0);
+    let before_flush = db.physical_stats();
+    assert!(before_flush.amplification.wal_bytes_written_since_open > 0);
+    assert_eq!(before_flush.memtables.immutable_tables, 0);
 
     db.flush().await.unwrap();
-    let after_flush = db.stats();
-    assert!(after_flush.sstable_flush_bytes_written > 0);
-    assert!(after_flush.l0_sstable_count >= 1);
-    assert_eq!(after_flush.write_stall_count, 0);
+    let after_flush = db.physical_stats();
+    assert!(after_flush.amplification.flush_bytes_written_since_open > 0);
+    assert!(after_flush.sstables.level_zero_files >= 1);
+    assert_eq!(after_flush.stalls.count_since_open, 0);
 }
 
 // ---------------------------------------------------------------------------

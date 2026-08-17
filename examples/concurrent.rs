@@ -75,8 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Verify all data was written
-    let stats = db.stats();
-    println!("  Keys in database: {}", stats.total_keys);
+    let stats = db.logical_stats().await?;
+    println!("  Keys in database: {}", stats.live_keys);
 
     // ============================================
     // Concurrent Readers

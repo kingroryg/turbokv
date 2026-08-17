@@ -200,7 +200,15 @@ the corresponding clean-tree JSON evidence artifact.
 | `write_batch(batch)` | Batch write operations |
 | `flush()` | Flush memtable to disk |
 | `compact()` | Trigger manual compaction |
-| `stats()` | Get database statistics |
+| `logical_stats()` | Scan a coherent snapshot for exact unique live-key and logical-byte counts |
+| `physical_stats()` | Get cheap physical gauges and counters since open without scanning logical data |
+| `stats()` | Legacy mixed physical statistics (deprecated) |
+
+`logical_stats()` counts each live key once and reports key bytes, value bytes,
+and their sum. It is a fallible full snapshot scan and can freeze the active
+memtable. `physical_stats()` is the monitoring path: it performs no logical
+scan, separates WAL/memtable/SSTable/version/tombstone/cache/stall data, and
+names process-lifetime counters with a `_since_open` suffix.
 
 ### DbOptions
 

@@ -142,7 +142,14 @@ impl SegmentMetadata {
 }
 
 pub(crate) fn wal_sequence_from_path(path: &Path) -> Option<u64> {
-    path.file_stem()?.to_string_lossy().parse().ok()
+    let filename = path.file_name()?.to_str()?;
+    let stem = filename.strip_suffix(".wal")?;
+    if stem.len() != 20 || !stem.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    let sequence = stem.parse::<u64>().ok()?;
+    (filename == format!("{sequence:020}.wal")).then_some(sequence)
 }
 
 /// Create a new WAL file
@@ -707,6 +714,35 @@ mod tests {
             file.read_u64::<LittleEndian>().unwrap(),
             file.read_u64::<LittleEndian>().unwrap(),
         )
+    }
+
+    #[test]
+    fn wal_sequence_requires_the_writer_canonical_filename() {
+        assert_eq!(
+            wal_sequence_from_path(Path::new("00000000000000000042.wal")),
+            Some(42)
+        );
+        assert_eq!(wal_sequence_from_path(Path::new("1.wal")), None);
+        assert_eq!(
+            wal_sequence_from_path(Path::new("0000000000000000001.wal")),
+            None
+        );
+        assert_eq!(
+            wal_sequence_from_path(Path::new("000000000000000000001.wal")),
+            None
+        );
+        assert_eq!(
+            wal_sequence_from_path(Path::new("00000000000000000042.tmp")),
+            None
+        );
+        assert_eq!(
+            wal_sequence_from_path(Path::new("not-a-wal-segment.wal")),
+            None
+        );
+        assert_eq!(
+            wal_sequence_from_path(Path::new("18446744073709551616.wal")),
+            None
+        );
     }
 
     #[test]

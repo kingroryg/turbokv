@@ -14,10 +14,21 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_skiplist::SkipMap;
+use parking_lot::Mutex;
 use tracing::info;
 
-use super::types::{MemTableConfig, MemTableEntry, MemTableStats};
+use super::types::{estimated_memtable_entry_size, MemTableConfig, MemTableEntry, MemTableStats};
 use crate::storage::prefix_upper_bound;
+
+/// Public raw-table mutations do not have the manager's same-key lock. A
+/// shared striped set keeps replacement and its physical counters together
+/// without allocating locks for every table or key.
+const RAW_MUTATION_LOCK_STRIPES: usize = 4_096;
+static RAW_MUTATION_LOCKS: std::sync::LazyLock<Box<[Mutex<()>]>> = std::sync::LazyLock::new(|| {
+    (0..RAW_MUTATION_LOCK_STRIPES)
+        .map(|_| Mutex::new(()))
+        .collect()
+});
 
 /// Result type for MemTable operations
 pub type Result<T> = std::result::Result<T, MemTableError>;
@@ -98,6 +109,17 @@ impl MemTable {
         value: &[u8],
         sequence: u64,
     ) -> Result<()> {
+        let _mutation = self.lock_raw_mutation(key);
+        self.insert_with_sequence_prelocked(key, value, sequence)
+    }
+
+    /// Apply an insert while the manager's same-key lock is held.
+    pub(crate) fn insert_with_sequence_prelocked(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        sequence: u64,
+    ) -> Result<()> {
         if !self.prepare_mutation(key, sequence)? {
             return Ok(());
         }
@@ -107,32 +129,33 @@ impl MemTable {
     }
 
     /// Apply a batch insert after the manager has made the active table stable.
-    pub(crate) fn insert_batch_entry(&self, key: &[u8], value: &[u8], sequence: u64) {
+    pub(crate) fn insert_batch_entry_prelocked(&self, key: &[u8], value: &[u8], sequence: u64) {
         if self.prepare_unbounded_mutation(key, sequence) {
             self.apply_insert(key, value, sequence);
         }
     }
 
     fn apply_insert(&self, key: &[u8], value: &[u8], sequence: u64) {
-        // Inline size estimation for fast path
-        let entry_size = key.len() + value.len() + 32; // 32 for entry overhead
+        let entry_size = estimated_memtable_entry_size(key, Some(value));
 
         let entry = MemTableEntry::new(value.to_vec(), sequence);
 
         // Check if key already exists BEFORE inserting
-        let existing = self.data.get(key);
-        let was_existing = existing.is_some();
-        let was_tombstone = existing.map(|e| e.value().is_tombstone()).unwrap_or(false);
+        let previous = self.data.get(key).map(|existing| {
+            (
+                existing.value().is_tombstone(),
+                estimated_memtable_entry_size(key, existing.value().value.as_deref()),
+            )
+        });
 
         self.data.insert(key.to_vec(), entry);
 
-        self.size_bytes.fetch_add(entry_size, Ordering::Relaxed);
+        self.replace_accounted_size(previous.map_or(0, |(_, size)| size), entry_size);
 
-        if was_tombstone {
-            // Replacing a tombstone: reduce tombstone count, add to entry count
+        if previous.is_some_and(|(was_tombstone, _)| was_tombstone) {
+            // The physical slot already exists; only its kind changes.
             self.tombstone_count.fetch_sub(1, Ordering::Relaxed);
-            self.entry_count.fetch_add(1, Ordering::Relaxed);
-        } else if !was_existing {
+        } else if previous.is_none() {
             // New key: increment entry count
             self.entry_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -155,6 +178,12 @@ impl MemTable {
     /// reached this memtable.
     #[inline]
     pub(crate) fn delete_with_sequence(&self, key: &[u8], sequence: u64) -> Result<()> {
+        let _mutation = self.lock_raw_mutation(key);
+        self.delete_with_sequence_prelocked(key, sequence)
+    }
+
+    /// Apply a tombstone while the manager's same-key lock is held.
+    pub(crate) fn delete_with_sequence_prelocked(&self, key: &[u8], sequence: u64) -> Result<()> {
         if !self.prepare_mutation(key, sequence)? {
             return Ok(());
         }
@@ -164,7 +193,7 @@ impl MemTable {
     }
 
     /// Apply a batch tombstone after the manager has made the active table stable.
-    pub(crate) fn delete_batch_entry(&self, key: &[u8], sequence: u64) {
+    pub(crate) fn delete_batch_entry_prelocked(&self, key: &[u8], sequence: u64) {
         if self.prepare_unbounded_mutation(key, sequence) {
             self.apply_delete(key, sequence);
         }
@@ -173,24 +202,48 @@ impl MemTable {
     fn apply_delete(&self, key: &[u8], sequence: u64) {
         let entry = MemTableEntry::tombstone(sequence);
 
-        // Check if we're deleting an existing non-tombstone entry
-        let was_value = self
-            .data
-            .get(key)
-            .map(|e| !e.value().is_tombstone())
-            .unwrap_or(false);
+        let previous = self.data.get(key).map(|existing| {
+            (
+                !existing.value().is_tombstone(),
+                estimated_memtable_entry_size(key, existing.value().value.as_deref()),
+            )
+        });
 
         self.data.insert(key.to_vec(), entry);
 
-        if was_value {
+        if previous.is_some_and(|(was_value, _)| was_value) {
             self.tombstone_count.fetch_add(1, Ordering::Relaxed);
-        } else {
+        } else if previous.is_none() {
             self.entry_count.fetch_add(1, Ordering::Relaxed);
             self.tombstone_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        // Approximate size (just key + overhead)
-        self.size_bytes.fetch_add(key.len() + 32, Ordering::Relaxed);
+        self.replace_accounted_size(
+            previous.map_or(0, |(_, size)| size),
+            estimated_memtable_entry_size(key, None),
+        );
+    }
+
+    fn replace_accounted_size(&self, previous: usize, replacement: usize) {
+        if replacement >= previous {
+            self.size_bytes
+                .fetch_add(replacement - previous, Ordering::Relaxed);
+        } else {
+            self.size_bytes
+                .fetch_sub(previous - replacement, Ordering::Relaxed);
+        }
+    }
+
+    fn lock_raw_mutation(&self, key: &[u8]) -> parking_lot::MutexGuard<'static, ()> {
+        // Mix in the table identity so equal keys in unrelated tables rarely
+        // contend. Moving a table requires exclusive ownership, so its address
+        // remains stable whenever concurrent methods can run.
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ self as *const Self as usize as u64;
+        for byte in key {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        RAW_MUTATION_LOCKS[hash as usize % RAW_MUTATION_LOCK_STRIPES].lock()
     }
 
     /// Get a value by key
@@ -441,6 +494,85 @@ mod tests {
         table.delete(b"key1").unwrap();
         assert!(!table.contains_key(b"key1"));
         assert_eq!(table.get(b"key1"), None);
+    }
+
+    #[test]
+    fn replacement_transitions_preserve_physical_entry_and_tombstone_counts() {
+        let table = MemTable::new(test_config());
+
+        table.delete(b"key").unwrap();
+        assert_eq!(table.stats().entry_count, 1);
+        assert_eq!(table.stats().tombstone_count, 1);
+        assert_eq!(table.stats().size_bytes, b"key".len() + 32);
+
+        table.delete(b"key").unwrap();
+        assert_eq!(table.stats().entry_count, 1);
+        assert_eq!(table.stats().tombstone_count, 1);
+        assert_eq!(table.stats().size_bytes, b"key".len() + 32);
+
+        table.insert(b"key", b"value").unwrap();
+        assert_eq!(table.stats().entry_count, 1);
+        assert_eq!(table.stats().tombstone_count, 0);
+        assert_eq!(table.stats().size_bytes, b"key".len() + b"value".len() + 32);
+
+        table.insert(b"key", b"new-value").unwrap();
+        assert_eq!(table.stats().entry_count, 1);
+        assert_eq!(table.stats().tombstone_count, 0);
+        assert_eq!(
+            table.stats().size_bytes,
+            b"key".len() + b"new-value".len() + 32
+        );
+
+        table.delete(b"key").unwrap();
+        assert_eq!(table.stats().entry_count, 1);
+        assert_eq!(table.stats().tombstone_count, 1);
+        assert_eq!(table.stats().size_bytes, b"key".len() + 32);
+    }
+
+    #[test]
+    fn concurrent_same_key_replacements_keep_physical_counters_bounded() {
+        const WRITERS: usize = 16;
+
+        let table = Arc::new(MemTable::new(test_config()));
+        table.delete(b"shared").unwrap();
+        let ready = Arc::new(std::sync::Barrier::new(WRITERS + 1));
+        let writers = (0..WRITERS)
+            .map(|index| {
+                let table = Arc::clone(&table);
+                let ready = Arc::clone(&ready);
+                std::thread::spawn(move || {
+                    ready.wait();
+                    table
+                        .insert(b"shared", format!("value-{index}").as_bytes())
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        ready.wait();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(table.stats().entry_count, 1);
+        assert_eq!(table.stats().tombstone_count, 0);
+
+        let ready = Arc::new(std::sync::Barrier::new(WRITERS + 1));
+        let deleters = (0..WRITERS)
+            .map(|_| {
+                let table = Arc::clone(&table);
+                let ready = Arc::clone(&ready);
+                std::thread::spawn(move || {
+                    ready.wait();
+                    table.delete(b"shared").unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        ready.wait();
+        for deleter in deleters {
+            deleter.join().unwrap();
+        }
+        assert_eq!(table.stats().entry_count, 1);
+        assert_eq!(table.stats().tombstone_count, 1);
+        assert_eq!(table.stats().size_bytes, b"shared".len() + 32);
     }
 
     #[test]
