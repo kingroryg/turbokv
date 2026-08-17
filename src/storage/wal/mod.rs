@@ -43,10 +43,11 @@ use tracing::info;
 
 use crate::core::crypto::crc32_checksum;
 use file::{
-    create_file, entry_size, finalize_header, read_entry, read_header_last_sequence, recover_file,
-    write_entries_batch, write_entry, WalFile,
+    create_file, entry_size, finalize_header, inspect_segment, open_recovered_file,
+    read_and_validate_header, read_entry_versioned, synchronize_segment_header,
+    wal_sequence_from_path, write_entries_batch, write_entry, WalFile,
 };
-use types::{ENTRY_HEADER_SIZE, WAL_HEADER_SIZE};
+use types::{ENTRY_HEADER_SIZE, ENTRY_RESERVED_SIZE, WAL_HEADER_SIZE};
 
 // Thread-local buffer for zero-allocation WAL writes
 // Pre-allocated to avoid per-write heap allocations
@@ -168,7 +169,7 @@ impl WriteAheadLog {
             let crc_offset = buf.len();
             buf.extend_from_slice(&[0u8; 4]);
             // 7. Reserved (6 bytes) - offset 26
-            buf.extend_from_slice(&[0u8; 6]);
+            buf.extend_from_slice(&[0_u8; ENTRY_RESERVED_SIZE]);
 
             // 8. Encode key-value data
             let data_start = buf.len();
@@ -184,16 +185,14 @@ impl WriteAheadLog {
             let entry_bytes = buf.len() as u64;
             // Single write to file
             let mut file = self.current_file.write();
-            if file.size + entry_bytes > self.config.max_file_size {
+            if file.should_rotate(entry_bytes, self.config.max_file_size) {
                 finalize_header(&mut file)?;
-                let new_seq = file.last_sequence + 1;
+                let new_seq = file.next_segment_sequence()?;
                 *file = create_file(&self.wal_dir, new_seq, &self.config)?;
                 info!("Rotated WAL file, new sequence: {}", new_seq);
             }
             file.file.write_all(&buf)?;
-            file.size += entry_bytes;
-            file.entry_count += 1;
-            file.last_sequence = file.last_sequence.max(sequence);
+            file.record_append(entry_bytes, 1, sequence, sequence);
 
             Ok(sequence)
         })
@@ -208,7 +207,7 @@ impl WriteAheadLog {
         // Check if rotation needed (check while holding read lock, then upgrade if needed)
         let needs_rotation = {
             let file = self.current_file.read();
-            file.size + entry_bytes > self.config.max_file_size
+            file.should_rotate(entry_bytes, self.config.max_file_size)
         };
 
         if needs_rotation {
@@ -217,9 +216,7 @@ impl WriteAheadLog {
 
         let mut file = self.current_file.write();
         write_entry(&mut file.file, entry)?;
-        file.size += entry_bytes;
-        file.entry_count += 1;
-        file.last_sequence = file.last_sequence.max(entry.sequence);
+        file.record_append(entry_bytes, 1, entry.sequence, entry.sequence);
 
         if sync {
             // Paranoid mode: fsync to disk (survives power loss)
@@ -284,7 +281,7 @@ impl WriteAheadLog {
             buf.push(0); // flags
             let crc_offset = buf.len();
             buf.extend_from_slice(&[0u8; 4]); // CRC placeholder
-            buf.extend_from_slice(&[0u8; 6]); // reserved
+            buf.extend_from_slice(&[0_u8; ENTRY_RESERVED_SIZE]);
 
             // Encode key only (no value for delete)
             let data_start = buf.len();
@@ -298,16 +295,14 @@ impl WriteAheadLog {
             // Check rotation and write
             let entry_bytes = buf.len() as u64;
             let mut file = self.current_file.write();
-            if file.size + entry_bytes > self.config.max_file_size {
+            if file.should_rotate(entry_bytes, self.config.max_file_size) {
                 finalize_header(&mut file)?;
-                let new_seq = file.last_sequence + 1;
+                let new_seq = file.next_segment_sequence()?;
                 *file = create_file(&self.wal_dir, new_seq, &self.config)?;
                 info!("Rotated WAL file, new sequence: {}", new_seq);
             }
             file.file.write_all(&buf)?;
-            file.size += entry_bytes;
-            file.entry_count += 1;
-            file.last_sequence = file.last_sequence.max(sequence);
+            file.record_append(entry_bytes, 1, sequence, sequence);
 
             Ok(sequence)
         })
@@ -319,16 +314,22 @@ impl WriteAheadLog {
             return Ok(vec![]);
         }
 
-        let (sequences, encoded, last_sequence) = self.encode_entries_batch(entries)?;
-        self.write_encoded_batch(&encoded, entries.len() as u64, last_sequence)
-            .await?;
+        let (sequences, encoded, first_sequence, last_sequence) =
+            self.encode_entries_batch(entries)?;
+        self.write_encoded_batch(
+            &encoded,
+            entries.len() as u64,
+            first_sequence,
+            last_sequence,
+        )
+        .await?;
 
         Ok(sequences)
     }
 
     pub async fn flush(&self) -> Result<()> {
-        let file = self.current_file.write();
-        file.file.sync_all()?;
+        let mut file = self.current_file.write();
+        finalize_header(&mut file)?;
         Ok(())
     }
 
@@ -362,22 +363,10 @@ impl WriteAheadLog {
     pub async fn iter_entries_from(&self, start_sequence: u64) -> Result<WalEntryIterator> {
         self.flush().await?;
 
-        let current_path = self.current_file.read().path.clone();
         let mut wal_files = self.list_wal_files().await?;
         wal_files.sort_by_key(|f| f.0);
 
-        let paths: Vec<PathBuf> = wal_files
-            .into_iter()
-            .filter(|(_, path)| {
-                if start_sequence == 0 || *path == current_path {
-                    return true;
-                }
-                read_header_last_sequence(path)
-                    .map(|last| last >= start_sequence)
-                    .unwrap_or(true)
-            })
-            .map(|(_, p)| p)
-            .collect();
+        let paths: Vec<PathBuf> = wal_files.into_iter().map(|(_, path)| path).collect();
 
         WalEntryIterator::new(paths, start_sequence)
     }
@@ -385,16 +374,38 @@ impl WriteAheadLog {
     pub async fn truncate(&self, up_to_sequence: u64) -> Result<()> {
         info!("Truncating WAL up to sequence {}", up_to_sequence);
 
-        let current_path = self.current_file.read().path.clone();
+        let wal_files = self.list_wal_files().await?;
+        self.truncate_files(&wal_files, up_to_sequence)
+    }
 
-        for (seq, path) in self.list_wal_files().await? {
-            // Never delete the current active file
-            if path == current_path {
+    fn truncate_files(&self, wal_files: &[(u64, PathBuf)], up_to_sequence: u64) -> Result<()> {
+        // Validate immutable candidates without blocking appends. A file that
+        // is non-active here cannot become active later because rotation only
+        // advances filenames. If the observed active file rotates meanwhile,
+        // leaving it for the next reclamation pass is conservative.
+        let observed_current_path = self.current_file.read().path.clone();
+        let mut eligible = Vec::new();
+
+        for (_, path) in wal_files {
+            if *path == observed_current_path {
                 continue;
             }
-            if seq < up_to_sequence {
+            let metadata = inspect_segment(path, false)?;
+            if metadata
+                .last_sequence
+                .map_or(true, |last| last < up_to_sequence)
+            {
+                eligible.push(path);
+            }
+        }
+
+        // Keep the active identity stable only for the final recheck/unlink
+        // window. Rotation and appends require the write side of this lock.
+        let current_file = self.current_file.read();
+        for path in eligible {
+            if *path != current_file.path {
                 info!("Deleting WAL file: {:?}", path);
-                tokio::fs::remove_file(path).await?;
+                std::fs::remove_file(path)?;
             }
         }
         Ok(())
@@ -449,7 +460,7 @@ impl WriteAheadLog {
     fn encode_entries_batch(
         &self,
         entries: &[(&[u8], Option<&[u8]>)],
-    ) -> Result<(Vec<u64>, Vec<u8>, u64)> {
+    ) -> Result<(Vec<u64>, Vec<u8>, u64, u64)> {
         let start_sequence = self
             .sequence
             .fetch_add(entries.len() as u64, Ordering::SeqCst);
@@ -479,7 +490,7 @@ impl WriteAheadLog {
 
             let crc_offset = encoded.len();
             encoded.extend_from_slice(&[0u8; 4]);
-            encoded.extend_from_slice(&[0u8; 6]);
+            encoded.extend_from_slice(&[0_u8; ENTRY_RESERVED_SIZE]);
 
             let data_start = encoded.len();
             encoded.extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -494,19 +505,20 @@ impl WriteAheadLog {
         }
 
         let last_sequence = sequences.last().copied().unwrap_or(start_sequence);
-        Ok((sequences, encoded, last_sequence))
+        Ok((sequences, encoded, start_sequence, last_sequence))
     }
 
     async fn write_encoded_batch(
         &self,
         encoded: &[u8],
         entry_count: u64,
+        first_sequence: u64,
         last_sequence: u64,
     ) -> Result<()> {
         let total_batch_size = encoded.len() as u64;
         let needs_rotation = {
             let f = self.current_file.read();
-            f.size + total_batch_size > self.config.max_file_size
+            f.should_rotate(total_batch_size, self.config.max_file_size)
         };
         if needs_rotation {
             self.rotate().await?;
@@ -514,9 +526,7 @@ impl WriteAheadLog {
 
         let mut f = self.current_file.write();
         f.file.write_all(encoded)?;
-        f.size += total_batch_size;
-        f.entry_count += entry_count;
-        f.last_sequence = f.last_sequence.max(last_sequence);
+        f.record_append(total_batch_size, entry_count, first_sequence, last_sequence);
 
         if self.config.sync_on_write {
             f.file.sync_all()?;
@@ -597,13 +607,39 @@ impl WriteAheadLog {
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.extension() == Some(std::ffi::OsStr::new("wal")) {
-                wal_files.push(path);
+                if let Some(sequence) = wal_sequence_from_path(&path) {
+                    wal_files.push((sequence, path));
+                }
             }
         }
-        wal_files.sort();
+        wal_files.sort_by_key(|(sequence, _)| *sequence);
 
-        if let Some(latest) = wal_files.last() {
-            recover_file(latest, config)
+        if let Some((latest_filename_sequence, latest)) = wal_files.last() {
+            let mut next_sequence = 0;
+            for (_, path) in &wal_files[..wal_files.len() - 1] {
+                let metadata = inspect_segment(path, false)?;
+                synchronize_segment_header(path, metadata)?;
+                next_sequence = next_sequence.max(metadata.next_sequence());
+            }
+            let latest_metadata = inspect_segment(latest, true)?;
+            let (mut file, latest_next_sequence) = open_recovered_file(latest, latest_metadata)?;
+            next_sequence = next_sequence.max(latest_next_sequence);
+
+            // Legacy segments remain readable, but current writes use v3. Start
+            // a new v3 segment rather than mixing record layouts in one file.
+            if latest_metadata.format.has_legacy_extension() {
+                finalize_header(&mut file)?;
+                let new_sequence = next_sequence.max(latest_filename_sequence.saturating_add(1));
+                return Ok((create_file(wal_dir, new_sequence, config)?, new_sequence));
+            }
+
+            if file.entry_count == 0 {
+                file.first_sequence = next_sequence;
+                file.last_sequence = next_sequence;
+                finalize_header(&mut file)?;
+            }
+
+            Ok((file, next_sequence))
         } else {
             Ok((create_file(wal_dir, 0, config)?, 0))
         }
@@ -616,10 +652,8 @@ impl WriteAheadLog {
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.extension() == Some(std::ffi::OsStr::new("wal")) {
-                if let Some(name) = path.file_stem() {
-                    if let Ok(seq) = name.to_string_lossy().parse::<u64>() {
-                        files.push((seq, path));
-                    }
+                if let Some(sequence) = wal_sequence_from_path(&path) {
+                    files.push((sequence, path));
                 }
             }
         }
@@ -634,13 +668,22 @@ impl WriteAheadLog {
         seen: &mut HashSet<u64>,
     ) -> Result<()> {
         let file = File::open(path)?;
+        let file_end = file.metadata()?.len();
         let mut reader = BufReader::new(file);
+        let (format, _) = read_and_validate_header(&mut reader)?;
         reader.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
 
-        while let Ok(entry) = read_entry(&mut reader) {
-            if entry.sequence >= start_sequence && !seen.contains(&entry.sequence) {
-                seen.insert(entry.sequence);
-                entries.push(entry);
+        loop {
+            let remaining = file_end.saturating_sub(reader.stream_position()?);
+            match read_entry_versioned(&mut reader, format, remaining) {
+                Ok(entry) => {
+                    if entry.sequence >= start_sequence && !seen.contains(&entry.sequence) {
+                        seen.insert(entry.sequence);
+                        entries.push(entry);
+                    }
+                }
+                Err(WalError::Eof) => break,
+                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -662,7 +705,7 @@ fn write_batch_sync(
     let total_batch_size: u64 = entries.iter().map(|e| entry_size(e) as u64).sum();
     let needs_rotation = {
         let f = current_file.read();
-        f.size + total_batch_size > config.max_file_size
+        f.should_rotate(total_batch_size, config.max_file_size)
     };
     if needs_rotation {
         rotate_sync(current_file, wal_dir, config)?;
@@ -670,10 +713,16 @@ fn write_batch_sync(
 
     let mut f = current_file.write();
     write_entries_batch(&mut f.file, &entries)?;
-    f.size += total_batch_size;
-    f.entry_count += entries.len() as u64;
-    if let Some(max_sequence) = entries.iter().map(|entry| entry.sequence).max() {
-        f.last_sequence = f.last_sequence.max(max_sequence);
+    if let (Some(min_sequence), Some(max_sequence)) = (
+        entries.iter().map(|entry| entry.sequence).min(),
+        entries.iter().map(|entry| entry.sequence).max(),
+    ) {
+        f.record_append(
+            total_batch_size,
+            entries.len() as u64,
+            min_sequence,
+            max_sequence,
+        );
     }
 
     if config.sync_on_write {
@@ -690,7 +739,7 @@ fn rotate_sync(
     let mut current = current_file.write();
     finalize_header(&mut current)?;
 
-    let new_seq = current.last_sequence + 1;
+    let new_seq = current.next_segment_sequence()?;
     *current = create_file(wal_dir, new_seq, config)?;
 
     info!("Rotated WAL file, new sequence: {}", new_seq);
@@ -699,8 +748,33 @@ fn rotate_sync(
 
 #[cfg(test)]
 mod tests {
+    use super::types::{LEGACY_ENTRY_EXTENSION_SIZE, WAL_FIRST_SEQUENCE_OFFSET};
     use super::*;
+    use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
     use tempfile::TempDir;
+
+    fn wal_paths(directory: &Path) -> Vec<PathBuf> {
+        let mut paths: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "wal"))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    fn header_bounds(path: &Path) -> (u64, u64, u64) {
+        let mut file = File::open(path).unwrap();
+        file.seek(SeekFrom::Start(WAL_FIRST_SEQUENCE_OFFSET))
+            .unwrap();
+        (
+            file.read_u64::<LittleEndian>().unwrap(),
+            file.read_u64::<LittleEndian>().unwrap(),
+            file.read_u64::<LittleEndian>().unwrap(),
+        )
+    }
 
     #[tokio::test]
     async fn test_wal_append_and_read() {
@@ -752,5 +826,384 @@ mod tests {
 
         let entries = wal.read_from(0).await.unwrap();
         assert_eq!(entries.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn repaired_tail_accepts_reachable_appends_across_a_second_recovery() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig::paranoid();
+        let wal = WriteAheadLog::new(directory.path(), config.clone())
+            .await
+            .unwrap();
+        assert_eq!(wal.append(b"before", b"repair").await.unwrap(), 0);
+        wal.flush().await.unwrap();
+        let path = wal.current_file.read().path.clone();
+        let valid_end = wal.current_size();
+        drop(wal);
+
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[8, 0, 0, 0, 1, 2, 3])
+            .unwrap();
+
+        let repaired = WriteAheadLog::new(directory.path(), config.clone())
+            .await
+            .unwrap();
+        assert_eq!(repaired.current_size(), valid_end);
+        assert_eq!(path.metadata().unwrap().len(), valid_end);
+        assert_eq!(repaired.current_sequence(), 1);
+        assert_eq!(repaired.append(b"after", b"repair").await.unwrap(), 1);
+        repaired.flush().await.unwrap();
+        assert_eq!(header_bounds(&path), (0, 1, 2));
+        drop(repaired);
+
+        let reopened = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        let entries = reopened.read_from(0).await.unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(reopened.append(b"second", b"reopen").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_reclamation_retains_a_segment_spanning_the_frontier() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: 140,
+            sync_on_write: true,
+            ..WalConfig::default()
+        };
+        let wal = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        for key in [b"a", b"b", b"c"] {
+            wal.append(key, b"v").await.unwrap();
+        }
+        wal.flush().await.unwrap();
+        assert_eq!(wal_paths(directory.path()).len(), 2);
+
+        wal.truncate(1).await.unwrap();
+        assert_eq!(wal_paths(directory.path()).len(), 2);
+
+        wal.truncate(2).await.unwrap();
+        assert_eq!(wal_paths(directory.path()).len(), 1);
+        assert_eq!(wal.read_from(0).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reclamation_never_deletes_the_active_segment() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: 110,
+            sync_on_write: true,
+            ..WalConfig::default()
+        };
+        let wal = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        wal.append(b"a", b"v").await.unwrap();
+        wal.append(b"b", b"v").await.unwrap();
+        let active_path = wal.current_file.read().path.clone();
+        assert_eq!(wal_paths(directory.path()).len(), 2);
+
+        wal.truncate(u64::MAX).await.unwrap();
+        assert!(active_path.exists());
+        assert_eq!(wal_paths(directory.path()), [active_path]);
+        assert_eq!(wal.read_from(0).await.unwrap()[0].sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_rotation_and_reclamation_keep_later_appends_reachable() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: 110,
+            sync_on_write: false,
+            ..WalConfig::default()
+        };
+        let wal = Arc::new(
+            WriteAheadLog::new(directory.path(), config.clone())
+                .await
+                .unwrap(),
+        );
+        let writer_wal = Arc::clone(&wal);
+        let writer = tokio::spawn(async move {
+            for index in 0_u64..100 {
+                writer_wal
+                    .append(&index.to_le_bytes(), b"value")
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let reclaim_wal = Arc::clone(&wal);
+        let reclaimer = tokio::spawn(async move {
+            for _ in 0..100 {
+                reclaim_wal.truncate(u64::MAX).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        writer.await.unwrap();
+        reclaimer.await.unwrap();
+
+        let marker_sequence = wal.append(b"marker", b"reachable").await.unwrap();
+        wal.flush().await.unwrap();
+        let active_path = wal.current_file.read().path.clone();
+        assert!(active_path.exists());
+        drop(wal);
+
+        let reopened = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        let marker = reopened.read_from(marker_sequence).await.unwrap();
+        assert_eq!(marker.len(), 1);
+        assert_eq!(marker[0].decode_key(), Some(b"marker".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn reclamation_uses_validated_record_bounds_not_the_filename() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig::paranoid();
+        let mut rotated = create_file(directory.path(), 0, &config).unwrap();
+        write_entry(
+            &mut rotated.file,
+            &WalEntry {
+                sequence: 10,
+                timestamp: 0,
+                entry_type: EntryType::Data,
+                data: Bytes::from(encode_kv(b"key", b"value")),
+            },
+        )
+        .unwrap();
+        let rotated_path = rotated.path.clone();
+        drop(rotated);
+        drop(create_file(directory.path(), 11, &config).unwrap());
+
+        let wal = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        assert_eq!(wal.current_sequence(), 11);
+        assert_eq!(header_bounds(&rotated_path), (10, 10, 1));
+        wal.truncate(5).await.unwrap();
+        assert!(rotated_path.exists());
+        wal.truncate(11).await.unwrap();
+        assert!(!rotated_path.exists());
+    }
+
+    #[tokio::test]
+    async fn empty_current_segment_recovers_the_exact_next_sequence() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig::paranoid();
+        let mut rotated = create_file(directory.path(), 0, &config).unwrap();
+        write_entry(
+            &mut rotated.file,
+            &WalEntry {
+                sequence: 10,
+                timestamp: 0,
+                entry_type: EntryType::Delete,
+                data: Bytes::from(encode_delete(b"key")),
+            },
+        )
+        .unwrap();
+        drop(rotated);
+        let mut active = create_file(directory.path(), 8, &config).unwrap();
+        let active_path = active.path.clone();
+        active
+            .file
+            .seek(SeekFrom::Start(WAL_FIRST_SEQUENCE_OFFSET))
+            .unwrap();
+        active.file.write_u64::<LittleEndian>(999).unwrap();
+        active.file.write_u64::<LittleEndian>(999).unwrap();
+        active.file.write_u64::<LittleEndian>(999).unwrap();
+        drop(active);
+
+        let wal = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        assert_eq!(wal.current_sequence(), 11);
+        assert_eq!(header_bounds(&active_path), (11, 11, 0));
+        assert_eq!(wal.append(b"next", b"value").await.unwrap(), 11);
+        wal.flush().await.unwrap();
+        assert_eq!(header_bounds(&active_path), (11, 11, 1));
+    }
+
+    #[tokio::test]
+    async fn rotation_keeps_filenames_forward_when_record_sequences_are_lower() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: 108,
+            sync_on_write: true,
+            ..WalConfig::default()
+        };
+        let mut first = create_file(directory.path(), 10, &config).unwrap();
+        write_entry(
+            &mut first.file,
+            &WalEntry {
+                sequence: 5,
+                timestamp: 0,
+                entry_type: EntryType::Data,
+                data: Bytes::from(encode_kv(b"old", b"value")),
+            },
+        )
+        .unwrap();
+        drop(first);
+
+        let wal = WriteAheadLog::new(directory.path(), config.clone())
+            .await
+            .unwrap();
+        assert_eq!(wal.current_sequence(), 6);
+        assert_eq!(wal.append(b"new", b"value").await.unwrap(), 6);
+        wal.flush().await.unwrap();
+        let active_path = wal.current_file.read().path.clone();
+        assert_eq!(active_path.file_stem().unwrap(), "00000000000000000011");
+        let valid_end = active_path.metadata().unwrap().len();
+        drop(wal);
+
+        OpenOptions::new()
+            .append(true)
+            .open(&active_path)
+            .unwrap()
+            .write_all(&[1, 2])
+            .unwrap();
+        let reopened = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        assert_eq!(active_path.metadata().unwrap().len(), valid_end);
+        assert_eq!(
+            reopened
+                .read_from(0)
+                .await
+                .unwrap()
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            [5, 6]
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_first_sync_entry_does_not_create_phantom_bounds() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: WAL_HEADER_SIZE as u64,
+            sync_on_write: true,
+            ..WalConfig::default()
+        };
+        let wal = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        assert_eq!(wal.append(b"oversized", b"value").await.unwrap(), 0);
+        wal.flush().await.unwrap();
+        let paths = wal_paths(directory.path());
+        assert_eq!(paths.len(), 1);
+        assert_eq!(header_bounds(&paths[0]), (0, 0, 1));
+    }
+
+    #[test]
+    fn iterator_is_fused_after_reporting_corruption() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig::durable();
+        let mut wal_file = create_file(directory.path(), 0, &config).unwrap();
+        let entry = WalEntry {
+            sequence: 0,
+            timestamp: 0,
+            entry_type: EntryType::Data,
+            data: Bytes::from(encode_kv(b"key", b"value")),
+        };
+        write_entry(&mut wal_file.file, &entry).unwrap();
+        wal_file.file.write_all(&[1, 0, 0, 0, 1]).unwrap();
+        let path = wal_file.path.clone();
+        drop(wal_file);
+
+        let mut iterator = WalEntryIterator::new(vec![path], 0).unwrap();
+        assert_eq!(iterator.next().unwrap().unwrap().sequence, 0);
+        assert!(iterator.next().unwrap().is_err());
+        assert!(iterator.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_helpers_reject_a_header_corrupted_after_open() {
+        let directory = TempDir::new().unwrap();
+        let wal = WriteAheadLog::new(directory.path(), WalConfig::paranoid())
+            .await
+            .unwrap();
+        wal.append(b"key", b"value").await.unwrap();
+        wal.flush().await.unwrap();
+        let path = wal.current_file.read().path.clone();
+
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all(b"BADMAGIC").unwrap();
+        drop(file);
+
+        assert!(matches!(
+            wal.read_from(0).await,
+            Err(WalError::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            wal.iter_entries().await,
+            Err(WalError::InvalidFormat(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_helpers_report_torn_and_oversized_lengths_without_scanning_past_them() {
+        for tail in [&[1_u8, 2][..], &u32::MAX.to_le_bytes()[..]] {
+            let directory = TempDir::new().unwrap();
+            let wal = WriteAheadLog::new(directory.path(), WalConfig::paranoid())
+                .await
+                .unwrap();
+            wal.append(b"key", b"value").await.unwrap();
+            wal.flush().await.unwrap();
+            let path = wal.current_file.read().path.clone();
+            OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(tail)
+                .unwrap();
+
+            assert!(wal.read_from(0).await.is_err());
+            let mut iterator = wal.iter_entries().await.unwrap();
+            assert_eq!(iterator.next().unwrap().unwrap().sequence, 0);
+            assert!(iterator.next().unwrap().is_err());
+            assert!(iterator.next().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_active_segment_rotates_to_v3_before_append() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig::paranoid();
+        let mut legacy = create_file(directory.path(), 0, &config).unwrap();
+        legacy.file.seek(SeekFrom::Start(8)).unwrap();
+        legacy.file.write_u32::<LittleEndian>(2).unwrap();
+        legacy
+            .file
+            .seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))
+            .unwrap();
+        let payload = encode_kv(b"legacy", b"value");
+        legacy
+            .file
+            .write_u32::<LittleEndian>(payload.len() as u32)
+            .unwrap();
+        legacy.file.write_u64::<LittleEndian>(0).unwrap();
+        legacy.file.write_u64::<LittleEndian>(0).unwrap();
+        legacy.file.write_u8(EntryType::Data as u8).unwrap();
+        legacy.file.write_u8(0).unwrap();
+        legacy
+            .file
+            .write_u32::<LittleEndian>(crc32_checksum(&payload))
+            .unwrap();
+        legacy.file.write_all(&[0_u8; ENTRY_RESERVED_SIZE]).unwrap();
+        legacy
+            .file
+            .write_all(&[0_u8; LEGACY_ENTRY_EXTENSION_SIZE])
+            .unwrap();
+        legacy.file.write_all(&payload).unwrap();
+        drop(legacy);
+
+        let wal = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        assert_eq!(wal_paths(directory.path()).len(), 2);
+        assert_eq!(wal.current_sequence(), 1);
+        assert_eq!(wal.append(b"current", b"value").await.unwrap(), 1);
+        let entries = wal.read_from(0).await.unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
     }
 }

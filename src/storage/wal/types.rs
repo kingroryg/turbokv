@@ -5,6 +5,14 @@ pub const WAL_MAGIC: &[u8; 8] = b"TURBOKV\0";
 pub const WAL_VERSION: u32 = 3;
 pub const WAL_HEADER_SIZE: usize = 64;
 pub const ENTRY_HEADER_SIZE: usize = 32;
+pub(crate) const LEGACY_ENTRY_EXTENSION_SIZE: usize = 96;
+pub(crate) const WAL_FIRST_SEQUENCE_OFFSET: u64 = 20;
+pub(crate) const ENTRY_TYPE_OFFSET: usize = 20;
+pub(crate) const ENTRY_FLAGS_OFFSET: usize = 21;
+#[cfg(test)]
+pub(crate) const ENTRY_CRC_OFFSET: u64 = 22;
+pub(crate) const ENTRY_RESERVED_START: usize = 26;
+pub(crate) const ENTRY_RESERVED_SIZE: usize = ENTRY_HEADER_SIZE - ENTRY_RESERVED_START;
 
 #[derive(Debug, Error)]
 pub enum WalError {
@@ -20,6 +28,9 @@ pub enum WalError {
 
     #[error("CRC mismatch: data corrupted")]
     CrcMismatch,
+
+    #[error("WAL corruption: {0}")]
+    Corruption(String),
 
     #[error("Channel closed")]
     ChannelClosed,
