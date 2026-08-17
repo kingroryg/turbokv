@@ -285,10 +285,12 @@ mod tests {
                             .wrapping_add(offset) as u8
                     })
                     .collect::<Vec<_>>();
-                engine
-                    .insert(format!("split:{key_index:04}").as_bytes(), &value)
-                    .await
-                    .unwrap();
+                let key = format!("split:{key_index:04}");
+                if generation == 1 && key_index == 0 {
+                    engine.delete(key.as_bytes()).await.unwrap();
+                } else {
+                    engine.insert(key.as_bytes(), &value).await.unwrap();
+                }
             }
             engine.flush().await.unwrap();
         }
@@ -713,7 +715,8 @@ mod tests {
             drop(engine);
 
             let reopened = Engine::open(config).await.unwrap();
-            assert!(reopened.get(b"split:0000").await.unwrap().is_some());
+            assert_eq!(reopened.get(b"split:0000").await.unwrap(), None);
+            assert!(reopened.get(b"split:0001").await.unwrap().is_some());
             assert_eq!(reopened.physical_stats().sstables.files, 2);
             reopened.shutdown().await.unwrap();
         }
@@ -745,6 +748,7 @@ mod tests {
         drop(engine);
 
         let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(reopened.get(b"split:0000").await.unwrap(), None);
         assert!(reopened.get(b"split:0047").await.unwrap().is_some());
         assert_eq!(reopened.physical_stats().sstables.files, 2);
         reopened.shutdown().await.unwrap();
@@ -771,7 +775,8 @@ mod tests {
                 .unwrap();
             assert_eq!(uncommitted_compaction_file_count(temp.path()), 0);
             assert_eq!(reopened.physical_stats().sstables.files, 2);
-            assert!(reopened.get(b"split:0000").await.unwrap().is_some());
+            assert_eq!(reopened.get(b"split:0000").await.unwrap(), None);
+            assert!(reopened.get(b"split:0001").await.unwrap().is_some());
             assert!(reopened.get(b"split:0047").await.unwrap().is_some());
             reopened.shutdown().await.unwrap();
         }
@@ -797,7 +802,8 @@ mod tests {
             uncommitted_compaction_file_count(temp.path()),
             baseline.output_count
         );
-        assert!(reopened.get(b"split:0000").await.unwrap().is_some());
+        assert_eq!(reopened.get(b"split:0000").await.unwrap(), None);
+        assert!(reopened.get(b"split:0001").await.unwrap().is_some());
         assert!(reopened.get(b"split:0047").await.unwrap().is_some());
         reopened.shutdown().await.unwrap();
     }
