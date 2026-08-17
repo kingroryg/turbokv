@@ -5,6 +5,7 @@
 //! Keys and values are raw bytes (`&[u8]` / `Vec<u8>`).
 //! Serialization is the caller's responsibility.
 
+use std::fmt;
 use std::time::Duration;
 
 /// Compression algorithm options
@@ -190,6 +191,115 @@ pub struct PhysicalStats {
     pub compactions_in_progress: u64,
 }
 
+/// Cheap operational health and write-backpressure status.
+///
+/// This is sampled for monitoring and is not a transactional snapshot across
+/// maintenance and write-path components.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatabaseStatus {
+    /// Flush and compaction failure/retry state.
+    pub maintenance: MaintenanceStatus,
+    /// Current write-pressure causes and their counters since open.
+    pub write_backpressure: WriteBackpressureStatus,
+}
+
+/// Health of flush and compaction maintenance for one open database.
+///
+/// A failed operation stays in `retry_pending` state until a later attempt
+/// proves the failed lane is settled. Flush uses successful FIFO drainage plus
+/// completion of registered WAL sync/reclamation work; compaction uses an
+/// exact post-attempt selection with no publication reconciliation, startup
+/// scan failure, or deferred cleanup remaining. Unrelated successful work
+/// therefore cannot clear a failed component. Only the first bounded failure
+/// detail in an unresolved retry sequence is retained per operation;
+/// since-open counters preserve evidence for subsequent failures and after a
+/// proven retry clears the detail.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaintenanceStatus {
+    /// Memtable-flush health.
+    pub flush: MaintenanceOperationStatus,
+    /// SSTable-compaction health.
+    pub compaction: MaintenanceOperationStatus,
+}
+
+impl MaintenanceStatus {
+    /// Whether neither maintenance operation has an unresolved failure.
+    pub fn is_healthy(&self) -> bool {
+        !self.flush.retry_pending && !self.compaction.retry_pending
+    }
+}
+
+impl fmt::Display for MaintenanceStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn write_operation(
+            formatter: &mut fmt::Formatter<'_>,
+            name: &str,
+            operation: &MaintenanceOperationStatus,
+        ) -> fmt::Result {
+            match &operation.unresolved_failure {
+                Some(failure) => write!(
+                    formatter,
+                    "{name}=failure #{} from {:?}: {}{}",
+                    failure.sequence_since_open,
+                    failure.origin,
+                    failure.message,
+                    if failure.message_truncated {
+                        " [truncated]"
+                    } else {
+                        ""
+                    }
+                ),
+                None => write!(formatter, "{name}=healthy"),
+            }
+        }
+
+        write_operation(formatter, "flush", &self.flush)?;
+        formatter.write_str(", ")?;
+        write_operation(formatter, "compaction", &self.compaction)
+    }
+}
+
+/// Health and retry counters for one kind of database maintenance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaintenanceOperationStatus {
+    /// Whether a failed operation still requires a successful retry.
+    pub retry_pending: bool,
+    /// Failed attempts since this database was opened.
+    pub failures_since_open: u64,
+    /// Failures originating in an automatic background task since open.
+    pub background_failures_since_open: u64,
+    /// Successful operations which cleared a pending failure since open.
+    pub successful_retries_since_open: u64,
+    /// The first unresolved failure retained for the current retry sequence.
+    pub unresolved_failure: Option<MaintenanceFailure>,
+}
+
+/// Bounded detail for an unresolved maintenance failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceFailure {
+    /// Monotonic ordinal among failures of this operation since open.
+    pub sequence_since_open: u64,
+    /// Where the failing attempt originated.
+    pub origin: MaintenanceOrigin,
+    /// Error text, retained up to 512 UTF-8 bytes.
+    pub message: String,
+    /// Whether the original error text exceeded the retained bound.
+    pub message_truncated: bool,
+}
+
+/// Origin of a maintenance attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceOrigin {
+    /// An explicit foreground flush or compaction request.
+    Foreground,
+    /// An automatic background maintenance request.
+    Background,
+    /// The final flush performed by graceful shutdown.
+    Shutdown,
+    /// Retryable cleanup discovered while reopening the database.
+    Recovery,
+}
+
 /// Physical write-ahead log statistics.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WalStats {
@@ -284,6 +394,40 @@ pub struct WriteStallStats {
     /// Number of controlled stalls since open.
     pub count_since_open: u64,
     /// Total controlled stall time in microseconds since open.
+    pub micros_since_open: u64,
+}
+
+/// Current write pressure and cumulative controlled-stall counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteBackpressureStatus {
+    /// Whether at least one cause is currently at its configured threshold.
+    pub active: bool,
+    /// Number of physical controlled stalls since open.
+    pub stalls_since_open: u64,
+    /// Total physical controlled-stall time in microseconds since open.
+    pub stall_micros_since_open: u64,
+    /// Immutable-memtable pressure and its attributed stall counters.
+    pub immutable_memtables: WriteBackpressureCauseStatus,
+    /// Level-zero file pressure and its attributed stall counters.
+    pub level_zero_files: WriteBackpressureCauseStatus,
+}
+
+/// Current pressure and cumulative stalls attributed to one cause.
+///
+/// When both causes are active, each receives the event and duration while
+/// [`WriteBackpressureStatus::stalls_since_open`] counts the physical sleep
+/// once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteBackpressureCauseStatus {
+    /// Whether the sampled value currently meets or exceeds the threshold.
+    pub active: bool,
+    /// Current sampled immutable-table or level-zero-file count.
+    pub current: u64,
+    /// Configured count at which this cause becomes active.
+    pub threshold: u64,
+    /// Stall events attributed to this cause since open.
+    pub count_since_open: u64,
+    /// Stall time attributed to this cause since open.
     pub micros_since_open: u64,
 }
 

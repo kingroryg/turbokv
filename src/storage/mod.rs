@@ -23,6 +23,7 @@ pub mod engine;
 mod failpoints;
 pub mod fd;
 pub mod iter;
+mod maintenance;
 pub mod manifest;
 pub mod memtable;
 pub mod partitioning;

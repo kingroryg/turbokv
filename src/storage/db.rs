@@ -34,10 +34,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::types::Compression;
-use crate::core::{CompactionResult, DbConfig, LogicalStats, PhysicalStats, WriteBatch};
+use crate::core::{
+    CompactionResult, DatabaseStatus, DbConfig, LogicalStats, PhysicalStats, WriteBatch,
+};
 
 use super::directory_lock::LOCKED_DIRECTORY_GUIDANCE;
-use super::engine::{Engine, StorageConfig, StorageError};
+use super::engine::{Engine, MaintenanceShutdownError, StorageConfig, StorageError};
 use super::sstable::CompressionType;
 
 /// Result type for database operations
@@ -207,6 +209,10 @@ impl DbOptions {
 /// failed batch is not partially published, but its complete WAL envelope may
 /// be recovered after reopen if failure occurred after the durable append. A
 /// failed [`Db::close`] consumes the handle and does not promise persistence.
+/// Background maintenance failures are retained in [`Db::status`]; clean close
+/// fails while any compaction failure remains unresolved. Its final flush can
+/// resolve an earlier flush failure when the retained FIFO and registered WAL
+/// post-work both complete successfully.
 ///
 /// # Exclusive directory ownership
 ///
@@ -425,10 +431,22 @@ impl Db {
     /// been flushed, background tasks have stopped, and the directory lock has
     /// been released as this handle is dropped. Dropping a [`Db`] does not
     /// provide the persistence guarantee; call `close` when pending writes must
-    /// be persisted.
+    /// be persisted. Close returns an error when its final flush fails or a
+    /// background maintenance failure remains unresolved. Use
+    /// [`Self::close_with_status`] to inspect unresolved maintenance as a
+    /// structured snapshot.
     pub async fn close(self) -> Result<()> {
         self.engine.shutdown().await?;
         Ok(())
+    }
+
+    /// Close cleanly and return a structured unresolved-health snapshot.
+    ///
+    /// This is the production monitoring form of [`Self::close`]. It consumes
+    /// the database exactly like the legacy method, while distinguishing
+    /// ordinary storage errors from unresolved flush or compaction work.
+    pub async fn close_with_status(self) -> std::result::Result<(), MaintenanceShutdownError> {
+        self.engine.shutdown_with_status().await
     }
 
     /// Compact every eligible SSTable in the scope captured after acquiring
@@ -440,8 +458,22 @@ impl Db {
     /// [`CompactionResult::work_remaining`] when another job is globally
     /// selectable in the drain's final live-state observation. Like any
     /// concurrent status sample, a later flush can immediately make it stale.
+    /// Obsolete input cleanup can be deferred after replacement publication;
+    /// that retry remains visible through [`Self::status`] even though the
+    /// logical compaction result is successful.
     pub async fn compact(&self) -> Result<CompactionResult> {
         Ok(self.engine.compact().await?)
+    }
+
+    /// Get cheap maintenance health and write-backpressure status.
+    ///
+    /// A failed flush, compaction, or obsolete-file cleanup remains visible
+    /// until a retry proves that lane's work is resolved. Only one bounded
+    /// failure detail is kept per lane; cumulative counters retain the
+    /// historical signal. Current pressure values are monitoring samples
+    /// rather than a transactional snapshot with storage statistics.
+    pub fn status(&self) -> DatabaseStatus {
+        self.engine.status()
     }
 
     /// Get legacy mixed physical statistics.
@@ -557,6 +589,21 @@ mod tests {
         // Remove
         db.remove(b"key1").await.unwrap();
         assert_eq!(db.get(b"key1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn public_status_starts_healthy_with_cause_thresholds_visible() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open_with_options(temp.path(), DbOptions::fast())
+            .await
+            .unwrap();
+
+        let status = db.status();
+        assert!(status.maintenance.is_healthy());
+        assert_eq!(status.write_backpressure.stalls_since_open, 0);
+        assert_eq!(status.write_backpressure.immutable_memtables.threshold, 8);
+        assert_eq!(status.write_backpressure.level_zero_files.threshold, 24);
+        db.close().await.unwrap();
     }
 
     #[tokio::test]

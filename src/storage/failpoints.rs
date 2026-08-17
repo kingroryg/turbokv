@@ -13,24 +13,36 @@ use super::engine::{Result, StorageError};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PersistenceBoundary {
     Wal,
+    WalFlush,
+    WalTruncation,
     MemtableFreeze,
     SstablePublication,
     ManifestInstallation,
     Checkpoint,
     CompactionOutputPublication,
     CompactionManifestPublication,
+    ManifestDirectorySync,
+    CompactionManifestDirectoryResync,
+    SstableCleanupScan,
+    SstableCleanup,
 }
 
 impl PersistenceBoundary {
     fn name(self) -> &'static str {
         match self {
             Self::Wal => "WAL",
+            Self::WalFlush => "WAL flush",
+            Self::WalTruncation => "WAL truncation",
             Self::MemtableFreeze => "memtable freeze",
             Self::SstablePublication => "SSTable publication",
             Self::ManifestInstallation => "manifest installation",
             Self::Checkpoint => "checkpoint",
             Self::CompactionOutputPublication => "compaction output publication",
             Self::CompactionManifestPublication => "compaction manifest publication",
+            Self::ManifestDirectorySync => "manifest directory sync",
+            Self::CompactionManifestDirectoryResync => "compaction manifest directory resync",
+            Self::SstableCleanupScan => "SSTable cleanup scan",
+            Self::SstableCleanup => "SSTable cleanup",
         }
     }
 }
