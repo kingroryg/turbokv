@@ -172,12 +172,14 @@ impl MemTableManager {
 
     /// Insert multiple key-value pairs while rotating at batch boundaries.
     pub fn insert_many(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let start_sequence = self.reserve_sequence_range(entries.len());
         let buffered: Vec<_> = entries
             .iter()
-            .map(|(key, value)| BufferEntry {
+            .enumerate()
+            .map(|(index, (key, value))| BufferEntry {
                 key: key.clone(),
                 value: value.clone(),
-                sequence: self.allocate_sequence(),
+                sequence: start_sequence + index as u64,
             })
             .collect();
         self.flush_buffer(&buffered)
@@ -203,6 +205,41 @@ impl MemTableManager {
             })
             .collect();
         self.flush_buffer(&buffered)
+    }
+
+    /// Apply an atomic logical batch without exposing a fallible prefix.
+    ///
+    /// Capacity thresholds are checked after every operation in the ordinary
+    /// path. Here the active generation is held stable, all operations are
+    /// applied with their preassigned sequences, and an oversized result is
+    /// rotated only after the complete batch exists.
+    pub(crate) fn apply_batch_with_sequences(
+        &self,
+        entries: &[(&[u8], Option<&[u8]>)],
+        sequences: &[u64],
+    ) -> Result<()> {
+        debug_assert_eq!(entries.len(), sequences.len());
+        let _mutations = self.lock_key_slices(entries.iter().map(|(key, _)| *key));
+        for &sequence in sequences {
+            self.observe_sequence(sequence);
+        }
+
+        let active = self.active.read();
+        if active.is_read_only() {
+            return Err(MemTableError::ReadOnly);
+        }
+        for ((key, value), &sequence) in entries.iter().zip(sequences) {
+            match value {
+                Some(value) => active.insert_batch_entry(key, value, sequence),
+                None => active.delete_batch_entry(key, sequence),
+            }
+        }
+        let should_rotate = active.should_flush();
+        drop(active);
+        if should_rotate {
+            self.rotate_memtable()?;
+        }
+        Ok(())
     }
 
     /// Flush thread-local buffer to main memtable
@@ -449,6 +486,11 @@ impl MemTableManager {
         self.next_sequence.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Reserve a contiguous engine sequence span for one compound mutation.
+    pub(crate) fn reserve_sequence_range(&self, count: usize) -> u64 {
+        self.next_sequence.fetch_add(count as u64, Ordering::AcqRel)
+    }
+
     fn observe_sequence(&self, sequence: u64) {
         self.next_sequence
             .fetch_max(sequence.saturating_add(1), Ordering::AcqRel);
@@ -459,10 +501,14 @@ impl MemTableManager {
     }
 
     fn lock_keys(&self, entries: &[BufferEntry]) -> Vec<parking_lot::MutexGuard<'static, ()>> {
-        let mut indices: Vec<_> = entries
-            .iter()
-            .map(|entry| self.lock_index(&entry.key))
-            .collect();
+        self.lock_key_slices(entries.iter().map(|entry| entry.key.as_slice()))
+    }
+
+    fn lock_key_slices<'a>(
+        &self,
+        keys: impl Iterator<Item = &'a [u8]>,
+    ) -> Vec<parking_lot::MutexGuard<'static, ()>> {
+        let mut indices: Vec<_> = keys.map(|key| self.lock_index(key)).collect();
         indices.sort_unstable();
         indices.dedup();
         indices

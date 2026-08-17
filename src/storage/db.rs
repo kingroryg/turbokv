@@ -170,17 +170,20 @@ impl DbOptions {
 /// immutable generation remains in the live read view until its durable
 /// SSTable and manifest installation are reflected there.
 ///
-/// Batches guarantee ordered application and all operations are visible after
-/// a successful return. This version does not provide isolation from
-/// concurrent calls or all-or-nothing recovery from a torn WAL tail.
+/// A write batch reserves one contiguous sequence span and is published as one
+/// visibility transition. Concurrent point and scan readers observe either the
+/// state before it or the complete batch. WAL recovery applies a batch only
+/// after validating its complete checksummed envelope.
 ///
 /// # Operational errors
 ///
 /// Except for [`DbError::InvalidOptions`], an error can occur after storage
 /// side effects. A flush failure cannot remove an uninstalled frozen
 /// generation; any such generation remains live for retry while the database
-/// is open. Callers must treat a failed mutation or batch as having an
+/// is open. Callers must treat a failed single or bulk mutation as having an
 /// indeterminate outcome and verify state before a non-idempotent retry. A
+/// failed batch is not partially published, but its complete WAL envelope may
+/// be recovered after reopen if failure occurred after the durable append. A
 /// failed [`Db::close`] consumes the handle and does not promise persistence.
 pub struct Db {
     engine: Arc<Engine>,
@@ -358,15 +361,11 @@ impl Db {
     /// Apply multiple operations in batch order.
     ///
     /// On success, every operation has been applied. With the WAL enabled, the
-    /// full encoded batch is appended before any operation is applied in
-    /// memory. If the same key occurs more than once, its last operation wins.
-    /// See [`Db`] for the current cross-layer deletion visibility limitation.
-    ///
-    /// # Current atomicity limitation
-    ///
-    /// Concurrent calls can currently observe partial in-memory application,
-    /// and recovery from a torn WAL batch can apply a valid prefix. Do not rely
-    /// on isolation or crash atomicity until those guarantees are implemented.
+    /// full batch is one checksummed WAL record. Point, range, and prefix reads
+    /// observe either the state before publication or the complete batch. A
+    /// torn record is discarded during tail repair, so recovery never applies
+    /// only a valid prefix. If the same key occurs more than once, its last
+    /// operation wins.
     pub async fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
         self.engine.write_batch(batch).await?;
         Ok(())
@@ -379,8 +378,6 @@ impl Db {
     /// synced. Concurrent writes that begin after the flush starts may require
     /// a later flush.
     pub async fn flush(&self) -> Result<()> {
-        // First flush ALL thread-local buffers from ALL threads
-        self.engine.flush_write_buffers()?;
         self.engine.flush().await?;
         Ok(())
     }
@@ -392,7 +389,6 @@ impl Db {
     /// asked to stop. Dropping a [`Db`] does not provide this clean-close
     /// guarantee; call `close` when pending writes must be persisted.
     pub async fn close(self) -> Result<()> {
-        self.engine.flush_write_buffers()?;
         self.engine.shutdown().await?;
         Ok(())
     }

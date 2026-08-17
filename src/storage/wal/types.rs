@@ -2,7 +2,7 @@ use bytes::Bytes;
 use thiserror::Error;
 
 pub const WAL_MAGIC: &[u8; 8] = b"TURBOKV\0";
-pub const WAL_VERSION: u32 = 3;
+pub const WAL_VERSION: u32 = 4;
 pub const WAL_HEADER_SIZE: usize = 64;
 pub const ENTRY_HEADER_SIZE: usize = 32;
 pub(crate) const LEGACY_ENTRY_EXTENSION_SIZE: usize = 96;
@@ -13,6 +13,8 @@ pub(crate) const ENTRY_FLAGS_OFFSET: usize = 21;
 pub(crate) const ENTRY_CRC_OFFSET: u64 = 22;
 pub(crate) const ENTRY_RESERVED_START: usize = 26;
 pub(crate) const ENTRY_RESERVED_SIZE: usize = ENTRY_HEADER_SIZE - ENTRY_RESERVED_START;
+const BATCH_HEADER_SIZE: usize = 4;
+const BATCH_OPERATION_HEADER_SIZE: usize = 9;
 
 #[derive(Debug, Error)]
 pub enum WalError {
@@ -61,6 +63,8 @@ pub enum EntryType {
     Truncate = 3,
     /// Tombstone (key deletion)
     Delete = 4,
+    /// A checksummed envelope containing one atomic logical write batch.
+    Batch = 5,
 }
 
 impl TryFrom<u8> for EntryType {
@@ -72,6 +76,7 @@ impl TryFrom<u8> for EntryType {
             2 => Ok(EntryType::Checkpoint),
             3 => Ok(EntryType::Truncate),
             4 => Ok(EntryType::Delete),
+            5 => Ok(EntryType::Batch),
             _ => Err(WalError::InvalidFormat(format!(
                 "Invalid entry type: {}",
                 value
@@ -122,6 +127,9 @@ impl WalEntry {
     }
 
     pub fn decode_kv(&self) -> Option<(&[u8], Option<&[u8]>)> {
+        if self.entry_type == EntryType::Batch {
+            return None;
+        }
         let key = self.decode_key()?;
         let value = if self.entry_type == EntryType::Delete {
             None
@@ -129,6 +137,65 @@ impl WalEntry {
             self.decode_value()
         };
         Some((key, value))
+    }
+
+    /// Lowest and highest engine sequence represented by this physical record.
+    pub(crate) fn sequence_bounds(&self) -> Result<(u64, u64)> {
+        if self.entry_type != EntryType::Batch {
+            return Ok((self.sequence, self.sequence));
+        }
+
+        let operation_count = batch_operation_count(&self.data)?;
+        let last_sequence = self
+            .sequence
+            .checked_add(operation_count.saturating_sub(1) as u64)
+            .ok_or_else(|| WalError::InvalidFormat("batch sequence range overflows".to_string()))?;
+        Ok((self.sequence, last_sequence))
+    }
+
+    /// Expand an atomic physical batch record into its logical mutations.
+    pub(crate) fn into_logical_entries(self) -> Result<Vec<Self>> {
+        if self.entry_type != EntryType::Batch {
+            return Ok(vec![self]);
+        }
+
+        let operation_count = batch_operation_count(&self.data)?;
+        let mut entries = Vec::with_capacity(operation_count);
+        let mut offset = BATCH_HEADER_SIZE;
+        for index in 0..operation_count {
+            let entry_type = EntryType::try_from(self.data[offset])?;
+            let key_length = read_u32(&self.data, offset + 1)? as usize;
+            let value_length = read_u32(&self.data, offset + 5)? as usize;
+            offset += BATCH_OPERATION_HEADER_SIZE;
+            let key_end = offset
+                .checked_add(key_length)
+                .ok_or_else(|| WalError::InvalidFormat("batch key length overflows".to_string()))?;
+            let value_end = key_end.checked_add(value_length).ok_or_else(|| {
+                WalError::InvalidFormat("batch value length overflows".to_string())
+            })?;
+            let key = &self.data[offset..key_end];
+            let value = &self.data[key_end..value_end];
+            let data = match entry_type {
+                EntryType::Data => encode_kv(key, value),
+                EntryType::Delete => encode_delete(key),
+                _ => {
+                    return Err(WalError::InvalidFormat(
+                        "batch contains a non-mutation entry".to_string(),
+                    ));
+                }
+            };
+            let sequence = self.sequence.checked_add(index as u64).ok_or_else(|| {
+                WalError::InvalidFormat("batch sequence range overflows".to_string())
+            })?;
+            entries.push(Self {
+                sequence,
+                timestamp: self.timestamp,
+                entry_type,
+                data: Bytes::from(data),
+            });
+            offset = value_end;
+        }
+        Ok(entries)
     }
 }
 
@@ -215,4 +282,107 @@ pub fn encode_delete(key: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
     buf.extend_from_slice(key);
     buf
+}
+
+/// Encode a logical write batch into one checksummed WAL record payload.
+pub(crate) fn encode_batch(entries: &[(&[u8], Option<&[u8]>)]) -> Result<Vec<u8>> {
+    let operation_count = u32::try_from(entries.len())
+        .map_err(|_| WalError::InvalidFormat("batch contains too many operations".to_string()))?;
+    let total_size = entries
+        .iter()
+        .try_fold(BATCH_HEADER_SIZE, |size, (key, value)| {
+            let _ = u32::try_from(key.len())
+                .map_err(|_| WalError::InvalidFormat("batch key is too large".to_string()))?;
+            let value_length = value.map_or(0, <[u8]>::len);
+            let _ = u32::try_from(value_length)
+                .map_err(|_| WalError::InvalidFormat("batch value is too large".to_string()))?;
+            size.checked_add(BATCH_OPERATION_HEADER_SIZE)
+                .and_then(|size| size.checked_add(key.len()))
+                .and_then(|size| size.checked_add(value_length))
+                .ok_or_else(|| WalError::InvalidFormat("batch payload is too large".to_string()))
+        })?;
+    let _ = u32::try_from(total_size)
+        .map_err(|_| WalError::InvalidFormat("batch payload is too large".to_string()))?;
+
+    let mut encoded = Vec::with_capacity(total_size);
+    encoded.extend_from_slice(&operation_count.to_le_bytes());
+    for (key, value) in entries {
+        let entry_type = if value.is_some() {
+            EntryType::Data
+        } else {
+            EntryType::Delete
+        };
+        encoded.push(entry_type as u8);
+        encoded.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(&(value.map_or(0, <[u8]>::len) as u32).to_le_bytes());
+        encoded.extend_from_slice(key);
+        if let Some(value) = value {
+            encoded.extend_from_slice(value);
+        }
+    }
+    Ok(encoded)
+}
+
+pub(crate) fn validate_batch(data: &[u8]) -> Result<()> {
+    let operation_count = batch_operation_count(data)?;
+    let mut offset = BATCH_HEADER_SIZE;
+    for _ in 0..operation_count {
+        let operation_header_end = offset
+            .checked_add(BATCH_OPERATION_HEADER_SIZE)
+            .ok_or_else(|| WalError::InvalidFormat("batch offset overflows".to_string()))?;
+        if operation_header_end > data.len() {
+            return Err(WalError::InvalidFormat(
+                "batch operation header is truncated".to_string(),
+            ));
+        }
+        let entry_type = EntryType::try_from(data[offset])?;
+        if !matches!(entry_type, EntryType::Data | EntryType::Delete) {
+            return Err(WalError::InvalidFormat(
+                "batch contains a non-mutation entry".to_string(),
+            ));
+        }
+        let key_length = read_u32(data, offset + 1)? as usize;
+        let value_length = read_u32(data, offset + 5)? as usize;
+        if entry_type == EntryType::Delete && value_length != 0 {
+            return Err(WalError::InvalidFormat(
+                "batch delete contains value bytes".to_string(),
+            ));
+        }
+        offset = operation_header_end
+            .checked_add(key_length)
+            .and_then(|offset| offset.checked_add(value_length))
+            .ok_or_else(|| {
+                WalError::InvalidFormat("batch operation length overflows".to_string())
+            })?;
+        if offset > data.len() {
+            return Err(WalError::InvalidFormat(
+                "batch operation exceeds its payload".to_string(),
+            ));
+        }
+    }
+    if offset != data.len() {
+        return Err(WalError::InvalidFormat(
+            "batch contains trailing payload bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn batch_operation_count(data: &[u8]) -> Result<usize> {
+    let count = read_u32(data, 0)? as usize;
+    if count == 0 {
+        return Err(WalError::InvalidFormat(
+            "batch contains no operations".to_string(),
+        ));
+    }
+    Ok(count)
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
+    let bytes = data
+        .get(offset..offset.saturating_add(4))
+        .ok_or_else(|| WalError::InvalidFormat("batch payload is truncated".to_string()))?;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().expect("four-byte batch field"),
+    ))
 }

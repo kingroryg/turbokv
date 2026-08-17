@@ -197,6 +197,10 @@ pub struct Engine {
     flush_lock: Arc<AsyncMutex<()>>,
     /// Prevents checkpoint installation from racing sequence allocation/application.
     mutation_barrier: Arc<RwLock<()>>,
+    /// Preserves sequence/publication order between concurrent atomic batches.
+    batch_serialization: Arc<AsyncMutex<()>>,
+    /// Publishes atomic batches as one visibility transition to concurrent readers.
+    batch_visibility: Arc<RwLock<()>>,
     /// Conservative floors for WAL applications that did not finish. Floors
     /// remain until reopen, when WAL replay applies them before this set starts
     /// empty again.
@@ -346,6 +350,8 @@ impl Engine {
             manifest: Arc::new(Mutex::new(manifest)),
             flush_lock: Arc::new(AsyncMutex::new(())),
             mutation_barrier: Arc::new(RwLock::new(())),
+            batch_serialization: Arc::new(AsyncMutex::new(())),
+            batch_visibility: Arc::new(RwLock::new(())),
             unapplied_wal_sequences: Arc::new(Mutex::new(BTreeSet::new())),
             shutdown: shutdown_tx,
             next_sstable_id,
@@ -427,20 +433,16 @@ impl Engine {
                 .collect();
             let mut pending =
                 PendingWalApplication::new(&self.unapplied_wal_sequences, wal.current_sequence());
-            let sequences = wal.append_batch(&wal_entries).await?;
+            let appended = wal.append_batch_with_metadata(&wal_entries).await?;
             #[cfg(test)]
             super::failpoints::check(
                 &self.config.data_dir,
                 super::failpoints::PersistenceBoundary::Wal,
             )?;
-            let wal_bytes = entries
-                .iter()
-                .map(|(key, value)| wal_data_entry_size(key, value))
-                .sum();
             self.wal_bytes_written
-                .fetch_add(wal_bytes, Ordering::Relaxed);
+                .fetch_add(appended.bytes_written, Ordering::Relaxed);
             self.memtable_manager
-                .insert_many_with_sequences(entries, &sequences)
+                .insert_many_with_sequences(entries, &appended.sequences)
                 .map_err(StorageError::MemTable)?;
             pending.disarm();
         } else {
@@ -495,16 +497,9 @@ impl Engine {
 
     /// Get a value by key
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // In fast mode, flush thread-local buffer to ensure visibility
-        if self.wal.is_none() {
-            self.memtable_manager
-                .flush_thread_local()
-                .map_err(StorageError::MemTable)?;
-        }
-
         let mut newest = self
-            .memtable_manager
-            .get_entry(key)
+            .snapshot_memtable(|manager| manager.get_entry(key))
+            .await?
             .map(VersionedValue::from_memtable);
 
         // Resolve all physical copies by sequence; physical list order is not
@@ -528,12 +523,9 @@ impl Engine {
     pub async fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         use std::collections::BTreeMap;
 
-        // In fast mode, flush thread-local buffer to ensure visibility
-        if self.wal.is_none() {
-            self.memtable_manager
-                .flush_thread_local()
-                .map_err(StorageError::MemTable)?;
-        }
+        let memtable_entries = self
+            .snapshot_memtable(|manager| manager.range_entries(start, end))
+            .await?;
 
         let mut merged: BTreeMap<Vec<u8>, VersionedValue> = BTreeMap::new();
 
@@ -548,7 +540,7 @@ impl Engine {
         drop(sstables);
 
         // Get from memtable last (newer data overrides SSTables)
-        for (key, entry) in self.memtable_manager.range_entries(start, end) {
+        for (key, entry) in memtable_entries {
             merge_versioned(&mut merged, key, VersionedValue::from_memtable(entry));
         }
 
@@ -563,12 +555,9 @@ impl Engine {
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         use std::collections::BTreeMap;
 
-        // In fast mode, flush thread-local buffer to ensure visibility
-        if self.wal.is_none() {
-            self.memtable_manager
-                .flush_thread_local()
-                .map_err(StorageError::MemTable)?;
-        }
+        let memtable_entries = self
+            .snapshot_memtable(|manager| manager.scan_prefix_entries(prefix))
+            .await?;
 
         let mut merged: BTreeMap<Vec<u8>, VersionedValue> = BTreeMap::new();
 
@@ -583,7 +572,7 @@ impl Engine {
         drop(sstables);
 
         // Get from memtable last (newer data overrides SSTables)
-        for (key, entry) in self.memtable_manager.scan_prefix_entries(prefix) {
+        for (key, entry) in memtable_entries {
             merge_versioned(&mut merged, key, VersionedValue::from_memtable(entry));
         }
 
@@ -612,12 +601,11 @@ impl Engine {
 
     /// Write a batch of operations atomically
     pub async fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
-        let _mutation = if batch.is_empty() {
-            None
-        } else {
-            self.maybe_stall_writes().await;
-            Some(self.mutation_barrier.read().await)
-        };
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.maybe_stall_writes().await;
+        let _batch_order = self.batch_serialization.lock().await;
 
         // Convert to WAL batch format
         let ops: Vec<(&[u8], Option<&[u8]>)> = batch
@@ -631,61 +619,40 @@ impl Engine {
             })
             .collect();
 
-        // Write to WAL (if enabled)
-        let (wal_sequences, mut pending_wal) = if let Some(ref wal) = self.wal {
-            let pending =
+        if let Some(ref wal) = self.wal {
+            // Keep checkpoint installation behind the full append-to-apply
+            // interval, but do not block readers during WAL I/O.
+            let _mutation = self.mutation_barrier.read().await;
+            let mut pending =
                 PendingWalApplication::new(&self.unapplied_wal_sequences, wal.current_sequence());
-            let sequences = wal.append_batch(&ops).await?;
+            let appended = wal.append_batch_with_metadata(&ops).await?;
             #[cfg(test)]
             super::failpoints::check(
                 &self.config.data_dir,
                 super::failpoints::PersistenceBoundary::Wal,
             )?;
-            let wal_bytes = batch
-                .ops()
-                .iter()
-                .map(|op| match op {
-                    crate::core::BatchOp::Put { key, value } => wal_data_entry_size(key, value),
-                    crate::core::BatchOp::Delete { key } => wal_delete_entry_size(key),
-                })
-                .sum();
             self.wal_bytes_written
-                .fetch_add(wal_bytes, Ordering::Relaxed);
-            (Some(sequences), Some(pending))
-        } else {
-            (None, None)
-        };
+                .fetch_add(appended.bytes_written, Ordering::Relaxed);
 
-        // Apply to memtable
-        for (index, op) in batch.ops().iter().enumerate() {
-            match op {
-                crate::core::BatchOp::Put { key, value } => {
-                    if let Some(sequences) = wal_sequences.as_ref() {
-                        self.memtable_manager
-                            .insert_with_sequence(key, value, sequences[index])
-                            .map_err(StorageError::MemTable)?;
-                    } else {
-                        self.memtable_manager
-                            .insert(key, value)
-                            .map_err(StorageError::MemTable)?;
-                    }
-                }
-                crate::core::BatchOp::Delete { key } => {
-                    if let Some(sequences) = wal_sequences.as_ref() {
-                        self.memtable_manager
-                            .delete_with_sequence(key, sequences[index])
-                            .map_err(StorageError::MemTable)?;
-                    } else {
-                        self.memtable_manager
-                            .delete(key)
-                            .map_err(StorageError::MemTable)?;
-                    }
-                }
-            }
-        }
-
-        if let Some(pending) = pending_wal.as_mut() {
+            let _publication = self.batch_visibility.write().await;
+            self.memtable_manager
+                .apply_batch_with_sequences(&ops, &appended.sequences)
+                .map_err(StorageError::MemTable)?;
             pending.disarm();
+        } else {
+            // Fast readers acquire these locks in this order while draining
+            // buffers, so keep the no-WAL batch path consistent.
+            let _publication = self.batch_visibility.write().await;
+            let _mutation = self.mutation_barrier.read().await;
+            let start = self
+                .memtable_manager
+                .reserve_sequence_range(batch.ops().len());
+            let sequences = (start..start + batch.ops().len() as u64).collect::<Vec<_>>();
+            // The manager applies into one stable generation without capacity
+            // failures between operations, so an error cannot expose a prefix.
+            self.memtable_manager
+                .apply_batch_with_sequences(&ops, &sequences)
+                .map_err(StorageError::MemTable)?;
         }
 
         Ok(())
@@ -698,6 +665,11 @@ impl Engine {
             // Wait for every sequence already allocated by a writer to reach a
             // memtable before freezing the generation covered by this flush.
             let _mutations = self.mutation_barrier.write().await;
+            if self.wal.is_none() {
+                self.memtable_manager
+                    .flush_thread_local()
+                    .map_err(StorageError::MemTable)?;
+            }
             self.memtable_manager
                 .force_rotate()
                 .map_err(StorageError::MemTable)?;
@@ -865,6 +837,26 @@ impl Engine {
                 .fetch_add(self.config.write_stall_micros, Ordering::Relaxed);
             tokio::time::sleep(Duration::from_micros(self.config.write_stall_micros)).await;
         }
+    }
+
+    async fn snapshot_memtable<T>(
+        &self,
+        snapshot: impl FnOnce(&MemTableManager) -> T,
+    ) -> Result<T> {
+        let _publication = self.batch_visibility.read().await;
+        let _mutations = if self.wal.is_none() {
+            // Fast readers briefly exclude sequence allocation while they drain
+            // buffers and capture the in-memory state at one linearization point.
+            Some(self.mutation_barrier.write().await)
+        } else {
+            None
+        };
+        if self.wal.is_none() {
+            self.memtable_manager
+                .flush_thread_local()
+                .map_err(StorageError::MemTable)?;
+        }
+        Ok(snapshot(&self.memtable_manager))
     }
 
     /// Read a key from an SSTable
@@ -1447,12 +1439,16 @@ async fn flush_memtable_to_sstable(
         });
 
         let minimum_unapplied_wal = resources.unapplied_wal_sequences.lock().first().copied();
-        candidate.wal_checkpoint = safe_flush_checkpoint(
+        let proposed_checkpoint = safe_flush_checkpoint(
             &candidate,
             resources.memtable_manager,
             memtable,
             minimum_unapplied_wal,
         );
+        candidate.wal_checkpoint = resources.wal.map_or(proposed_checkpoint, |wal| {
+            wal.align_checkpoint(proposed_checkpoint)
+                .max(candidate.wal_checkpoint)
+        });
 
         #[cfg(test)]
         super::failpoints::check(
@@ -2077,6 +2073,445 @@ mod tests {
         assert!(replayed.is_tombstone());
         assert!(reopened.memtable_manager.current_sequence() > tombstone_sequence);
         reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_scans_observe_no_atomic_batch_prefix() {
+        const ROUNDS: usize = 12;
+        const KEYS_PER_BATCH: usize = 512;
+
+        let directory = TempDir::new().unwrap();
+        let engine = Arc::new(
+            Engine::open(isolated_config(directory.path(), false))
+                .await
+                .unwrap(),
+        );
+
+        for round in 0..ROUNDS {
+            let prefix = format!("atomic:{round:02}:").into_bytes();
+            let end = format!("atomic:{round:02};").into_bytes();
+            let mut batch = WriteBatch::with_capacity(KEYS_PER_BATCH);
+            for key in 0..KEYS_PER_BATCH {
+                batch.put(format!("atomic:{round:02}:{key:04}"), b"value");
+            }
+
+            let scanning = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let scanner_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let scanner_engine = Arc::clone(&engine);
+            let scanner_flag = Arc::clone(&scanning);
+            let scanner_started_flag = Arc::clone(&scanner_started);
+            let scan_start = prefix.clone();
+            let scan_end = end.clone();
+            let scanner = tokio::spawn(async move {
+                let mut observations = 0;
+                while scanner_flag.load(Ordering::Acquire) {
+                    let count = scanner_engine
+                        .range(&scan_start, &scan_end)
+                        .await
+                        .unwrap()
+                        .len();
+                    assert!(
+                        count == 0 || count == KEYS_PER_BATCH,
+                        "reader observed {count} operations from an atomic batch"
+                    );
+                    observations += 1;
+                    scanner_started_flag.store(true, Ordering::Release);
+                    tokio::task::yield_now().await;
+                }
+                observations
+            });
+
+            while !scanner_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            engine.write_batch(&batch).await.unwrap();
+            scanning.store(false, Ordering::Release);
+            assert!(scanner.await.unwrap() > 0);
+            assert_eq!(
+                engine.scan_prefix(&prefix).await.unwrap().len(),
+                KEYS_PER_BATCH
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn publication_gate_blocks_every_reader_shape_until_batch_is_complete() {
+        let directory = TempDir::new().unwrap();
+        let engine = Arc::new(
+            Engine::open(isolated_config(directory.path(), false))
+                .await
+                .unwrap(),
+        );
+        let publication = engine.batch_visibility.write().await;
+        let start = engine.memtable_manager.reserve_sequence_range(2);
+        engine
+            .memtable_manager
+            .insert_with_sequence(b"gate:a", b"one", start)
+            .unwrap();
+
+        let started = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let point_engine = Arc::clone(&engine);
+        let point_started = Arc::clone(&started);
+        let point = tokio::spawn(async move {
+            point_started.fetch_add(1, Ordering::AcqRel);
+            point_engine.get(b"gate:a").await.unwrap()
+        });
+        let range_engine = Arc::clone(&engine);
+        let range_started = Arc::clone(&started);
+        let range = tokio::spawn(async move {
+            range_started.fetch_add(1, Ordering::AcqRel);
+            range_engine.range(b"gate:", b"gate;").await.unwrap()
+        });
+        let prefix_engine = Arc::clone(&engine);
+        let prefix_started = Arc::clone(&started);
+        let prefix = tokio::spawn(async move {
+            prefix_started.fetch_add(1, Ordering::AcqRel);
+            prefix_engine.scan_prefix(b"gate:").await.unwrap()
+        });
+        while started.load(Ordering::Acquire) != 3 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert!(!point.is_finished());
+        assert!(!range.is_finished());
+        assert!(!prefix.is_finished());
+
+        engine
+            .memtable_manager
+            .insert_with_sequence(b"gate:b", b"two", start + 1)
+            .unwrap();
+        drop(publication);
+
+        assert_eq!(point.await.unwrap(), Some(b"one".to_vec()));
+        let expected = vec![
+            (b"gate:a".to_vec(), b"one".to_vec()),
+            (b"gate:b".to_vec(), b"two".to_vec()),
+        ];
+        assert_eq!(range.await.unwrap(), expected);
+        assert_eq!(prefix.await.unwrap(), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sstable_io_after_a_reader_snapshot_does_not_block_batch_publication() {
+        let directory = TempDir::new().unwrap();
+        let engine = Arc::new(
+            Engine::open(isolated_config(directory.path(), false))
+                .await
+                .unwrap(),
+        );
+        let sstable_write = engine.sstables.write().await;
+        let range_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let range_engine = Arc::clone(&engine);
+        let started = Arc::clone(&range_started);
+        let range = tokio::spawn(async move {
+            started.store(true, Ordering::Release);
+            range_engine.range(b"slow:", b"slow;").await.unwrap()
+        });
+        while !range_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!range.is_finished());
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"slow:key", b"published");
+        tokio::time::timeout(Duration::from_secs(1), engine.write_batch(&batch))
+            .await
+            .expect("batch publication waited for unrelated SSTable I/O")
+            .unwrap();
+
+        drop(sstable_write);
+        assert!(range.await.unwrap().is_empty());
+        assert_eq!(
+            engine.get(b"slow:key").await.unwrap(),
+            Some(b"published".to_vec())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reader_observes_old_state_while_paranoid_batch_waits_on_wal() {
+        let directory = TempDir::new().unwrap();
+        let engine = Arc::new(
+            Engine::open(isolated_config(directory.path(), true))
+                .await
+                .unwrap(),
+        );
+        engine.insert(b"blocked:key", b"old").await.unwrap();
+        let wal = Arc::clone(engine.wal.as_ref().unwrap());
+
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_wal = Arc::clone(&wal);
+        let lock_holder = tokio::task::spawn_blocking(move || {
+            let file_guard = lock_wal.lock_current_file_for_test();
+            let _ = locked_tx.send(());
+            release_rx.recv().unwrap();
+            drop(file_guard);
+        });
+        locked_rx.await.unwrap();
+
+        let batch_engine = Arc::clone(&engine);
+        let batch = tokio::spawn(async move {
+            let mut batch = WriteBatch::new();
+            batch.put(b"blocked:key", b"new");
+            batch_engine.write_batch(&batch).await
+        });
+        while wal.current_sequence() < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!batch.is_finished());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), engine.get(b"blocked:key"))
+                .await
+                .expect("reader waited for a batch WAL fsync")
+                .unwrap(),
+            Some(b"old".to_vec())
+        );
+
+        release_tx.send(()).unwrap();
+        lock_holder.await.unwrap();
+        batch.await.unwrap().unwrap();
+        assert_eq!(
+            engine.get(b"blocked:key").await.unwrap(),
+            Some(b"new".to_vec())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fast_read_drain_waits_for_an_inflight_buffered_insert() {
+        let directory = TempDir::new().unwrap();
+        let engine = Arc::new(
+            Engine::open(isolated_config(directory.path(), false))
+                .await
+                .unwrap(),
+        );
+        let inflight_writer = engine.mutation_barrier.read().await;
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_engine = Arc::clone(&engine);
+        let reader_started = Arc::clone(&started);
+        let reader = tokio::spawn(async move {
+            reader_started.store(true, Ordering::Release);
+            reader_engine.get(b"drain:key").await.unwrap()
+        });
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert!(!reader.is_finished());
+
+        engine
+            .memtable_manager
+            .insert_buffered(b"drain:key", b"visible")
+            .unwrap();
+        drop(inflight_writer);
+
+        assert_eq!(reader.await.unwrap(), Some(b"visible".to_vec()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fast_flush_drains_a_buffered_insert_before_its_freeze_point() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), false);
+        let engine = Arc::new(Engine::open(config.clone()).await.unwrap());
+        let inflight_writer = engine.mutation_barrier.read().await;
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flush_engine = Arc::clone(&engine);
+        let flush_started = Arc::clone(&started);
+        let flush = tokio::spawn(async move {
+            flush_started.store(true, Ordering::Release);
+            flush_engine.flush().await
+        });
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert!(!flush.is_finished());
+
+        engine
+            .memtable_manager
+            .insert_buffered(b"flush-gap:key", b"persisted")
+            .unwrap();
+        drop(inflight_writer);
+        flush.await.unwrap().unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(
+            reopened.get(b"flush-gap:key").await.unwrap(),
+            Some(b"persisted".to_vec())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_key_batch_order_survives_wal_only_recovery() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), true);
+        let engine = Engine::open(config.clone()).await.unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(b"same:key", b"first");
+        batch.delete(b"same:key");
+        batch.put(b"same:key", b"last");
+
+        engine.write_batch(&batch).await.unwrap();
+        assert_eq!(
+            engine.get(b"same:key").await.unwrap(),
+            Some(b"last".to_vec())
+        );
+        let final_sequence = engine
+            .memtable_manager
+            .get_entry(b"same:key")
+            .unwrap()
+            .sequence;
+        engine.wal.as_ref().unwrap().flush().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        let entry = reopened.memtable_manager.get_entry(b"same:key").unwrap();
+        assert_eq!(entry.value, Some(b"last".to_vec()));
+        assert_eq!(entry.sequence, final_sequence);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_wal_batch_recovers_after_prepublication_failure() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), true);
+        let engine = Engine::open(config.clone()).await.unwrap();
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::Wal,
+        );
+        let mut batch = WriteBatch::new();
+        batch.put(b"failure:a", b"one");
+        batch.put(b"failure:b", b"two");
+
+        assert!(engine.write_batch(&batch).await.is_err());
+        failure.assert_hit();
+        assert!(engine
+            .range(b"failure:", b"failure;")
+            .await
+            .unwrap()
+            .is_empty());
+        engine.wal.as_ref().unwrap().flush().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(
+            reopened.range(b"failure:", b"failure;").await.unwrap(),
+            vec![
+                (b"failure:a".to_vec(), b"one".to_vec()),
+                (b"failure:b".to_vec(), b"two".to_vec()),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_durable_batch_stays_recoverable_before_publication() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), true);
+        let engine = Arc::new(Engine::open(config.clone()).await.unwrap());
+        let publication_reader = engine.batch_visibility.read().await;
+        let batch_engine = Arc::clone(&engine);
+        let batch = tokio::spawn(async move {
+            let mut batch = WriteBatch::new();
+            batch.put(b"cancel:a", b"one");
+            batch.put(b"cancel:b", b"two");
+            batch_engine.write_batch(&batch).await
+        });
+        let wal = engine.wal.as_ref().unwrap();
+        while wal.current_sequence() < 2 || wal.align_checkpoint(1) != 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!batch.is_finished());
+
+        batch.abort();
+        assert!(batch.await.unwrap_err().is_cancelled());
+        drop(publication_reader);
+        assert!(engine
+            .range(b"cancel:", b"cancel;")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            engine
+                .unapplied_wal_sequences
+                .lock()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0]
+        );
+
+        engine.insert(b"later:key", b"later").await.unwrap();
+        engine.flush().await.unwrap();
+        assert_eq!(
+            Manifest::load_or_create(directory.path())
+                .unwrap()
+                .wal_checkpoint,
+            0
+        );
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(
+            reopened.range(b"cancel:", b"cancel;").await.unwrap(),
+            vec![
+                (b"cancel:a".to_vec(), b"one".to_vec()),
+                (b"cancel:b".to_vec(), b"two".to_vec()),
+            ]
+        );
+        assert_eq!(
+            reopened.get(b"later:key").await.unwrap(),
+            Some(b"later".to_vec())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_checkpoint_never_splits_a_reserved_batch_span() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), true);
+        let engine = Engine::open(config.clone()).await.unwrap();
+        let wal = engine.wal.as_ref().unwrap();
+        let sequences = wal
+            .append_batch(&[
+                (b"span:a".as_slice(), Some(b"one".as_slice())),
+                (b"span:b".as_slice(), Some(b"two".as_slice())),
+                (b"span:c".as_slice(), Some(b"three".as_slice())),
+            ])
+            .await
+            .unwrap();
+        for (index, sequence) in sequences.iter().copied().enumerate() {
+            engine
+                .memtable_manager
+                .insert_with_sequence(
+                    format!("span:{}", (b'a' + index as u8) as char).as_bytes(),
+                    match index {
+                        0 => b"one",
+                        1 => b"two",
+                        _ => b"three",
+                    },
+                    sequence,
+                )
+                .unwrap();
+            engine.memtable_manager.force_rotate().unwrap();
+        }
+        let failure = super::super::failpoints::arm_on_hit(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::ManifestInstallation,
+            2,
+        );
+
+        assert!(engine.flush().await.is_err());
+        failure.assert_hit();
+        assert_eq!(
+            Manifest::load_or_create(directory.path())
+                .unwrap()
+                .wal_checkpoint,
+            sequences[0]
+        );
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(reopened.scan_prefix(b"span:").await.unwrap().len(), 3);
     }
 
     #[tokio::test]

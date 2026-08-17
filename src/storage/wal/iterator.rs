@@ -1,5 +1,6 @@
 //! WAL entry iterator for TurboKV
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -17,6 +18,7 @@ pub struct WalEntryIterator {
     format: WalFormat,
     current_file_end: u64,
     start_sequence: u64,
+    pending: VecDeque<WalEntry>,
     failed: bool,
 }
 
@@ -29,6 +31,7 @@ impl WalEntryIterator {
             format: WalFormat::Current,
             current_file_end: 0,
             start_sequence,
+            pending: VecDeque::new(),
             failed: false,
         };
         iter.open_next_file()?;
@@ -62,6 +65,13 @@ impl Iterator for WalEntryIterator {
             return None;
         }
         loop {
+            if let Some(entry) = self.pending.pop_front() {
+                if entry.sequence >= self.start_sequence || self.start_sequence == 0 {
+                    return Some(Ok(entry));
+                }
+                continue;
+            }
+
             let reader = self.reader.as_mut()?;
 
             let position = match reader.stream_position() {
@@ -74,13 +84,14 @@ impl Iterator for WalEntryIterator {
             };
             let remaining = self.current_file_end.saturating_sub(position);
             match read_entry_versioned(reader, self.format, remaining) {
-                Ok(entry) => {
-                    // Skip entries before start_sequence
-                    if entry.sequence < self.start_sequence && self.start_sequence > 0 {
-                        continue;
+                Ok(entry) => match entry.into_logical_entries() {
+                    Ok(entries) => self.pending.extend(entries),
+                    Err(error) => {
+                        self.failed = true;
+                        self.reader = None;
+                        return Some(Err(error));
                     }
-                    return Some(Ok(entry));
-                }
+                },
                 Err(ref e) if matches!(e, super::types::WalError::Eof) => {
                     // End of this file, try next
                     if let Err(e) = self.open_next_file() {
