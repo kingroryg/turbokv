@@ -502,11 +502,20 @@ impl MemTableManager {
 
     /// Lowest sequence not represented by the immutable currently installing.
     pub(crate) fn minimum_live_sequence_excluding(&self, excluded: &Arc<MemTable>) -> Option<u64> {
+        self.minimum_live_sequence_except(Some(excluded))
+    }
+
+    /// Lowest sequence still retained by any active or immutable generation.
+    pub(crate) fn minimum_live_sequence(&self) -> Option<u64> {
+        self.minimum_live_sequence_except(None)
+    }
+
+    fn minimum_live_sequence_except(&self, excluded: Option<&Arc<MemTable>>) -> Option<u64> {
         let active_min = self.active.read().sequence_bounds().map(|(min, _)| min);
         self.immutable
             .read()
             .iter()
-            .filter(|table| !Arc::ptr_eq(table, excluded))
+            .filter(|table| excluded.map_or(true, |excluded| !Arc::ptr_eq(table, excluded)))
             .filter_map(|table| table.sequence_bounds().map(|(min, _)| min))
             .chain(active_min)
             .min()

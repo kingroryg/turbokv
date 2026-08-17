@@ -11,7 +11,7 @@
 //! - Streaming merge to handle large files without RAM pressure
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -30,6 +30,7 @@ use crate::core::CompactionResult as PublicCompactionResult;
 use super::directory_lock::DirectoryLock;
 use super::engine::{Result as EngineResult, SstableStatistics, StorageError};
 use super::manifest::{sync_directory, Manifest, SSTableManifestEntry};
+use super::memtable::MemTableManager;
 use super::sstable::{
     OutputAppendDecision, SSTableConfig, SSTableEntry, SSTableInfo, SSTableReader, SSTableWriter,
 };
@@ -107,6 +108,77 @@ struct CompactionExecutionOptions {
     target_file_size: u64,
     first_output: Option<CompactionOutputIdentity>,
     require_output: bool,
+    tombstone_reclamation_frontier: TombstoneReclamationFrontier,
+}
+
+#[derive(Clone, Copy)]
+struct TombstoneReclamationFrontier(Option<u64>);
+
+impl TombstoneReclamationFrontier {
+    const RETAIN_ALL: Self = Self(None);
+
+    const fn captured(first_sequence_outside_inputs: u64) -> Self {
+        Self(Some(first_sequence_outside_inputs))
+    }
+
+    fn can_reclaim(self, tombstone_sequence: u64) -> bool {
+        self.0.is_some_and(|frontier| tombstone_sequence < frontier)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SstableIdentity {
+    id: u64,
+    path: PathBuf,
+}
+
+impl From<&SSTableManifestEntry> for SstableIdentity {
+    fn from(table: &SSTableManifestEntry) -> Self {
+        Self {
+            id: table.id,
+            path: table.path.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TombstoneSequenceCache {
+    minimum_sequences: HashMap<SstableIdentity, Option<u64>>,
+    #[cfg(test)]
+    scan_attempts: u64,
+}
+
+impl TombstoneSequenceCache {
+    fn reclaimable_table_ids(
+        &mut self,
+        live_identities: &HashSet<SstableIdentity>,
+        candidates: &[SSTableManifestEntry],
+        frontier: TombstoneReclamationFrontier,
+    ) -> EngineResult<HashSet<u64>> {
+        self.minimum_sequences
+            .retain(|identity, _| live_identities.contains(identity));
+        let mut reclaimable = HashSet::new();
+        for table in candidates {
+            let identity = SstableIdentity::from(table);
+            let minimum = match self.minimum_sequences.get(&identity).copied() {
+                Some(minimum) => minimum,
+                None => {
+                    #[cfg(test)]
+                    {
+                        self.scan_attempts = self.scan_attempts.saturating_add(1);
+                    }
+                    let minimum = minimum_sstable_tombstone_sequence(&table.path)?;
+                    self.minimum_sequences.insert(identity, minimum);
+                    minimum
+                }
+            };
+            if minimum.is_some_and(|sequence| frontier.can_reclaim(sequence)) {
+                reclaimable.insert(table.id);
+                break;
+            }
+        }
+        Ok(reclaimable)
+    }
 }
 
 struct CompactionOutputIdentity {
@@ -241,6 +313,36 @@ impl Compactor {
         None
     }
 
+    /// Select one component whose seed has an exactly identified reclaimable
+    /// tombstone. The rewrite is therefore useful without size pressure, even
+    /// when unrelated entries in the same table are newer than the frontier.
+    fn pick_tombstone_reclamation_in_scope(
+        &self,
+        sstables: &[SSTableManifestEntry],
+        scope: &HashSet<u64>,
+        reclaimable_table_ids: &HashSet<u64>,
+    ) -> Option<CompactionSelection> {
+        if self.config.max_levels == 0 {
+            return None;
+        }
+        let seed = sstables
+            .iter()
+            .filter(|table| scope.contains(&table.id) && reclaimable_table_ids.contains(&table.id))
+            .min_by_key(|table| (table.level, table.creation_time, table.id))?
+            .clone();
+        let requested_output_level = seed.level.saturating_add(1).min(self.config.max_levels - 1);
+        let (input_sstables, output_level) = complete_overlap_closure(
+            sstables,
+            vec![seed],
+            requested_output_level,
+            self.config.max_levels,
+        );
+        Some(CompactionSelection {
+            input_sstables,
+            output_level,
+        })
+    }
+
     /// Execute one legacy, caller-named, single-output compaction.
     ///
     /// This preserves the pre-0.5 low-level API. It does not coordinate with
@@ -266,6 +368,7 @@ impl Compactor {
                         creation: CompactionOutputCreation::CallerOwned,
                     }),
                     require_output: true,
+                    tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
                 },
             )
             .map_err(|error| Error::Compaction {
@@ -346,50 +449,59 @@ impl Compactor {
                     tombstones_dropped += 1;
                 }
             } else {
-                let append_decision = if let Some(output) = &pending_output {
-                    if output.writer.is_empty() {
-                        OutputAppendDecision::Append
-                    } else {
-                        output
-                            .writer
-                            .decide_target_size(
-                                &entry.key,
-                                entry.value.as_deref(),
-                                entry.sequence,
-                                options.target_file_size,
-                            )
-                            .map_err(compaction_error)?
-                    }
-                } else {
-                    OutputAppendDecision::Append
-                };
-                if append_decision == OutputAppendDecision::SplitBefore {
-                    let completed = pending_output
-                        .take()
-                        .expect("a split is requested only for a nonempty output");
-                    output_sstables.push(self.finish_output(job.output_level, completed)?);
-                }
-                if pending_output.is_none() {
-                    pending_output =
-                        Some(self.start_output(output_attempts, &mut options.first_output)?);
-                }
-                pending_output
-                    .as_mut()
-                    .expect("an output writer was just created")
-                    .writer
-                    .add_versioned(&entry.key, entry.value.as_deref(), entry.sequence)
-                    .map_err(compaction_error)?;
-                if append_decision == OutputAppendDecision::AppendAndSeal {
-                    let completed = pending_output
-                        .take()
-                        .expect("an appended output is present to seal");
-                    output_sstables.push(self.finish_output(job.output_level, completed)?);
-                }
-                if entry.value.is_some() {
-                    live_keys.push(entry.key.to_vec());
-                }
-                entries_merged += 1;
                 last_key = Some(entry.key.clone());
+                let reclaim_tombstone = entry.value.is_none()
+                    && options
+                        .tombstone_reclamation_frontier
+                        .can_reclaim(entry.sequence);
+                if reclaim_tombstone {
+                    entries_dropped += 1;
+                    tombstones_dropped += 1;
+                } else {
+                    let append_decision = if let Some(output) = &pending_output {
+                        if output.writer.is_empty() {
+                            OutputAppendDecision::Append
+                        } else {
+                            output
+                                .writer
+                                .decide_target_size(
+                                    &entry.key,
+                                    entry.value.as_deref(),
+                                    entry.sequence,
+                                    options.target_file_size,
+                                )
+                                .map_err(compaction_error)?
+                        }
+                    } else {
+                        OutputAppendDecision::Append
+                    };
+                    if append_decision == OutputAppendDecision::SplitBefore {
+                        let completed = pending_output
+                            .take()
+                            .expect("a split is requested only for a nonempty output");
+                        output_sstables.push(self.finish_output(job.output_level, completed)?);
+                    }
+                    if pending_output.is_none() {
+                        pending_output =
+                            Some(self.start_output(output_attempts, &mut options.first_output)?);
+                    }
+                    pending_output
+                        .as_mut()
+                        .expect("an output writer was just created")
+                        .writer
+                        .add_versioned(&entry.key, entry.value.as_deref(), entry.sequence)
+                        .map_err(compaction_error)?;
+                    if append_decision == OutputAppendDecision::AppendAndSeal {
+                        let completed = pending_output
+                            .take()
+                            .expect("an appended output is present to seal");
+                        output_sstables.push(self.finish_output(job.output_level, completed)?);
+                    }
+                    if entry.value.is_some() {
+                        live_keys.push(entry.key.to_vec());
+                    }
+                    entries_merged += 1;
+                }
             }
 
             // Advance the iterator that provided this entry
@@ -540,6 +652,27 @@ fn compaction_error(error: Error) -> StorageError {
     StorageError::Compaction(error.to_string())
 }
 
+fn minimum_sstable_tombstone_sequence(path: &std::path::Path) -> EngineResult<Option<u64>> {
+    let reader = SSTableReader::open(path).map_err(compaction_error)?;
+    let mut minimum: Option<u64> = None;
+    let mut entries = reader.iter();
+    while let Some(entry) = entries.next_versioned() {
+        let (_, entry) = entry.map_err(compaction_error)?;
+        if entry.value.into_option().is_none() {
+            let sequence = entry.sequence.unwrap_or(0);
+            minimum = Some(minimum.map_or(sequence, |current| current.min(sequence)));
+        }
+    }
+    Ok(minimum)
+}
+
+/// The manifest checkpoint is the next sequence recovery may replay, not the
+/// last sequence already covered. Keep this named to make the inclusive WAL
+/// iterator boundary explicit and avoid an overflowing `checkpoint + 1`.
+const fn first_wal_replayable_sequence(checkpoint: u64) -> u64 {
+    checkpoint
+}
+
 fn sstable_id_from_path(path: &std::path::Path) -> u64 {
     path.file_stem()
         .and_then(|stem| stem.to_str())
@@ -670,6 +803,8 @@ pub(super) struct CompactionCoordinator {
     directory_lock: Weak<DirectoryLock>,
     sstables: Arc<AsyncRwLock<Vec<SSTableInfo>>>,
     manifest: Arc<AsyncMutex<Manifest>>,
+    tombstone_reclamation_sources: TombstoneReclamationSources,
+    tombstone_sequence_cache: Arc<Mutex<TombstoneSequenceCache>>,
     sstable_stats: Arc<SstableStatistics>,
     compactions_in_progress: Arc<AtomicU64>,
     deferred_cleanup: Arc<Mutex<Vec<PathBuf>>>,
@@ -679,6 +814,63 @@ pub(super) struct CompactionCoordinator {
     during_manifest_gate: Mutex<Option<Arc<CompactionTestGate>>>,
     #[cfg(test)]
     after_manifest_gate: Mutex<Option<Arc<CompactionTestGate>>>,
+}
+
+/// Live layers which can publish or replay a version after compaction captures
+/// its persisted inputs.
+pub(super) struct TombstoneReclamationSources {
+    memtable_manager: Arc<MemTableManager>,
+    mutation_barrier: Arc<AsyncRwLock<()>>,
+    unapplied_wal_sequences: Arc<Mutex<BTreeSet<u64>>>,
+    wal_enabled: bool,
+}
+
+impl TombstoneReclamationSources {
+    pub(super) fn new(
+        memtable_manager: Arc<MemTableManager>,
+        mutation_barrier: Arc<AsyncRwLock<()>>,
+        unapplied_wal_sequences: Arc<Mutex<BTreeSet<u64>>>,
+        wal_enabled: bool,
+    ) -> Self {
+        Self {
+            memtable_manager,
+            mutation_barrier,
+            unapplied_wal_sequences,
+            wal_enabled,
+        }
+    }
+
+    async fn capture_frontier(
+        &self,
+        manifest: &AsyncMutex<Manifest>,
+    ) -> EngineResult<TombstoneReclamationFrontier> {
+        // Once this lock is released, every newly allocated mutation has a
+        // sequence at or above the captured next sequence.
+        let _mutations = self.mutation_barrier.write().await;
+        if !self.wal_enabled {
+            self.memtable_manager
+                .flush_thread_local()
+                .map_err(StorageError::MemTable)?;
+        }
+
+        let mut frontier = self.memtable_manager.current_sequence();
+        if let Some(sequence) = self.memtable_manager.minimum_live_sequence() {
+            frontier = frontier.min(sequence);
+        }
+        if let Some(sequence) = self.unapplied_wal_sequences.lock().first().copied() {
+            frontier = frontier.min(sequence);
+        }
+        if self.wal_enabled {
+            let checkpoint = manifest.lock().await.wal_checkpoint;
+            frontier = frontier.min(first_wal_replayable_sequence(checkpoint));
+        }
+        Ok(TombstoneReclamationFrontier::captured(frontier))
+    }
+}
+
+struct CapturedCompactionSelection {
+    selection: CompactionSelection,
+    tombstone_reclamation_frontier: TombstoneReclamationFrontier,
 }
 
 /// A manifest-installed generation waiting for the short asynchronous
@@ -708,6 +900,7 @@ impl CompactionCoordinator {
         directory_lock: Weak<DirectoryLock>,
         sstables: Arc<AsyncRwLock<Vec<SSTableInfo>>>,
         manifest: Arc<AsyncMutex<Manifest>>,
+        tombstone_reclamation_sources: TombstoneReclamationSources,
         sstable_stats: Arc<SstableStatistics>,
         compactions_in_progress: Arc<AtomicU64>,
         deferred_cleanup: Vec<PathBuf>,
@@ -720,6 +913,8 @@ impl CompactionCoordinator {
             directory_lock,
             sstables,
             manifest,
+            tombstone_reclamation_sources,
+            tombstone_sequence_cache: Arc::new(Mutex::new(TombstoneSequenceCache::default())),
             sstable_stats,
             compactions_in_progress,
             deferred_cleanup: Arc::new(Mutex::new(deferred_cleanup)),
@@ -781,6 +976,9 @@ impl CompactionCoordinator {
         let snapshot = self.live_manifest_entries().await;
         PublicCompactionResult {
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            // Admission is already closed or directory ownership is gone. Do
+            // not start an exact tombstone scan that can race active cleanup;
+            // this path remains the documented stable metadata-only no-op.
             work_remaining: self
                 .compactor
                 .pick_compaction_selection(&snapshot)
@@ -804,7 +1002,7 @@ impl CompactionCoordinator {
 
         loop {
             let snapshot = self.live_manifest_entries().await;
-            let job = match kind {
+            let ordinary_job = match kind {
                 CompactionRequestKind::ManualDrain => {
                     self.compactor.pick_compaction_in_scope(&snapshot, &scope)
                 }
@@ -812,13 +1010,22 @@ impl CompactionCoordinator {
                     self.compactor.pick_compaction_selection(&snapshot)
                 }
             };
-            let Some(job) = job else {
-                break;
+            let (job, reclamation_only) = if let Some(job) = ordinary_job {
+                (job, false)
+            } else {
+                let Some(job) = self
+                    .select_tombstone_reclamation_in_scope(&snapshot, &scope)
+                    .await?
+                else {
+                    break;
+                };
+                (job, true)
             };
             if !job
                 .input_sstables
                 .iter()
                 .any(|input| input.level < job.output_level)
+                && !reclamation_only
             {
                 return Err(StorageError::Compaction(
                     "selected compaction job cannot advance any input".to_string(),
@@ -833,7 +1040,9 @@ impl CompactionCoordinator {
             for input_id in &result.input_ids {
                 scope.remove(input_id);
             }
-            scope.extend(result.output_sstables.iter().map(|output| output.id));
+            if !reclamation_only {
+                scope.extend(result.output_sstables.iter().map(|output| output.id));
+            }
             aggregate.input_files = aggregate
                 .input_files
                 .saturating_add(u64::try_from(result.input_ids.len()).unwrap_or(u64::MAX));
@@ -851,11 +1060,87 @@ impl CompactionCoordinator {
         aggregate.bytes_reclaimed = aggregate.bytes_read.saturating_sub(aggregate.bytes_written);
         aggregate.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let final_snapshot = self.live_manifest_entries().await;
-        aggregate.work_remaining = self
-            .compactor
-            .pick_compaction_selection(&final_snapshot)
-            .is_some();
+        aggregate.work_remaining = self.has_global_selectable_work(&final_snapshot).await?;
         Ok(aggregate)
+    }
+
+    async fn has_global_selectable_work(
+        &self,
+        snapshot: &[SSTableManifestEntry],
+    ) -> EngineResult<bool> {
+        if self.compactor.pick_compaction_selection(snapshot).is_some() {
+            return Ok(true);
+        }
+        let scope = snapshot
+            .iter()
+            .map(|table| table.id)
+            .collect::<HashSet<_>>();
+        Ok(self
+            .select_tombstone_reclamation_in_scope(snapshot, &scope)
+            .await?
+            .is_some())
+    }
+
+    /// Cheaply reject an idle database before taking the mutation barrier.
+    /// Once a tombstone exists, capture one proof frontier and reselect from a
+    /// refreshed live list so selection and `work_remaining` share the same
+    /// exact eligibility rule.
+    async fn select_tombstone_reclamation_in_scope(
+        &self,
+        snapshot: &[SSTableManifestEntry],
+        scope: &HashSet<u64>,
+    ) -> EngineResult<Option<CompactionSelection>> {
+        let has_tombstone_candidate = snapshot
+            .iter()
+            .any(|table| scope.contains(&table.id) && table.tombstone_count > 0);
+        if !has_tombstone_candidate {
+            return Ok(None);
+        }
+        let frontier = self
+            .tombstone_reclamation_sources
+            .capture_frontier(&self.manifest)
+            .await?;
+        let latest = self.live_manifest_entries().await;
+        let reclaimable_table_ids = self
+            .reclaimable_tombstone_table_ids(&latest, scope, frontier)
+            .await?;
+        Ok(self.compactor.pick_tombstone_reclamation_in_scope(
+            &latest,
+            scope,
+            &reclaimable_table_ids,
+        ))
+    }
+
+    /// Resolve immutable table metadata away from the async runtime. Cache
+    /// keys include both id and path so a reused id cannot inherit a proof.
+    /// The coordinator cache lock serializes scans across rejected concurrent
+    /// callers; failed scans propagate without installing a cache entry.
+    async fn reclaimable_tombstone_table_ids(
+        &self,
+        latest: &[SSTableManifestEntry],
+        scope: &HashSet<u64>,
+        frontier: TombstoneReclamationFrontier,
+    ) -> EngineResult<HashSet<u64>> {
+        let live_identities = latest
+            .iter()
+            .map(SstableIdentity::from)
+            .collect::<HashSet<_>>();
+        let mut candidates = latest
+            .iter()
+            .filter(|table| scope.contains(&table.id) && table.tombstone_count > 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|table| (table.level, table.creation_time, table.id));
+        let cache = Arc::clone(&self.tombstone_sequence_cache);
+
+        tokio::task::spawn_blocking(move || {
+            let mut cache = cache.lock();
+            cache.reclaimable_table_ids(&live_identities, &candidates, frontier)
+        })
+        .await
+        .map_err(|error| {
+            StorageError::Other(format!("tombstone metadata scan task failed: {error}"))
+        })?
     }
 
     /// Permanently stop admitting requests. Waiting on the returned drain
@@ -894,6 +1179,10 @@ impl CompactionCoordinator {
         self: &Arc<Self>,
         job: Option<CompactionSelection>,
     ) -> EngineResult<Option<PreparedCompactionPublication>> {
+        let job = match job {
+            Some(job) => Some(self.capture_reclamation_safety(job).await?),
+            None => None,
+        };
         let coordinator = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             coordinator.retry_deferred_cleanup();
@@ -904,10 +1193,61 @@ impl CompactionCoordinator {
         .map_err(|error| StorageError::Other(format!("compaction blocking task failed: {error}")))?
     }
 
-    fn execute_claimed_blocking(
+    /// Capture the oldest sequence which can still arrive from outside this
+    /// job, then refresh its persisted overlap closure. Memory is captured
+    /// before SSTables because flush publishes the SSTable before releasing its
+    /// immutable generation; that ordering covers either side of the handoff.
+    async fn capture_reclamation_safety(
         &self,
         job: CompactionSelection,
+    ) -> EngineResult<CapturedCompactionSelection> {
+        let frontier = self
+            .tombstone_reclamation_sources
+            .capture_frontier(&self.manifest)
+            .await?;
+
+        let latest = self.live_manifest_entries().await;
+        let selected_ids = job
+            .input_sstables
+            .iter()
+            .map(|table| table.id)
+            .collect::<HashSet<_>>();
+        let seed = latest
+            .iter()
+            .filter(|table| selected_ids.contains(&table.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if seed.len() != selected_ids.len() {
+            // Explicit low-level test jobs can name absent inputs. They retain
+            // tombstones and continue to the normal read/publication error.
+            return Ok(CapturedCompactionSelection {
+                selection: job,
+                tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
+            });
+        }
+        let (input_sstables, output_level) = complete_overlap_closure(
+            &latest,
+            seed,
+            job.output_level,
+            self.compactor.config.max_levels,
+        );
+        Ok(CapturedCompactionSelection {
+            selection: CompactionSelection {
+                input_sstables,
+                output_level,
+            },
+            tombstone_reclamation_frontier: frontier,
+        })
+    }
+
+    fn execute_claimed_blocking(
+        &self,
+        captured: CapturedCompactionSelection,
     ) -> EngineResult<PreparedCompactionPublication> {
+        let CapturedCompactionSelection {
+            selection: job,
+            tombstone_reclamation_frontier,
+        } = captured;
         let input_sstables = job.input_sstables.clone();
         let input_ids: HashSet<u64> = input_sstables.iter().map(|table| table.id).collect();
         let input_paths = input_sstables
@@ -926,6 +1266,7 @@ impl CompactionCoordinator {
                 target_file_size: self.compactor.config.target_file_size,
                 first_output: None,
                 require_output: false,
+                tombstone_reclamation_frontier,
             },
         );
         self.sstable_stats
@@ -1104,6 +1445,11 @@ impl CompactionCoordinator {
     #[cfg(test)]
     pub(super) fn accepting_requests_for_test(&self) -> bool {
         self.accepting_requests.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn tombstone_scan_attempts_for_test(&self) -> u64 {
+        self.tombstone_sequence_cache.lock().scan_attempts
     }
 
     #[cfg(test)]
@@ -1405,6 +1751,16 @@ mod tests {
     }
 
     #[test]
+    fn wal_checkpoint_is_the_inclusive_first_replayable_sequence() {
+        assert_eq!(first_wal_replayable_sequence(0), 0);
+        assert_eq!(first_wal_replayable_sequence(27), 27);
+        assert_eq!(first_wal_replayable_sequence(u64::MAX), u64::MAX);
+        let frontier = TombstoneReclamationFrontier::captured(u64::MAX);
+        assert!(frontier.can_reclaim(u64::MAX - 1));
+        assert!(!frontier.can_reclaim(u64::MAX));
+    }
+
+    #[test]
     fn test_pick_compaction_l0() {
         let config = CompactionConfig::default();
         let compactor = Compactor::new(
@@ -1499,6 +1855,148 @@ mod tests {
     }
 
     #[test]
+    fn top_level_reclamation_can_select_a_mixed_sequence_table() {
+        let directory = TempDir::new().unwrap();
+        std::fs::create_dir_all(directory.path().join("sstables")).unwrap();
+        let compactor = Compactor::new(
+            CompactionConfig {
+                max_levels: 2,
+                ..CompactionConfig::default()
+            },
+            SSTableConfig::default(),
+            directory.path().to_path_buf(),
+            Arc::new(AtomicU64::new(100)),
+        );
+        let path = directory.path().join("sstables/mixed.sst");
+        let mut table = write_entries_table(
+            &path,
+            1,
+            SSTableConfig::default(),
+            &[
+                (b"a:tombstone".to_vec(), None, 10),
+                (b"z:live".to_vec(), Some(b"newer".to_vec()), 20),
+            ],
+        );
+        table.level = 1;
+        assert_eq!(minimum_sstable_tombstone_sequence(&path).unwrap(), Some(10));
+        let tables = vec![table];
+        let scope = HashSet::from([1]);
+
+        assert!(compactor
+            .pick_tombstone_reclamation_in_scope(&tables, &scope, &HashSet::new())
+            .is_none());
+        let selected = compactor
+            .pick_tombstone_reclamation_in_scope(&tables, &scope, &HashSet::from([1]))
+            .unwrap();
+        assert_eq!(selected.output_level, 1);
+        assert_eq!(selected.input_sstables[0].id, 1);
+    }
+
+    #[test]
+    fn tombstone_sequence_cache_keys_by_id_and_path_and_retries_scan_errors() {
+        let directory = TempDir::new().unwrap();
+        let first = write_entries_table(
+            &directory.path().join("first.sst"),
+            1,
+            SSTableConfig::default(),
+            &[(b"key".to_vec(), None, 10)],
+        );
+        let second = write_entries_table(
+            &directory.path().join("second.sst"),
+            1,
+            SSTableConfig::default(),
+            &[(b"key".to_vec(), None, 20)],
+        );
+        let frontier = TombstoneReclamationFrontier::captured(15);
+        let mut cache = TombstoneSequenceCache::default();
+
+        let first_live = HashSet::from([SstableIdentity::from(&first)]);
+        assert_eq!(
+            cache
+                .reclaimable_table_ids(&first_live, std::slice::from_ref(&first), frontier)
+                .unwrap(),
+            HashSet::from([1])
+        );
+        cache
+            .reclaimable_table_ids(&first_live, std::slice::from_ref(&first), frontier)
+            .unwrap();
+        assert_eq!(cache.scan_attempts, 1);
+
+        // Reusing an id at another immutable path cannot inherit the old
+        // table's sequence proof.
+        let second_live = HashSet::from([SstableIdentity::from(&second)]);
+        assert!(cache
+            .reclaimable_table_ids(&second_live, std::slice::from_ref(&second), frontier)
+            .unwrap()
+            .is_empty());
+        assert_eq!(cache.scan_attempts, 2);
+        assert!(!cache
+            .minimum_sequences
+            .contains_key(&SstableIdentity::from(&first)));
+
+        let missing_path = directory.path().join("missing.sst");
+        let mut missing = metadata_table(2, 1, b"a", b"z", 2);
+        missing.path.clone_from(&missing_path);
+        missing.tombstone_count = 1;
+        let missing_identity = SstableIdentity::from(&missing);
+        let missing_live = HashSet::from([missing_identity.clone()]);
+        assert!(cache
+            .reclaimable_table_ids(&missing_live, std::slice::from_ref(&missing), frontier,)
+            .is_err());
+        assert!(!cache.minimum_sequences.contains_key(&missing_identity));
+
+        let repaired = write_entries_table(
+            &missing_path,
+            2,
+            SSTableConfig::default(),
+            &[(b"key".to_vec(), None, 5)],
+        );
+        assert_eq!(
+            cache
+                .reclaimable_table_ids(
+                    &HashSet::from([SstableIdentity::from(&repaired)]),
+                    std::slice::from_ref(&repaired),
+                    frontier,
+                )
+                .unwrap(),
+            HashSet::from([2])
+        );
+    }
+
+    #[test]
+    fn concurrent_tombstone_cache_callers_scan_an_identity_once() {
+        let directory = TempDir::new().unwrap();
+        let table = write_entries_table(
+            &directory.path().join("shared.sst"),
+            1,
+            SSTableConfig::default(),
+            &[(b"key".to_vec(), None, 10)],
+        );
+        let live = HashSet::from([SstableIdentity::from(&table)]);
+        let cache = Arc::new(Mutex::new(TombstoneSequenceCache::default()));
+        let mut callers = Vec::new();
+        for _ in 0..2 {
+            let cache = Arc::clone(&cache);
+            let live = live.clone();
+            let table = table.clone();
+            callers.push(std::thread::spawn(move || {
+                cache
+                    .lock()
+                    .reclaimable_table_ids(
+                        &live,
+                        &[table],
+                        TombstoneReclamationFrontier::captured(11),
+                    )
+                    .unwrap()
+            }));
+        }
+        for caller in callers {
+            assert_eq!(caller.join().unwrap(), HashSet::from([1]));
+        }
+        assert_eq!(cache.lock().scan_attempts, 1);
+    }
+
+    #[test]
     fn compaction_selects_sequence_not_input_position() {
         let directory = TempDir::new().unwrap();
         let sstable_directory = directory.path().join("sstables");
@@ -1528,6 +2026,7 @@ mod tests {
                     target_file_size: compactor.config.target_file_size,
                     first_output: None,
                     require_output: false,
+                    tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
                 },
             )
             .unwrap();
@@ -1539,6 +2038,62 @@ mod tests {
         let entry = reader.get_entry(b"ordered:key").unwrap().unwrap();
         assert_eq!(entry.sequence, Some(20));
         assert!(entry.value.into_option().is_none());
+    }
+
+    #[test]
+    fn winning_tombstone_requires_a_strict_reclamation_frontier() {
+        let directory = TempDir::new().unwrap();
+        let sstable_directory = directory.path().join("sstables");
+        std::fs::create_dir_all(&sstable_directory).unwrap();
+        let tombstone = write_versioned_table(&sstable_directory.join("1.sst"), 1, 20, None);
+        let stale = write_versioned_table(&sstable_directory.join("2.sst"), 2, 10, Some(b"stale"));
+
+        for (case, frontier, tombstones_expected) in [
+            (0_u64, TombstoneReclamationFrontier::RETAIN_ALL, 1_u64),
+            (1, TombstoneReclamationFrontier::captured(20), 1),
+            (2, TombstoneReclamationFrontier::captured(21), 0),
+        ] {
+            let compactor = Compactor::new(
+                CompactionConfig::default(),
+                SSTableConfig {
+                    compression: CompressionType::None,
+                    ..SSTableConfig::default()
+                },
+                directory.path().to_path_buf(),
+                Arc::new(AtomicU64::new(10 + case * 10)),
+            );
+            let mut attempts = CompactionOutputAttempts::new(Arc::new(Mutex::new(Vec::new())));
+            let result = compactor
+                .execute_selection(
+                    CompactionSelection {
+                        input_sstables: vec![tombstone.clone(), stale.clone()],
+                        output_level: 1,
+                    },
+                    &mut attempts,
+                    CompactionExecutionOptions {
+                        target_file_size: compactor.config.target_file_size,
+                        first_output: None,
+                        require_output: false,
+                        tombstone_reclamation_frontier: frontier,
+                    },
+                )
+                .unwrap();
+            attempts.mark_manifest_committed();
+
+            assert_eq!(result.tombstones_dropped, 1 - tombstones_expected);
+            assert_eq!(
+                result
+                    .output_sstables
+                    .iter()
+                    .map(|table| table.tombstone_count)
+                    .sum::<u64>(),
+                tombstones_expected
+            );
+            assert_eq!(result.entries_dropped, 2 - tombstones_expected);
+            if tombstones_expected == 0 {
+                assert!(result.output_sstables.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -1611,6 +2166,7 @@ mod tests {
                         target_file_size: TARGET_SIZE,
                         first_output: None,
                         require_output: false,
+                        tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
                     },
                 )
                 .unwrap();
@@ -1706,6 +2262,7 @@ mod tests {
                         target_file_size,
                         first_output: None,
                         require_output: false,
+                        tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
                     },
                 )
                 .unwrap();

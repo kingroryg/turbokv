@@ -51,7 +51,10 @@ use crate::core::{
 #[cfg(test)]
 use super::InProgressGuard;
 use super::{
-    compaction::{remove_sstable_if_present, CompactionConfig, CompactionCoordinator},
+    compaction::{
+        remove_sstable_if_present, CompactionConfig, CompactionCoordinator,
+        TombstoneReclamationSources,
+    },
     directory_lock::{
         AcquireError as DirectoryLockAcquireError, DirectoryLock, LOCKED_DIRECTORY_GUIDANCE,
     },
@@ -531,6 +534,9 @@ impl Engine {
         let sstables = Arc::new(AsyncRwLock::new(sstables));
         let manifest = Arc::new(AsyncMutex::new(manifest));
         let compactions_in_progress = Arc::new(AtomicU64::new(0));
+        let flush_lock = Arc::new(AsyncMutex::new(()));
+        let mutation_barrier = Arc::new(AsyncRwLock::new(()));
+        let unapplied_wal_sequences = Arc::new(Mutex::new(BTreeSet::new()));
         let compaction_coordinator = Arc::new(CompactionCoordinator::new(
             config.compaction_config.clone(),
             config.sstable_config.clone(),
@@ -539,6 +545,12 @@ impl Engine {
             Arc::downgrade(&directory_lock),
             Arc::clone(&sstables),
             Arc::clone(&manifest),
+            TombstoneReclamationSources::new(
+                Arc::clone(&memtable_manager),
+                Arc::clone(&mutation_barrier),
+                Arc::clone(&unapplied_wal_sequences),
+                wal.is_some(),
+            ),
             Arc::clone(&sstable_stats),
             Arc::clone(&compactions_in_progress),
             deferred_sstable_cleanup,
@@ -551,11 +563,11 @@ impl Engine {
             memtable_manager,
             sstables,
             manifest,
-            flush_lock: Arc::new(AsyncMutex::new(())),
-            mutation_barrier: Arc::new(AsyncRwLock::new(())),
+            flush_lock,
+            mutation_barrier,
             batch_serialization: Arc::new(AsyncMutex::new(())),
             batch_visibility: Arc::new(AsyncRwLock::new(())),
-            unapplied_wal_sequences: Arc::new(Mutex::new(BTreeSet::new())),
+            unapplied_wal_sequences,
             shutdown: shutdown_tx,
             background_tasks: Mutex::new(Vec::new()),
             shutdown_lock: AsyncMutex::new(()),
@@ -2157,7 +2169,7 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = Engine::open(config).await.unwrap();
+        let engine = Engine::open(config.clone()).await.unwrap();
 
         // Insert
         engine.insert(b"key1", b"value1").await.unwrap();
@@ -2312,19 +2324,19 @@ mod tests {
         engine.compact().await.unwrap();
         let after_compaction = engine.physical_stats();
         assert_eq!(after_compaction.sstables.files, 1);
-        assert_eq!(after_compaction.sstables.versions, 4);
-        assert_eq!(after_compaction.sstables.tombstones, 1);
-        assert_eq!(after_compaction.versions.current, 4);
-        assert_eq!(after_compaction.versions.tombstones, 1);
+        assert_eq!(after_compaction.sstables.versions, 3);
+        assert_eq!(after_compaction.sstables.tombstones, 0);
+        assert_eq!(after_compaction.versions.current, 3);
+        assert_eq!(after_compaction.versions.tombstones, 0);
         assert_eq!(
             after_compaction.versions.reclaimed_by_compaction_since_open,
-            4
+            5
         );
         assert_eq!(
             after_compaction
                 .versions
                 .tombstones_reclaimed_by_compaction_since_open,
-            1
+            2
         );
         assert_eq!(
             after_compaction
@@ -2379,10 +2391,10 @@ mod tests {
             reopened_physical.sstables.bytes,
             after_compaction.sstables.bytes
         );
-        assert_eq!(reopened_physical.sstables.versions, 4);
-        assert_eq!(reopened_physical.sstables.tombstones, 1);
-        assert_eq!(reopened_physical.versions.current, 4);
-        assert_eq!(reopened_physical.versions.tombstones, 1);
+        assert_eq!(reopened_physical.sstables.versions, 3);
+        assert_eq!(reopened_physical.sstables.tombstones, 0);
+        assert_eq!(reopened_physical.versions.current, 3);
+        assert_eq!(reopened_physical.versions.tombstones, 0);
         assert_eq!(
             reopened_physical
                 .versions
@@ -3594,6 +3606,11 @@ mod tests {
                     .await
                     .unwrap();
             }
+            if generation == 0 {
+                engine.insert(b"shutdown:deleted", b"old").await.unwrap();
+            } else if generation == 3 {
+                engine.delete(b"shutdown:deleted").await.unwrap();
+            }
             engine.flush().await.unwrap();
         }
         let after_manifest = engine.compaction_coordinator.gate_after_manifest_for_test();
@@ -3635,6 +3652,12 @@ mod tests {
             .expect("requests during shutdown are immediate no-ops")
             .unwrap();
         assert_eq!(rejected.input_files, 0);
+        assert_eq!(
+            engine
+                .compaction_coordinator
+                .tombstone_scan_attempts_for_test(),
+            0
+        );
         assert!(!shutdown.is_finished());
 
         after_manifest.release();
@@ -3650,6 +3673,7 @@ mod tests {
             reopened.get(b"shutdown:00000").await.unwrap(),
             Some(format!("generation-03-{:064}", 0).into_bytes())
         );
+        assert_eq!(reopened.get(b"shutdown:deleted").await.unwrap(), None);
         reopened.shutdown().await.unwrap();
     }
 
@@ -4498,6 +4522,301 @@ mod tests {
             Some(b"new-versioned-value".to_vec())
         );
         assert_eq!(reopened.get(b"order:legacy-value").await.unwrap(), None);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delayed_older_flush_retains_then_reclaims_tombstone_at_a_safe_fixed_point() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 4;
+        config.compaction_config.max_levels = 3;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Arc::new(Engine::open(config.clone()).await.unwrap());
+
+        engine.insert(b"delayed:key", b"original").await.unwrap();
+        engine.flush().await.unwrap();
+        engine.delete(b"delayed:key").await.unwrap();
+        engine.flush().await.unwrap();
+        for generation in 0..2 {
+            engine
+                .insert(format!("delayed:initial:{generation}").as_bytes(), b"value")
+                .await
+                .unwrap();
+            engine.flush().await.unwrap();
+        }
+
+        // Model an acknowledged old, nonoverlapping generation whose flush was
+        // delayed. Its global sequence floor must retain the tombstone even
+        // though its eventual SSTable cannot join the overlap closure.
+        engine
+            .memtable_manager
+            .insert_with_sequence(b"z:delayed-floor", b"late-old-copy", 0)
+            .unwrap();
+        let before_manifest = engine
+            .compaction_coordinator
+            .gate_before_manifest_for_test();
+        let background = engine.clone_for_background();
+        let compaction = tokio::spawn(async move { background.compact().await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !before_manifest.reached() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compaction must capture the delayed floor before publication");
+        engine.flush().await.unwrap();
+        before_manifest.release();
+        let retained = compaction.await.unwrap();
+        assert_eq!(retained.input_files, 4);
+        assert!(retained.work_remaining);
+        assert_eq!(engine.get(b"delayed:key").await.unwrap(), None);
+        assert_eq!(
+            Manifest::load_or_create(directory.path())
+                .unwrap()
+                .sstables
+                .iter()
+                .map(|table| table.tombstone_count)
+                .sum::<u64>(),
+            1
+        );
+
+        // No level is under ordinary pressure. The later manual request must
+        // nevertheless revisit the retained tombstone now that the floor is
+        // durable, even though that floor's L0 table is nonoverlapping.
+        engine.compact().await.unwrap();
+        assert_eq!(engine.get(b"delayed:key").await.unwrap(), None);
+        assert_eq!(
+            Manifest::load_or_create(directory.path())
+                .unwrap()
+                .sstables
+                .iter()
+                .map(|table| table.tombstone_count)
+                .sum::<u64>(),
+            0
+        );
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(reopened.get(b"delayed:key").await.unwrap(), None);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_reports_the_next_reclaimable_tombstone_component() {
+        let directory = TempDir::new().unwrap();
+        let sstable_directory = directory.path().join("sstables");
+        std::fs::create_dir_all(&sstable_directory).unwrap();
+        let mut manifest = Manifest::new();
+        for component in 0_u64..2 {
+            let prefix = format!("component:{component}");
+            let deleted_key = format!("{prefix}:deleted");
+            let live_key = format!("{prefix}:live");
+            let entries = [
+                (deleted_key.as_bytes(), None, 10),
+                (live_key.as_bytes(), Some(b"newer-live".as_slice()), 20),
+            ];
+            let mut table = write_versioned_scan_table(
+                &sstable_directory.join(format!("component-{component}.sst")),
+                component + 1,
+                &entries,
+            );
+            table.level = 1;
+            manifest.sstables.push(table);
+        }
+        manifest.save(directory.path()).unwrap();
+
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.max_levels = 2;
+        config.compaction_config.l0_compaction_trigger = 4;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Engine::open(config.clone()).await.unwrap();
+        assert_eq!(engine.get(b"component:0:deleted").await.unwrap(), None);
+        assert_eq!(engine.get(b"component:1:deleted").await.unwrap(), None);
+
+        let first = engine.clone_for_background().compact().await.unwrap();
+        assert_eq!((first.input_files, first.output_files), (1, 1));
+        assert!(first.work_remaining);
+        assert!(!first.is_complete());
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        // The exact tombstone sequence cache is intentionally in-memory. A
+        // reopen must rescan the remaining mixed table and still reclaim it.
+        let reopened = Engine::open(config).await.unwrap();
+        let second = reopened.clone_for_background().compact().await.unwrap();
+        assert_eq!((second.input_files, second.output_files), (1, 1));
+        assert!(!second.work_remaining);
+        assert!(second.is_complete());
+        assert_eq!(
+            Manifest::load_or_create(directory.path())
+                .unwrap()
+                .sstables
+                .iter()
+                .map(|table| table.tombstone_count)
+                .sum::<u64>(),
+            0
+        );
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wal_replay_floor_retains_a_tombstone_at_the_checkpoint_equality_boundary() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), true);
+        config.compaction_config.l0_compaction_trigger = 2;
+        config.compaction_config.max_levels = 2;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Engine::open(config.clone()).await.unwrap();
+
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::Wal,
+        );
+        assert!(engine
+            .insert(b"wal-floor:key", b"replayable-old")
+            .await
+            .is_err());
+        failure.assert_hit();
+        engine.delete(b"wal-floor:key").await.unwrap();
+        engine.flush().await.unwrap();
+        engine.insert(b"wal-floor:other", b"value").await.unwrap();
+        engine.flush().await.unwrap();
+        assert_eq!(
+            Manifest::load_or_create(directory.path())
+                .unwrap()
+                .wal_checkpoint,
+            0
+        );
+
+        engine.compact().await.unwrap();
+        let compacted = Manifest::load_or_create(directory.path()).unwrap();
+        assert_eq!(compacted.wal_checkpoint, 0);
+        assert_eq!(
+            compacted
+                .sstables
+                .iter()
+                .map(|table| table.tombstone_count)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(engine.get(b"wal-floor:key").await.unwrap(), None);
+        engine.wal.as_ref().unwrap().flush().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(reopened.get(b"wal-floor:key").await.unwrap(), None);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn safe_tombstone_reclamation_survives_output_splitting_and_reopen() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 2;
+        config.compaction_config.max_levels = 2;
+        config.compaction_config.target_file_size = 20 * 1024;
+        config.sstable_config.block_size = 512;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Engine::open(config.clone()).await.unwrap();
+
+        for key_index in 0..48 {
+            engine
+                .insert(
+                    format!("reclaim-split:{key_index:04}").as_bytes(),
+                    &[b'a'; 512],
+                )
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+        for key_index in 0..48 {
+            let key = format!("reclaim-split:{key_index:04}");
+            if key_index % 7 == 0 {
+                engine.delete(key.as_bytes()).await.unwrap();
+            } else {
+                engine.insert(key.as_bytes(), &[b'b'; 512]).await.unwrap();
+            }
+        }
+        engine.flush().await.unwrap();
+
+        let result = engine.compact().await.unwrap();
+        assert!(result.output_files >= 3);
+        let compacted = Manifest::load_or_create(directory.path()).unwrap();
+        assert!(compacted.sstables.len() >= 3);
+        assert!(compacted
+            .sstables
+            .windows(2)
+            .all(|tables| tables[0].max_key < tables[1].min_key));
+        assert_eq!(
+            compacted
+                .sstables
+                .iter()
+                .map(|table| table.tombstone_count)
+                .sum::<u64>(),
+            0
+        );
+        for key_index in (0..48).step_by(7) {
+            assert_eq!(
+                engine
+                    .get(format!("reclaim-split:{key_index:04}").as_bytes())
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        for key_index in (0..48).step_by(7) {
+            assert_eq!(
+                reopened
+                    .get(format!("reclaim-split:{key_index:04}").as_bytes())
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fully_deleted_compaction_publishes_no_empty_table_and_allows_reinsertion() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 2;
+        config.compaction_config.max_levels = 2;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Engine::open(config.clone()).await.unwrap();
+
+        engine.insert(b"fully-deleted", b"old").await.unwrap();
+        engine.flush().await.unwrap();
+        engine.delete(b"fully-deleted").await.unwrap();
+        engine.flush().await.unwrap();
+
+        let result = engine.compact().await.unwrap();
+        assert_eq!(result.input_files, 2);
+        assert_eq!(result.output_files, 0);
+        assert!(Manifest::load_or_create(directory.path())
+            .unwrap()
+            .sstables
+            .is_empty());
+        assert_eq!(engine.get(b"fully-deleted").await.unwrap(), None);
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(reopened.get(b"fully-deleted").await.unwrap(), None);
+        reopened
+            .insert(b"fully-deleted", b"new-after-reclamation")
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.get(b"fully-deleted").await.unwrap(),
+            Some(b"new-after-reclamation".to_vec())
+        );
         reopened.shutdown().await.unwrap();
     }
 
