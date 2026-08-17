@@ -4,9 +4,127 @@
 //! covering tombstone semantics, flush/reopen durability, batch
 //! writes, range/prefix scans with deletions, compaction, and stats.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 use turbokv::{Db, DbOptions, WriteBatch};
+
+fn seeded_next(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    *state
+}
+
+async fn run_seeded_mutation_mix(options: DbOptions, mut seed: u64) {
+    let tmp = TempDir::new().unwrap();
+    let mut expected = BTreeMap::new();
+    let db = Db::open_with_options(tmp.path(), options.clone())
+        .await
+        .unwrap();
+
+    // Deterministically cross every fast-buffer boundary with every other
+    // mutation/read/flush entry point before the randomized mix.
+    db.insert(b"mix:00", b"buffered-before-delete")
+        .await
+        .unwrap();
+    db.remove(b"mix:00").await.unwrap();
+    db.insert(b"mix:01", b"buffered-before-bulk").await.unwrap();
+    db.insert_many([(b"mix:01".as_slice(), b"bulk".as_slice())])
+        .await
+        .unwrap();
+    expected.insert(b"mix:01".to_vec(), b"bulk".to_vec());
+    db.insert(b"mix:02", b"buffered-before-batch")
+        .await
+        .unwrap();
+    let mut opening_batch = WriteBatch::new();
+    opening_batch.delete(b"mix:02");
+    opening_batch.put(b"mix:03", b"batch");
+    db.write_batch(&opening_batch).await.unwrap();
+    expected.insert(b"mix:03".to_vec(), b"batch".to_vec());
+    db.insert(b"mix:04", b"buffered-before-read").await.unwrap();
+    expected.insert(b"mix:04".to_vec(), b"buffered-before-read".to_vec());
+    assert_eq!(
+        db.get(b"mix:04").await.unwrap(),
+        expected.get(b"mix:04".as_slice()).cloned()
+    );
+    db.insert(b"mix:05", b"buffered-before-flush")
+        .await
+        .unwrap();
+    expected.insert(b"mix:05".to_vec(), b"buffered-before-flush".to_vec());
+    db.flush().await.unwrap();
+
+    for step in 0..240_u64 {
+        let random = seeded_next(&mut seed);
+        let key_index = (random >> 8) % 24;
+        let key = format!("mix:{key_index:02}").into_bytes();
+        let value = format!("value:{step:03}:{random:016x}").into_bytes();
+        match random % 7 {
+            0 => {
+                db.insert(&key, &value).await.unwrap();
+                expected.insert(key, value);
+            }
+            1 => {
+                db.remove(&key).await.unwrap();
+                expected.remove(&key);
+            }
+            2 => {
+                let second_key = format!("mix:{:02}", (key_index + 7) % 24).into_bytes();
+                let second_value = format!("bulk:{step:03}").into_bytes();
+                db.insert_many([
+                    (key.clone(), value.clone()),
+                    (second_key.clone(), second_value.clone()),
+                ])
+                .await
+                .unwrap();
+                expected.insert(key, value);
+                expected.insert(second_key, second_value);
+            }
+            3 => {
+                let second_key = format!("mix:{:02}", (key_index + 11) % 24).into_bytes();
+                let mut batch = WriteBatch::new();
+                batch.put(&key, b"batch-first");
+                batch.delete(&key);
+                batch.put(&key, &value);
+                batch.delete(&second_key);
+                db.write_batch(&batch).await.unwrap();
+                expected.insert(key, value);
+                expected.remove(&second_key);
+            }
+            4 => {
+                assert_eq!(db.get(&key).await.unwrap(), expected.get(&key).cloned());
+            }
+            5 => {
+                let actual = db.range(b"mix:", b"mix;").await.unwrap();
+                let modeled: Vec<_> = expected
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                assert_eq!(actual, modeled);
+            }
+            _ => db.flush().await.unwrap(),
+        }
+    }
+
+    db.flush().await.unwrap();
+    let modeled: Vec<_> = expected.into_iter().collect();
+    assert_eq!(db.scan_prefix(b"mix:").await.unwrap(), modeled);
+    drop(db);
+
+    let reopened = Db::open_with_options(tmp.path(), options).await.unwrap();
+    assert_eq!(reopened.scan_prefix(b"mix:").await.unwrap(), modeled);
+}
+
+#[tokio::test]
+async fn seeded_mutation_entry_point_mix_preserves_order_in_every_mode() {
+    for (options, seed) in [
+        (DbOptions::fast(), 0x9f4a_7c15_d3e2_b801),
+        (DbOptions::durable(), 0x62de_41b7_a590_c3f8),
+        (DbOptions::paranoid(), 0xe13b_805c_4ad7_296f),
+    ] {
+        run_seeded_mutation_mix(options, seed).await;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 1. Tombstone point-get

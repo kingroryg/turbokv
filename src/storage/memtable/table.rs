@@ -101,6 +101,18 @@ impl MemTable {
             return Ok(());
         }
 
+        self.apply_insert(key, value, sequence);
+        Ok(())
+    }
+
+    /// Apply a batch insert after the manager has made the active table stable.
+    pub(crate) fn insert_batch_entry(&self, key: &[u8], value: &[u8], sequence: u64) {
+        if self.prepare_unbounded_mutation(key, sequence) {
+            self.apply_insert(key, value, sequence);
+        }
+    }
+
+    fn apply_insert(&self, key: &[u8], value: &[u8], sequence: u64) {
         // Inline size estimation for fast path
         let entry_size = key.len() + value.len() + 32; // 32 for entry overhead
 
@@ -124,8 +136,6 @@ impl MemTable {
             self.entry_count.fetch_add(1, Ordering::Relaxed);
         }
         // Overwrite of existing non-tombstone: don't change counts
-
-        Ok(())
     }
 
     /// Delete a key by inserting a tombstone
@@ -148,6 +158,18 @@ impl MemTable {
             return Ok(());
         }
 
+        self.apply_delete(key, sequence);
+        Ok(())
+    }
+
+    /// Apply a batch tombstone after the manager has made the active table stable.
+    pub(crate) fn delete_batch_entry(&self, key: &[u8], sequence: u64) {
+        if self.prepare_unbounded_mutation(key, sequence) {
+            self.apply_delete(key, sequence);
+        }
+    }
+
+    fn apply_delete(&self, key: &[u8], sequence: u64) {
         let entry = MemTableEntry::tombstone(sequence);
 
         // Check if we're deleting an existing non-tombstone entry
@@ -168,8 +190,6 @@ impl MemTable {
 
         // Approximate size (just key + overhead)
         self.size_bytes.fetch_add(key.len() + 32, Ordering::Relaxed);
-
-        Ok(())
     }
 
     /// Get a value by key
@@ -330,6 +350,14 @@ impl MemTable {
             .data
             .get(key)
             .map_or(true, |entry| entry.value().sequence <= sequence))
+    }
+
+    fn prepare_unbounded_mutation(&self, key: &[u8], sequence: u64) -> bool {
+        debug_assert!(!self.read_only.load(Ordering::Acquire));
+        self.observe_sequence(sequence);
+        self.data
+            .get(key)
+            .map_or(true, |entry| entry.value().sequence <= sequence)
     }
 
     /// Get statistics for this memtable

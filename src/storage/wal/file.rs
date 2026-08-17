@@ -6,7 +6,7 @@
 //!   and writes all entries in a single syscall
 //! - **Direct File I/O** - Writes go straight to kernel buffer (no userspace buffering)
 //!
-//! ## WAL Entry Format (v3)
+//! ## WAL Entry Format (v4)
 //!
 //! Entry header: 32 bytes
 //! - length: u32 (4 bytes)
@@ -35,6 +35,7 @@ const MAX_SUFFIX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalFormat {
     Legacy,
+    V3,
     Current,
 }
 
@@ -42,6 +43,7 @@ impl WalFormat {
     fn from_version(version: u32) -> Result<Self> {
         match version {
             1 | 2 => Ok(Self::Legacy),
+            3 => Ok(Self::V3),
             WAL_VERSION => Ok(Self::Current),
             _ => Err(WalError::InvalidFormat(format!(
                 "Unsupported WAL version: {version}"
@@ -51,6 +53,14 @@ impl WalFormat {
 
     pub fn has_legacy_extension(self) -> bool {
         self == Self::Legacy
+    }
+
+    pub fn is_current(self) -> bool {
+        self == Self::Current
+    }
+
+    fn supports_batches(self) -> bool {
+        self == Self::Current
     }
 
     fn entry_header_size(self) -> usize {
@@ -112,7 +122,7 @@ impl WalFile {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct SegmentMetadata {
     pub first_sequence: Option<u64>,
     pub last_sequence: Option<u64>,
@@ -120,10 +130,12 @@ pub(crate) struct SegmentMetadata {
     pub valid_end: u64,
     pub format: WalFormat,
     pub empty_sequence: u64,
+    /// Atomic logical batch spans discovered during the validation scan.
+    pub batch_ranges: Vec<(u64, u64)>,
 }
 
 impl SegmentMetadata {
-    pub fn next_sequence(self) -> u64 {
+    pub fn next_sequence(&self) -> u64 {
         self.last_sequence
             .map_or(self.empty_sequence, |sequence| sequence.saturating_add(1))
     }
@@ -177,12 +189,12 @@ pub(crate) fn recover_file(path: &Path, _config: &WalConfig) -> Result<(WalFile,
     tracing::info!("Recovering from WAL file: {:?}", path);
 
     let metadata = inspect_segment(path, true)?;
-    open_recovered_file(path, metadata)
+    open_recovered_file(path, &metadata)
 }
 
 pub(crate) fn open_recovered_file(
     path: &Path,
-    metadata: SegmentMetadata,
+    metadata: &SegmentMetadata,
 ) -> Result<(WalFile, u64)> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     rewrite_header(&mut file, metadata)?;
@@ -231,23 +243,28 @@ pub(crate) fn inspect_segment(path: &Path, repair_tail: bool) -> Result<SegmentM
         valid_end: WAL_HEADER_SIZE as u64,
         format,
         empty_sequence,
+        batch_ranges: Vec::new(),
     };
     let mut offset = WAL_HEADER_SIZE as u64;
 
     while offset < file_len {
         match read_record_at(&mut file, offset, file_len, format) {
             Ok((entry, end)) => {
+                let (record_first, record_last) = entry.sequence_bounds()?;
                 metadata.first_sequence = Some(
                     metadata
                         .first_sequence
-                        .map_or(entry.sequence, |first| first.min(entry.sequence)),
+                        .map_or(record_first, |first| first.min(record_first)),
                 );
                 metadata.last_sequence = Some(
                     metadata
                         .last_sequence
-                        .map_or(entry.sequence, |last| last.max(entry.sequence)),
+                        .map_or(record_last, |last| last.max(record_last)),
                 );
-                metadata.entry_count += 1;
+                metadata.entry_count += record_last - record_first + 1;
+                if entry.entry_type == EntryType::Batch {
+                    metadata.batch_ranges.push((record_first, record_last));
+                }
                 metadata.valid_end = end;
                 offset = end;
             }
@@ -283,7 +300,7 @@ pub(crate) fn inspect_segment(path: &Path, repair_tail: bool) -> Result<SegmentM
 
                 file.set_len(metadata.valid_end)?;
                 file.seek(SeekFrom::Start(metadata.valid_end))?;
-                rewrite_header(&mut file, metadata)?;
+                rewrite_header(&mut file, &metadata)?;
                 file.sync_all()?;
                 return Ok(metadata);
             }
@@ -409,7 +426,9 @@ fn plausible_record_size(
     file.seek(SeekFrom::Start(offset))?;
     let mut header = [0_u8; ENTRY_HEADER_SIZE];
     file.read_exact(&mut header)?;
-    if EntryType::try_from(header[ENTRY_TYPE_OFFSET]).is_err()
+    let entry_type = EntryType::try_from(header[ENTRY_TYPE_OFFSET]);
+    if entry_type.is_err()
+        || matches!(entry_type, Ok(EntryType::Batch)) && !format.supports_batches()
         || header[ENTRY_FLAGS_OFFSET] != 0
         || header[ENTRY_RESERVED_START..ENTRY_HEADER_SIZE]
             != [0_u8; ENTRY_HEADER_SIZE - ENTRY_RESERVED_START]
@@ -449,7 +468,7 @@ pub(crate) fn read_and_validate_header(
     Ok((format, first_sequence))
 }
 
-fn rewrite_header(file: &mut File, metadata: SegmentMetadata) -> Result<()> {
+fn rewrite_header(file: &mut File, metadata: &SegmentMetadata) -> Result<()> {
     let first = metadata.first_sequence.unwrap_or(metadata.empty_sequence);
     let last = metadata.last_sequence.unwrap_or(metadata.empty_sequence);
     file.seek(SeekFrom::Start(WAL_FIRST_SEQUENCE_OFFSET))?;
@@ -460,7 +479,7 @@ fn rewrite_header(file: &mut File, metadata: SegmentMetadata) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn synchronize_segment_header(path: &Path, metadata: SegmentMetadata) -> Result<()> {
+pub(crate) fn synchronize_segment_header(path: &Path, metadata: &SegmentMetadata) -> Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     rewrite_header(&mut file, metadata)?;
     file.sync_all()?;
@@ -481,7 +500,7 @@ pub(crate) fn finalize_header(wal_file: &mut WalFile) -> Result<()> {
     Ok(())
 }
 
-/// Write a single entry to the WAL (v3 format).
+/// Write a single entry to the WAL (v3/v4 physical format).
 #[allow(dead_code)]
 pub(crate) fn write_entry(writer: &mut impl Write, entry: &WalEntry) -> Result<()> {
     writer.write_u32::<LittleEndian>(entry.data.len() as u32)?;
@@ -499,7 +518,7 @@ pub(crate) fn write_entry(writer: &mut impl Write, entry: &WalEntry) -> Result<(
 /// Read a single entry with version-aware format.
 ///
 /// Versions 1 and 2 contain a 96-byte extension between the header and payload;
-/// version 3 does not. The extension is ignored during migration reads.
+/// versions 3 and 4 do not. The extension is ignored during migration reads.
 pub(crate) fn read_entry_versioned(
     reader: &mut impl Read,
     format: WalFormat,
@@ -526,6 +545,11 @@ pub(crate) fn read_entry_versioned(
     let sequence = reader.read_u64::<LittleEndian>()?;
     let timestamp = reader.read_u64::<LittleEndian>()?;
     let entry_type = EntryType::try_from(reader.read_u8()?)?;
+    if entry_type == EntryType::Batch && !format.supports_batches() {
+        return Err(WalError::InvalidFormat(
+            "batch record appears in a WAL version without batch support".to_string(),
+        ));
+    }
     let flags = reader.read_u8()?;
     if flags != 0 {
         return Err(WalError::InvalidFormat(format!(
@@ -554,15 +578,20 @@ pub(crate) fn read_entry_versioned(
     }
     validate_payload(entry_type, &data)?;
 
-    Ok(WalEntry {
+    let entry = WalEntry {
         sequence,
         timestamp,
         entry_type,
         data: Bytes::from(data),
-    })
+    };
+    entry.sequence_bounds()?;
+    Ok(entry)
 }
 
 fn validate_payload(entry_type: EntryType, data: &[u8]) -> Result<()> {
+    if entry_type == EntryType::Batch {
+        return validate_batch(data);
+    }
     if !matches!(entry_type, EntryType::Data | EntryType::Delete) {
         return Ok(());
     }
@@ -588,7 +617,7 @@ fn validate_payload(entry_type: EntryType, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Calculate the size of an entry on disk (v3 format).
+/// Calculate the size of an entry on disk (v3/v4 physical format).
 pub(crate) fn entry_size(entry: &WalEntry) -> usize {
     ENTRY_HEADER_SIZE + entry.data.len()
 }
@@ -644,6 +673,28 @@ mod tests {
     fn encoded_entry(sequence: u64) -> Vec<u8> {
         let mut encoded = Vec::new();
         write_entry(&mut encoded, &entry(sequence)).unwrap();
+        encoded
+    }
+
+    fn batch_entry(sequence: u64) -> WalEntry {
+        WalEntry {
+            sequence,
+            timestamp: 0,
+            entry_type: EntryType::Batch,
+            data: Bytes::from(
+                encode_batch(&[
+                    (b"first".as_slice(), Some(b"one".as_slice())),
+                    (b"second".as_slice(), None),
+                    (b"third".as_slice(), Some(b"three".as_slice())),
+                ])
+                .unwrap(),
+            ),
+        }
+    }
+
+    fn encoded_batch_entry(sequence: u64) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        write_entry(&mut encoded, &batch_entry(sequence)).unwrap();
         encoded
     }
 
@@ -745,6 +796,55 @@ mod tests {
             assert_eq!(next_sequence, 1, "{name}");
             assert_eq!(header_bounds(&path), (0, 0, 1), "{name}");
         }
+    }
+
+    #[test]
+    fn recovery_discards_every_logical_operation_from_a_torn_batch_envelope() {
+        let complete = encoded_batch_entry(1);
+        let cases = [
+            ("partial-header", complete[..20].to_vec()),
+            ("partial-body", complete[..complete.len() - 1].to_vec()),
+            ("checksum", {
+                let mut bytes = complete.clone();
+                bytes[ENTRY_CRC_OFFSET as usize] ^= 0x80;
+                bytes
+            }),
+        ];
+
+        for (name, damaged_batch) in cases {
+            let directory = TempDir::new().unwrap();
+            let config = WalConfig::durable();
+            let mut wal_file = create_file(directory.path(), 0, &config).unwrap();
+            write_entry(&mut wal_file.file, &entry(0)).unwrap();
+            let valid_end = wal_file.file.stream_position().unwrap();
+            wal_file.file.write_all(&damaged_batch).unwrap();
+            let path = wal_file.path.clone();
+            drop(wal_file);
+
+            let (recovered, next_sequence) =
+                recover_file(&path, &config).unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(recovered.size, valid_end, "{name}");
+            assert_eq!(recovered.entry_count, 1, "{name}");
+            assert_eq!(next_sequence, 1, "{name}");
+            assert_eq!(header_bounds(&path), (0, 0, 1), "{name}");
+        }
+    }
+
+    #[test]
+    fn segment_metadata_counts_the_complete_logical_batch_sequence_span() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig::durable();
+        let mut wal_file = create_file(directory.path(), 0, &config).unwrap();
+        write_entry(&mut wal_file.file, &entry(0)).unwrap();
+        write_entry(&mut wal_file.file, &batch_entry(1)).unwrap();
+        let path = wal_file.path.clone();
+        drop(wal_file);
+
+        let (recovered, next_sequence) = recover_file(&path, &config).unwrap();
+        assert_eq!((recovered.first_sequence, recovered.last_sequence), (0, 3));
+        assert_eq!(recovered.entry_count, 4);
+        assert_eq!(next_sequence, 4);
+        assert_eq!(header_bounds(&path), (0, 3, 4));
     }
 
     #[test]

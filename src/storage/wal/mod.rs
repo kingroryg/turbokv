@@ -11,7 +11,7 @@
 //! │  append_batch() ──────────► Direct Write (bypasses group commit)│
 //! └─────────────────────────────────────────────────────────────────┘
 //!
-//! ## File Format (v3)
+//! ## File Format (v4)
 //!
 //! - Header: 64 bytes (magic, version, timestamps, sequence range)
 //! - Entries: Header (32B) + Payload (variable)
@@ -29,7 +29,7 @@ pub use iterator::WalEntryIterator;
 pub use types::{encode_delete, encode_kv, EntryType, Result, WalConfig, WalEntry, WalError};
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -47,7 +47,7 @@ use file::{
     read_and_validate_header, read_entry_versioned, synchronize_segment_header,
     wal_sequence_from_path, write_entries_batch, write_entry, WalFile,
 };
-use types::{ENTRY_HEADER_SIZE, ENTRY_RESERVED_SIZE, WAL_HEADER_SIZE};
+use types::{encode_batch, ENTRY_HEADER_SIZE, ENTRY_RESERVED_SIZE, WAL_HEADER_SIZE};
 
 // Thread-local buffer for zero-allocation WAL writes
 // Pre-allocated to avoid per-write heap allocations
@@ -60,11 +60,25 @@ struct WriteRequest {
     response: oneshot::Sender<Result<()>>,
 }
 
+pub(crate) struct BatchAppend {
+    pub sequences: Vec<u64>,
+    pub bytes_written: u64,
+}
+
+struct EncodedBatchRecord {
+    sequences: Vec<u64>,
+    encoded: Vec<u8>,
+    first_sequence: u64,
+    last_sequence: u64,
+}
+
 pub struct WriteAheadLog {
     wal_dir: PathBuf,
     config: WalConfig,
     current_file: Arc<RwLock<WalFile>>,
     sequence: Arc<AtomicU64>,
+    /// Atomic batch spans used to keep durable checkpoints on batch boundaries.
+    batch_ranges: Arc<RwLock<BTreeMap<u64, u64>>>,
     write_tx: mpsc::Sender<WriteRequest>,
 }
 
@@ -78,7 +92,7 @@ impl WriteAheadLog {
                 source: Some(e),
             })?;
 
-        let (wal_file, sequence) = Self::open_or_create(&wal_dir, &config).await?;
+        let (wal_file, sequence, batch_ranges) = Self::open_or_create(&wal_dir, &config).await?;
         let current_file = Arc::new(RwLock::new(wal_file));
         let (write_tx, write_rx) = mpsc::channel::<WriteRequest>(config.max_batch_size * 2);
 
@@ -95,6 +109,7 @@ impl WriteAheadLog {
             config,
             current_file,
             sequence: Arc::new(AtomicU64::new(sequence)),
+            batch_ranges: Arc::new(RwLock::new(batch_ranges)),
             write_tx,
         })
     }
@@ -310,21 +325,30 @@ impl WriteAheadLog {
 
     /// Append multiple key-value pairs in a single batch (bypasses group commit)
     pub async fn append_batch(&self, entries: &[(&[u8], Option<&[u8]>)]) -> Result<Vec<u64>> {
+        Ok(self.append_batch_with_metadata(entries).await?.sequences)
+    }
+
+    pub(crate) async fn append_batch_with_metadata(
+        &self,
+        entries: &[(&[u8], Option<&[u8]>)],
+    ) -> Result<BatchAppend> {
         if entries.is_empty() {
-            return Ok(vec![]);
+            return Ok(BatchAppend {
+                sequences: Vec::new(),
+                bytes_written: 0,
+            });
         }
 
-        let (sequences, encoded, first_sequence, last_sequence) =
-            self.encode_entries_batch(entries)?;
-        self.write_encoded_batch(
-            &encoded,
-            entries.len() as u64,
-            first_sequence,
-            last_sequence,
-        )
-        .await?;
+        let batch = self.encode_entries_batch(entries)?;
+        self.write_encoded_batch(&batch).await?;
+        self.batch_ranges
+            .write()
+            .insert(batch.first_sequence, batch.last_sequence);
 
-        Ok(sequences)
+        Ok(BatchAppend {
+            sequences: batch.sequences,
+            bytes_written: batch.encoded.len() as u64,
+        })
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -408,11 +432,24 @@ impl WriteAheadLog {
                 std::fs::remove_file(path)?;
             }
         }
+        self.batch_ranges
+            .write()
+            .retain(|_, last| *last >= up_to_sequence);
         Ok(())
     }
 
     pub fn current_sequence(&self) -> u64 {
         self.sequence.load(Ordering::SeqCst)
+    }
+
+    /// Move a proposed checkpoint back to the start of any batch it splits.
+    pub(crate) fn align_checkpoint(&self, proposed: u64) -> u64 {
+        let ranges = self.batch_ranges.read();
+        ranges
+            .range(..proposed)
+            .next_back()
+            .and_then(|(&start, &end)| (proposed <= end).then_some(start))
+            .unwrap_or(proposed)
     }
 
     /// Ensure future WAL entries do not reuse sequences already persisted in
@@ -425,6 +462,11 @@ impl WriteAheadLog {
     pub fn current_size(&self) -> u64 {
         let file = self.current_file.read();
         file.size
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_current_file_for_test(&self) -> parking_lot::RwLockWriteGuard<'_, WalFile> {
+        self.current_file.write()
     }
 
     // ========================================
@@ -460,62 +502,32 @@ impl WriteAheadLog {
     fn encode_entries_batch(
         &self,
         entries: &[(&[u8], Option<&[u8]>)],
-    ) -> Result<(Vec<u64>, Vec<u8>, u64, u64)> {
+    ) -> Result<EncodedBatchRecord> {
         let start_sequence = self
             .sequence
             .fetch_add(entries.len() as u64, Ordering::SeqCst);
-        let timestamp = super::cached_time::now_ms();
-        let total_size: usize = entries
-            .iter()
-            .map(|(key, value)| ENTRY_HEADER_SIZE + 4 + key.len() + value.map_or(0, <[u8]>::len))
-            .sum();
-
-        let mut sequences = Vec::with_capacity(entries.len());
-        let mut encoded = Vec::with_capacity(total_size);
-
-        for (i, (key, value)) in entries.iter().enumerate() {
-            let sequence = start_sequence + i as u64;
-            let entry_type = if value.is_some() {
-                EntryType::Data
-            } else {
-                EntryType::Delete
-            };
-            let data_len = 4 + key.len() + value.map_or(0, <[u8]>::len);
-
-            encoded.extend_from_slice(&(data_len as u32).to_le_bytes());
-            encoded.extend_from_slice(&sequence.to_le_bytes());
-            encoded.extend_from_slice(&timestamp.to_le_bytes());
-            encoded.push(entry_type as u8);
-            encoded.push(0);
-
-            let crc_offset = encoded.len();
-            encoded.extend_from_slice(&[0u8; 4]);
-            encoded.extend_from_slice(&[0_u8; ENTRY_RESERVED_SIZE]);
-
-            let data_start = encoded.len();
-            encoded.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            encoded.extend_from_slice(key);
-            if let Some(value) = value {
-                encoded.extend_from_slice(value);
-            }
-
-            let crc = crc32_checksum(&encoded[data_start..]);
-            encoded[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
-            sequences.push(sequence);
-        }
-
-        let last_sequence = sequences.last().copied().unwrap_or(start_sequence);
-        Ok((sequences, encoded, start_sequence, last_sequence))
+        let last_sequence = start_sequence
+            .checked_add(entries.len() as u64 - 1)
+            .ok_or_else(|| WalError::InvalidFormat("batch sequence range overflows".to_string()))?;
+        let sequences = (start_sequence..=last_sequence).collect();
+        let entry = WalEntry {
+            sequence: start_sequence,
+            timestamp: super::cached_time::now_ms(),
+            entry_type: EntryType::Batch,
+            data: Bytes::from(encode_batch(entries)?),
+        };
+        let mut encoded = Vec::with_capacity(entry_size(&entry));
+        write_entry(&mut encoded, &entry)?;
+        Ok(EncodedBatchRecord {
+            sequences,
+            encoded,
+            first_sequence: start_sequence,
+            last_sequence,
+        })
     }
 
-    async fn write_encoded_batch(
-        &self,
-        encoded: &[u8],
-        entry_count: u64,
-        first_sequence: u64,
-        last_sequence: u64,
-    ) -> Result<()> {
-        let total_batch_size = encoded.len() as u64;
+    async fn write_encoded_batch(&self, batch: &EncodedBatchRecord) -> Result<()> {
+        let total_batch_size = batch.encoded.len() as u64;
         let needs_rotation = {
             let f = self.current_file.read();
             f.should_rotate(total_batch_size, self.config.max_file_size)
@@ -525,8 +537,13 @@ impl WriteAheadLog {
         }
 
         let mut f = self.current_file.write();
-        f.file.write_all(encoded)?;
-        f.record_append(total_batch_size, entry_count, first_sequence, last_sequence);
+        f.file.write_all(&batch.encoded)?;
+        f.record_append(
+            total_batch_size,
+            batch.sequences.len() as u64,
+            batch.first_sequence,
+            batch.last_sequence,
+        );
 
         if self.config.sync_on_write {
             f.file.sync_all()?;
@@ -600,7 +617,10 @@ impl WriteAheadLog {
         }
     }
 
-    async fn open_or_create(wal_dir: &Path, config: &WalConfig) -> Result<(WalFile, u64)> {
+    async fn open_or_create(
+        wal_dir: &Path,
+        config: &WalConfig,
+    ) -> Result<(WalFile, u64, BTreeMap<u64, u64>)> {
         let mut entries = tokio::fs::read_dir(wal_dir).await?;
         let mut wal_files = Vec::new();
 
@@ -616,21 +636,28 @@ impl WriteAheadLog {
 
         if let Some((latest_filename_sequence, latest)) = wal_files.last() {
             let mut next_sequence = 0;
+            let mut batch_ranges = BTreeMap::new();
             for (_, path) in &wal_files[..wal_files.len() - 1] {
                 let metadata = inspect_segment(path, false)?;
-                synchronize_segment_header(path, metadata)?;
+                synchronize_segment_header(path, &metadata)?;
                 next_sequence = next_sequence.max(metadata.next_sequence());
+                batch_ranges.extend(metadata.batch_ranges.iter().copied());
             }
             let latest_metadata = inspect_segment(latest, true)?;
-            let (mut file, latest_next_sequence) = open_recovered_file(latest, latest_metadata)?;
+            let (mut file, latest_next_sequence) = open_recovered_file(latest, &latest_metadata)?;
             next_sequence = next_sequence.max(latest_next_sequence);
+            batch_ranges.extend(latest_metadata.batch_ranges.iter().copied());
 
-            // Legacy segments remain readable, but current writes use v3. Start
-            // a new v3 segment rather than mixing record layouts in one file.
-            if latest_metadata.format.has_legacy_extension() {
+            // Older segments remain readable, but current writes use v4. Start
+            // a new segment rather than adding v4 batch records to an old one.
+            if !latest_metadata.format.is_current() {
                 finalize_header(&mut file)?;
                 let new_sequence = next_sequence.max(latest_filename_sequence.saturating_add(1));
-                return Ok((create_file(wal_dir, new_sequence, config)?, new_sequence));
+                return Ok((
+                    create_file(wal_dir, new_sequence, config)?,
+                    new_sequence,
+                    batch_ranges,
+                ));
             }
 
             if file.entry_count == 0 {
@@ -639,9 +666,9 @@ impl WriteAheadLog {
                 finalize_header(&mut file)?;
             }
 
-            Ok((file, next_sequence))
+            Ok((file, next_sequence, batch_ranges))
         } else {
-            Ok((create_file(wal_dir, 0, config)?, 0))
+            Ok((create_file(wal_dir, 0, config)?, 0, BTreeMap::new()))
         }
     }
 
@@ -677,9 +704,11 @@ impl WriteAheadLog {
             let remaining = file_end.saturating_sub(reader.stream_position()?);
             match read_entry_versioned(&mut reader, format, remaining) {
                 Ok(entry) => {
-                    if entry.sequence >= start_sequence && !seen.contains(&entry.sequence) {
-                        seen.insert(entry.sequence);
-                        entries.push(entry);
+                    for entry in entry.into_logical_entries()? {
+                        if entry.sequence >= start_sequence && !seen.contains(&entry.sequence) {
+                            seen.insert(entry.sequence);
+                            entries.push(entry);
+                        }
                     }
                 }
                 Err(WalError::Eof) => break,
@@ -826,6 +855,84 @@ mod tests {
 
         let entries = wal.read_from(0).await.unwrap();
         assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            sequences
+        );
+        assert_eq!(wal.align_checkpoint(sequences[1]), sequences[0]);
+        assert_eq!(wal.align_checkpoint(sequences[2] + 1), sequences[2] + 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_group_commit_single_and_direct_batch_follow_sequence_order() {
+        let directory = TempDir::new().unwrap();
+        let wal = Arc::new(
+            WriteAheadLog::new(directory.path(), WalConfig::paranoid())
+                .await
+                .unwrap(),
+        );
+
+        let (locked_tx, locked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_wal = Arc::clone(&wal);
+        let lock_holder = tokio::task::spawn_blocking(move || {
+            let file_guard = lock_wal.current_file.write();
+            let _ = locked_tx.send(());
+            release_rx.recv().unwrap();
+            drop(file_guard);
+        });
+        locked_rx.await.unwrap();
+        let queued_wal = Arc::clone(&wal);
+        let queued = tokio::spawn(async move { queued_wal.append(b"key", b"old").await });
+        while wal.current_sequence() < 1 {
+            tokio::task::yield_now().await;
+        }
+
+        let batch_wal = Arc::clone(&wal);
+        let batch = tokio::spawn(async move {
+            batch_wal
+                .append_batch(&[
+                    (b"key".as_slice(), Some(b"new".as_slice())),
+                    (b"key".as_slice(), None),
+                ])
+                .await
+        });
+        while wal.current_sequence() < 3 {
+            tokio::task::yield_now().await;
+        }
+        release_tx.send(()).unwrap();
+        lock_holder.await.unwrap();
+
+        assert_eq!(queued.await.unwrap().unwrap(), 0);
+        assert_eq!(batch.await.unwrap().unwrap(), [1, 2]);
+        assert_eq!(
+            wal.read_from(0)
+                .await
+                .unwrap()
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaimed_batch_ranges_do_not_accumulate_in_memory() {
+        let directory = TempDir::new().unwrap();
+        let wal = WriteAheadLog::new(directory.path(), WalConfig::durable())
+            .await
+            .unwrap();
+        let sequences = wal
+            .append_batch(&[(b"key".as_slice(), Some(b"value".as_slice()))])
+            .await
+            .unwrap();
+        assert_eq!(wal.batch_ranges.read().len(), 1);
+
+        wal.truncate(sequences[0] + 1).await.unwrap();
+        assert!(wal.batch_ranges.read().is_empty());
     }
 
     #[tokio::test]
@@ -1162,7 +1269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_active_segment_rotates_to_v3_before_append() {
+    async fn legacy_active_segment_rotates_to_v4_before_append() {
         let directory = TempDir::new().unwrap();
         let config = WalConfig::paranoid();
         let mut legacy = create_file(directory.path(), 0, &config).unwrap();
