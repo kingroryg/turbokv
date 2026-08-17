@@ -50,12 +50,12 @@ pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     Some(upper)
 }
 
-struct InProgressGuard {
+pub(super) struct InProgressGuard {
     counter: Arc<AtomicU64>,
 }
 
 impl InProgressGuard {
-    fn new(counter: Arc<AtomicU64>) -> Self {
+    pub(super) fn new(counter: Arc<AtomicU64>) -> Self {
         counter.fetch_add(1, Ordering::AcqRel);
         Self { counter }
     }

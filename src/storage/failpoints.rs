@@ -17,7 +17,7 @@ pub(crate) enum PersistenceBoundary {
     SstablePublication,
     ManifestInstallation,
     Checkpoint,
-    Compaction,
+    CompactionOutputPublication,
 }
 
 impl PersistenceBoundary {
@@ -28,7 +28,7 @@ impl PersistenceBoundary {
             Self::SstablePublication => "SSTable publication",
             Self::ManifestInstallation => "manifest installation",
             Self::Checkpoint => "checkpoint",
-            Self::Compaction => "compaction",
+            Self::CompactionOutputPublication => "compaction output publication",
         }
     }
 }
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn compaction_boundary_keeps_installed_inputs_authoritative() {
+    async fn compaction_output_publication_failure_keeps_installed_inputs_authoritative() {
         let temp = TempDir::new().unwrap();
         let engine = Engine::open(test_config(temp.path())).await.unwrap();
 
@@ -423,10 +423,31 @@ mod tests {
         }
         assert_eq!(engine.stats().l0_sstable_count, 4);
 
-        let failure = arm(temp.path(), PersistenceBoundary::Compaction);
-        assert_injected(engine.compact().await, PersistenceBoundary::Compaction);
+        let failure = arm(
+            temp.path(),
+            PersistenceBoundary::CompactionOutputPublication,
+        );
+        assert_injected(
+            engine.compact().await,
+            PersistenceBoundary::CompactionOutputPublication,
+        );
         failure.assert_hit();
         assert_eq!(engine.stats().l0_sstable_count, 4);
+        assert_eq!(engine.stats().sstable_count, 4);
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("sstables"))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "sst")
+                })
+                .count(),
+            0,
+            "an output rejected before directory durability must be removed"
+        );
         drop(engine);
 
         let reopened = Engine::open(test_config(temp.path())).await.unwrap();
