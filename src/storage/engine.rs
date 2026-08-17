@@ -203,6 +203,7 @@ pub struct Engine {
     sstable_flush_bytes_written: Arc<AtomicU64>,
     compaction_bytes_read: Arc<AtomicU64>,
     compaction_bytes_written: Arc<AtomicU64>,
+    compactions_in_progress: Arc<AtomicU64>,
     write_stall_count: Arc<AtomicU64>,
     write_stall_micros: Arc<AtomicU64>,
 }
@@ -328,6 +329,7 @@ impl Engine {
             sstable_flush_bytes_written: Arc::new(AtomicU64::new(0)),
             compaction_bytes_read: Arc::new(AtomicU64::new(0)),
             compaction_bytes_written: Arc::new(AtomicU64::new(0)),
+            compactions_in_progress: Arc::new(AtomicU64::new(0)),
             write_stall_count: Arc::new(AtomicU64::new(0)),
             write_stall_micros: Arc::new(AtomicU64::new(0)),
         };
@@ -620,6 +622,7 @@ impl Engine {
 
     /// Trigger compaction
     pub async fn compact(&self) -> Result<CompactionResult> {
+        let _in_progress = InProgressGuard::new(Arc::clone(&self.compactions_in_progress));
         let sstables = self.sstables.read().await;
 
         // Convert SSTableInfo to SSTableManifestEntry for compactor
@@ -688,6 +691,7 @@ impl Engine {
             sstable_flush_bytes_written: self.sstable_flush_bytes_written.load(Ordering::Relaxed),
             compaction_bytes_read: self.compaction_bytes_read.load(Ordering::Relaxed),
             compaction_bytes_written: self.compaction_bytes_written.load(Ordering::Relaxed),
+            compactions_in_progress: self.compactions_in_progress.load(Ordering::Acquire),
             immutable_memtables: memtable_stats.immutable.len() as u64,
             l0_sstable_count: self.l0_sstable_count.load(Ordering::Relaxed),
             write_stall_count: self.write_stall_count.load(Ordering::Relaxed),
@@ -1076,6 +1080,7 @@ impl Engine {
             sstable_flush_bytes_written: self.sstable_flush_bytes_written.clone(),
             compaction_bytes_read: self.compaction_bytes_read.clone(),
             compaction_bytes_written: self.compaction_bytes_written.clone(),
+            compactions_in_progress: self.compactions_in_progress.clone(),
         }
     }
 }
@@ -1097,6 +1102,7 @@ struct BackgroundEngine {
     sstable_flush_bytes_written: Arc<AtomicU64>,
     compaction_bytes_read: Arc<AtomicU64>,
     compaction_bytes_written: Arc<AtomicU64>,
+    compactions_in_progress: Arc<AtomicU64>,
 }
 
 impl BackgroundEngine {
@@ -1108,6 +1114,7 @@ impl BackgroundEngine {
     }
 
     async fn compact(&self) -> Result<CompactionResult> {
+        let _in_progress = InProgressGuard::new(Arc::clone(&self.compactions_in_progress));
         let sstables = self.sstables.read().await;
         let manifest_entries: Vec<SSTableManifestEntry> = sstables
             .iter()
@@ -1297,6 +1304,23 @@ impl BackgroundEngine {
     }
 }
 
+struct InProgressGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl InProgressGuard {
+    fn new(counter: Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter }
+    }
+}
+
+impl Drop for InProgressGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn wal_data_entry_size(key: &[u8], value: &[u8]) -> u64 {
     const WAL_ENTRY_HEADER_SIZE: usize = 32;
     (WAL_ENTRY_HEADER_SIZE + 4 + key.len() + value.len()) as u64
@@ -1311,6 +1335,16 @@ fn wal_delete_entry_size(key: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn in_progress_guard_tracks_scope_and_drop() {
+        let counter = Arc::new(AtomicU64::new(0));
+        {
+            let _guard = InProgressGuard::new(Arc::clone(&counter));
+            assert_eq!(counter.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
 
     #[tokio::test]
     async fn test_basic_operations() {

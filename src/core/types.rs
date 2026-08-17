@@ -134,6 +134,8 @@ pub struct StorageStats {
     pub compaction_bytes_read: u64,
     /// Total bytes written by compaction jobs
     pub compaction_bytes_written: u64,
+    /// Compaction selections or jobs currently in progress
+    pub compactions_in_progress: u64,
     /// Immutable memtables waiting to be flushed
     pub immutable_memtables: u64,
     /// Number of level-0 SSTables

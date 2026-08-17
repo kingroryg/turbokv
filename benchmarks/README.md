@@ -3,7 +3,9 @@
 The `benchmarks` Cargo target compares TurboKV durable mode with fjall using a
 fresh database, identical deterministic keys and values, WAL-backed buffered
 individual writes, disabled compression, equal 64 MiB memtables, one flush
-worker, and an explicit final flush and manual compaction call.
+worker, and an explicit final flush followed by compaction to a maintenance
+fixed point. Release runs refuse dirty Git worktrees so the recorded commit
+identifies the measured source.
 It reports write acknowledgement throughput separately from fully settled
 throughput. Latency p50, p95, p99, and maximum values measure individual write
 acknowledgements.
@@ -24,8 +26,9 @@ cargo bench --bench benchmarks -- --profile release --confirm-release
 Each invocation writes a human-readable `.txt` report and a machine-readable
 JSON report under `target/benchmark-results` (override with `--output DIR`).
 Both include the workload configuration, fixed seed, protocol settings,
-environment, locked dependency versions, and Git commit/dirty state. Generated
-results are evidence artifacts and are intentionally not committed.
+environment, the complete locked dependency set and lockfile checksum, and Git
+commit/dirty state. Generated results are evidence artifacts and are
+intentionally not committed.
 
 Release comparisons should run on an otherwise idle named reference machine,
 from a clean checkout, with stable power and thermal settings. Keep the JSON

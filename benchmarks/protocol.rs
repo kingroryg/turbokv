@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const SEED: u64 = 0x5455_5242_4f4b_5604;
@@ -101,22 +102,42 @@ pub fn percentile(sorted_micros: &[u64], percentile: u32) -> u64 {
 }
 
 pub fn package_version(lockfile: &str, package: &str) -> Option<String> {
-    let mut in_package = false;
-    let mut found_name = false;
-    for line in lockfile.lines() {
-        if line == "[[package]]" {
-            in_package = true;
-            found_name = false;
-        } else if in_package && line == format!("name = \"{package}\"") {
-            found_name = true;
-        } else if found_name {
-            if let Some(version) = line
-                .strip_prefix("version = \"")
-                .and_then(|v| v.strip_suffix('"'))
-            {
-                return Some(version.to_string());
+    locked_package_versions(lockfile)
+        .remove(package)
+        .and_then(|versions| versions.into_iter().next())
+}
+
+pub fn locked_package_versions(lockfile: &str) -> BTreeMap<String, Vec<String>> {
+    let mut packages = BTreeMap::<String, Vec<String>>::new();
+    for block in lockfile.split("[[package]]").skip(1) {
+        let name = lock_field(block, "name");
+        let version = lock_field(block, "version");
+        if let (Some(name), Some(version)) = (name, version) {
+            let versions = packages.entry(name).or_default();
+            if !versions.contains(&version) {
+                versions.push(version);
+                versions.sort();
             }
         }
     }
-    None
+    packages
+}
+
+fn lock_field(block: &str, field: &str) -> Option<String> {
+    let prefix = format!("{field} = \"");
+    block.lines().find_map(|line| {
+        line.strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix('"'))
+            .map(str::to_string)
+    })
+}
+
+pub fn ensure_release_reproducible(profile: Profile, git_dirty: bool) -> Result<(), String> {
+    if profile == Profile::Release && git_dirty {
+        return Err(
+            "release benchmarks require a clean Git worktree so the recorded commit identifies the measured source"
+                .to_string(),
+        );
+    }
+    Ok(())
 }

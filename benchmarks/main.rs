@@ -3,7 +3,10 @@ mod protocol;
 use fjall::{
     CompressionType as FjallCompression, Config as FjallConfig, PartitionCreateOptions, PersistMode,
 };
-use protocol::{package_version, percentile, Cli, Profile, WorkloadConfig};
+use protocol::{
+    ensure_release_reproducible, locked_package_versions, package_version, percentile, Cli,
+    Profile, WorkloadConfig,
+};
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use serde::Serialize;
@@ -15,10 +18,11 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
-use turbokv::{Compression, Db, DbOptions};
+use turbokv::{Compression, Db, DbOptions, DbStats};
 
 type DynError = Box<dyn std::error::Error>;
 const MEMTABLE_BYTES: u32 = 64 * 1024 * 1024;
+const SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Serialize)]
 struct Report {
@@ -29,6 +33,8 @@ struct Report {
     protocol: Protocol,
     environment: Environment,
     dependencies: BTreeMap<String, String>,
+    locked_dependencies: BTreeMap<String, Vec<String>>,
+    cargo_lock_crc32: String,
     results: Vec<Measurement>,
 }
 
@@ -58,7 +64,7 @@ struct Environment {
 
 #[derive(Debug, Serialize)]
 struct Measurement {
-    engine: &'static str,
+    engine: EngineName,
     repetition: u32,
     operations: u64,
     acknowledgement_seconds: f64,
@@ -76,6 +82,22 @@ struct Measurement {
     write_amplification: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EngineName {
+    TurboKv,
+    Fjall,
+}
+
+impl EngineName {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TurboKv => "turbokv",
+            Self::Fjall => "fjall",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct Latencies {
     samples: usize,
@@ -83,6 +105,16 @@ struct Latencies {
     p95: u64,
     p99: u64,
     maximum: u64,
+}
+
+#[derive(Default)]
+struct StorageMetrics {
+    disk_bytes: u64,
+    wal_bytes_written: Option<u64>,
+    flush_bytes_written: Option<u64>,
+    compaction_bytes_read: Option<u64>,
+    compaction_bytes_written: Option<u64>,
+    physical_write_bytes: Option<u64>,
 }
 
 #[tokio::main]
@@ -117,6 +149,8 @@ async fn main() -> Result<(), DynError> {
 
 async fn run(profile: Profile, config: WorkloadConfig) -> Result<Report, DynError> {
     let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let environment = environment()?;
+    ensure_release_reproducible(profile, environment.git_dirty)?;
     let keys = deterministic_keys(&config);
     let value = deterministic_value(config.value_bytes, config.seed);
     let mut results = Vec::with_capacity(config.repetitions as usize * 2);
@@ -134,7 +168,7 @@ async fn run(profile: Profile, config: WorkloadConfig) -> Result<Report, DynErro
             key_order: "SplitMix64 permutation rendered as fixed-width hexadecimal bytes",
             acknowledgement_boundary: "all individual insert calls have returned successfully",
             settled_boundary:
-                "acknowledgement followed by a synchronous forced flush and manual compaction call",
+                "acknowledgement followed by a synchronous forced flush and compaction to a stable maintenance fixed point",
             durability:
                 "WAL enabled with buffered acknowledgements; final settlement synchronizes pending data",
             compression: "disabled for both engines",
@@ -143,8 +177,10 @@ async fn run(profile: Profile, config: WorkloadConfig) -> Result<Report, DynErro
             memtable_bytes: MEMTABLE_BYTES,
             flush_workers: 1,
         },
-        environment: environment()?,
+        environment,
         dependencies: dependencies(),
+        locked_dependencies: locked_dependencies(),
+        cargo_lock_crc32: format!("{:08x}", crc32fast::hash(include_bytes!("../Cargo.lock"))),
         results,
     })
 }
@@ -168,28 +204,86 @@ async fn run_turbokv(
     }
     let acknowledgement = acknowledgement_start.elapsed();
     let settlement_start = Instant::now();
-    db.flush().await?;
-    db.compact().await?;
+    let stats = settle_turbokv(&db, config.operations).await?;
     let settlement = settlement_start.elapsed();
-    let stats = db.stats();
     let disk_bytes = directory_size(temp.path())?;
     let write_bytes = stats.wal_bytes_written
         + stats.sstable_flush_bytes_written
         + stats.compaction_bytes_written;
     Ok(measurement(
-        "turbokv",
+        EngineName::TurboKv,
         repetition,
         config,
         acknowledgement,
         settlement,
         samples,
-        disk_bytes,
-        Some(stats.wal_bytes_written),
-        Some(stats.sstable_flush_bytes_written),
-        Some(stats.compaction_bytes_read),
-        Some(stats.compaction_bytes_written),
-        Some(write_bytes),
+        StorageMetrics {
+            disk_bytes,
+            wal_bytes_written: Some(stats.wal_bytes_written),
+            flush_bytes_written: Some(stats.sstable_flush_bytes_written),
+            compaction_bytes_read: Some(stats.compaction_bytes_read),
+            compaction_bytes_written: Some(stats.compaction_bytes_written),
+            physical_write_bytes: Some(write_bytes),
+        },
     ))
+}
+
+async fn settle_turbokv(db: &Db, expected_keys: u64) -> Result<DbStats, DynError> {
+    let deadline = Instant::now() + SETTLEMENT_TIMEOUT;
+    db.flush().await?;
+
+    loop {
+        let before = wait_for_accounted_keys(db, expected_keys, deadline).await?;
+        db.compact().await?;
+        let after = wait_for_accounted_keys(db, expected_keys, deadline).await?;
+        if maintenance_signature(&before) == maintenance_signature(&after) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let confirmed = wait_for_accounted_keys(db, expected_keys, deadline).await?;
+            if maintenance_signature(&after) == maintenance_signature(&confirmed) {
+                return Ok(confirmed);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "TurboKV did not reach a maintenance fixed point within 300 seconds".into(),
+            );
+        }
+    }
+}
+
+async fn wait_for_accounted_keys(
+    db: &Db,
+    expected_keys: u64,
+    deadline: Instant,
+) -> Result<DbStats, DynError> {
+    loop {
+        let stats = db.stats();
+        if stats.total_keys == expected_keys
+            && stats.memtable_size == 0
+            && stats.immutable_memtables == 0
+            && stats.compactions_in_progress == 0
+        {
+            return Ok(stats);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "TurboKV settlement timed out with {} of {expected_keys} keys accounted for",
+                stats.total_keys
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+const fn maintenance_signature(stats: &DbStats) -> (u64, u64, u64, u64, u64) {
+    (
+        stats.sstable_count,
+        stats.l0_sstable_count,
+        stats.compaction_bytes_read,
+        stats.compaction_bytes_written,
+        stats.compactions_in_progress,
+    )
 }
 
 fn run_fjall(
@@ -224,39 +318,39 @@ fn run_fjall(
     partition.major_compact()?;
     keyspace.persist(PersistMode::SyncAll)?;
     let settlement = settlement_start.elapsed();
+    let stored_keys = u64::try_from(partition.len()?)?;
+    if stored_keys != config.operations {
+        return Err(format!(
+            "fjall settlement accounted for {stored_keys} of {} keys",
+            config.operations
+        )
+        .into());
+    }
     drop(partition);
     drop(keyspace);
     let disk_bytes = directory_size(temp.path())?;
     Ok(measurement(
-        "fjall",
+        EngineName::Fjall,
         repetition,
         config,
         acknowledgement,
         settlement,
         samples,
-        disk_bytes,
-        None,
-        None,
-        None,
-        None,
-        None,
+        StorageMetrics {
+            disk_bytes,
+            ..StorageMetrics::default()
+        },
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn measurement(
-    engine: &'static str,
+    engine: EngineName,
     repetition: u32,
     config: &WorkloadConfig,
     acknowledgement: Duration,
     settlement: Duration,
     mut samples: Vec<u64>,
-    disk_bytes: u64,
-    wal_bytes_written: Option<u64>,
-    flush_bytes_written: Option<u64>,
-    compaction_bytes_read: Option<u64>,
-    compaction_bytes_written: Option<u64>,
-    physical_write_bytes: Option<u64>,
+    storage: StorageMetrics,
 ) -> Measurement {
     samples.sort_unstable();
     let total = acknowledgement + settlement;
@@ -278,12 +372,14 @@ fn measurement(
             maximum: samples.last().copied().unwrap_or_default(),
         },
         logical_bytes,
-        disk_bytes,
-        wal_bytes_written,
-        flush_bytes_written,
-        compaction_bytes_read,
-        compaction_bytes_written,
-        write_amplification: physical_write_bytes.map(|bytes| bytes as f64 / logical_bytes as f64),
+        disk_bytes: storage.disk_bytes,
+        wal_bytes_written: storage.wal_bytes_written,
+        flush_bytes_written: storage.flush_bytes_written,
+        compaction_bytes_read: storage.compaction_bytes_read,
+        compaction_bytes_written: storage.compaction_bytes_written,
+        write_amplification: storage
+            .physical_write_bytes
+            .map(|bytes| bytes as f64 / logical_bytes as f64),
     }
 }
 
@@ -363,6 +459,10 @@ fn dependencies() -> BTreeMap<String, String> {
         .collect()
 }
 
+fn locked_dependencies() -> BTreeMap<String, Vec<String>> {
+    locked_package_versions(include_str!("../Cargo.lock"))
+}
+
 fn human_report(report: &Report) -> String {
     let mut output = format!(
         "TurboKV benchmark protocol v{} ({:?})\ncommit: {}{}\nenvironment: {} / {} / {} CPUs / {}\nworkload: {} operations, {}-byte keys, {}-byte values, seed {:#x}, {} repetition(s)\nprotocol: {}; {}; compression {}; batch size {}; memtable {} bytes; {} flush worker\n",
@@ -390,7 +490,17 @@ fn human_report(report: &Report) -> String {
     for (name, version) in &report.dependencies {
         write!(output, " {name}={version}").expect("writing to a String cannot fail");
     }
-    output.push_str("\n\n");
+    writeln!(
+        output,
+        "\nCargo.lock crc32: {}\nlocked dependencies:",
+        report.cargo_lock_crc32
+    )
+    .expect("writing to a String cannot fail");
+    for (name, versions) in &report.locked_dependencies {
+        writeln!(output, "  {name}={}", versions.join(","))
+            .expect("writing to a String cannot fail");
+    }
+    output.push('\n');
     output.push_str(
         "engine    run  ack ops/s  settled ops/s  p50 us  p95 us  p99 us  max us  disk bytes\n",
     );
@@ -398,7 +508,7 @@ fn human_report(report: &Report) -> String {
         writeln!(
             output,
             "{:<9} {:>3} {:>10.0} {:>14.0} {:>7} {:>7} {:>7} {:>7} {:>11}",
-            result.engine,
+            result.engine.as_str(),
             result.repetition,
             result.acknowledgement_ops_per_second,
             result.fully_settled_ops_per_second,
