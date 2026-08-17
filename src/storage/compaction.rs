@@ -25,10 +25,11 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock};
 use tracing::{debug, info, warn};
 
 use crate::core::error::{Error, Result};
-use crate::core::CompactionResult as PublicCompactionResult;
+use crate::core::{CompactionResult as PublicCompactionResult, MaintenanceOrigin};
 
 use super::directory_lock::DirectoryLock;
 use super::engine::{Result as EngineResult, SstableStatistics, StorageError};
+use super::maintenance::{MaintenanceHealth, MaintenanceOperation};
 use super::manifest::{sync_directory, Manifest, SSTableManifestEntry};
 use super::memtable::MemTableManager;
 use super::sstable::{
@@ -807,7 +808,10 @@ pub(super) struct CompactionCoordinator {
     tombstone_sequence_cache: Arc<Mutex<TombstoneSequenceCache>>,
     sstable_stats: Arc<SstableStatistics>,
     compactions_in_progress: Arc<AtomicU64>,
+    maintenance_health: Arc<MaintenanceHealth>,
     deferred_cleanup: Arc<Mutex<Vec<PathBuf>>>,
+    publication_reconciliation: Arc<Mutex<Vec<PathBuf>>>,
+    recovery_cleanup_incomplete: bool,
     #[cfg(test)]
     before_manifest_gate: Mutex<Option<Arc<CompactionTestGate>>>,
     #[cfg(test)]
@@ -903,7 +907,9 @@ impl CompactionCoordinator {
         tombstone_reclamation_sources: TombstoneReclamationSources,
         sstable_stats: Arc<SstableStatistics>,
         compactions_in_progress: Arc<AtomicU64>,
+        maintenance_health: Arc<MaintenanceHealth>,
         deferred_cleanup: Vec<PathBuf>,
+        recovery_cleanup_incomplete: bool,
     ) -> Self {
         Self {
             ownership: Arc::new(AsyncMutex::new(())),
@@ -917,7 +923,10 @@ impl CompactionCoordinator {
             tombstone_sequence_cache: Arc::new(Mutex::new(TombstoneSequenceCache::default())),
             sstable_stats,
             compactions_in_progress,
+            maintenance_health,
             deferred_cleanup: Arc::new(Mutex::new(deferred_cleanup)),
+            publication_reconciliation: Arc::new(Mutex::new(Vec::new())),
+            recovery_cleanup_incomplete,
             #[cfg(test)]
             before_manifest_gate: Mutex::new(None),
             #[cfg(test)]
@@ -988,6 +997,40 @@ impl CompactionCoordinator {
     }
 
     async fn run_owned(
+        self: Arc<Self>,
+        claim: OwnedMutexGuard<()>,
+        directory_lock: Arc<DirectoryLock>,
+        kind: CompactionRequestKind,
+        started: Instant,
+    ) -> EngineResult<PublicCompactionResult> {
+        let origin = match kind {
+            CompactionRequestKind::ManualDrain => MaintenanceOrigin::Foreground,
+            CompactionRequestKind::BackgroundJob => MaintenanceOrigin::Background,
+        };
+        let mut attempt = self
+            .maintenance_health
+            .attempt(MaintenanceOperation::Compaction, origin);
+        let coordinator = Arc::clone(&self);
+        let result = coordinator
+            .run_owned_inner(claim, directory_lock, kind, started)
+            .await;
+        let retry_work_resolved = result
+            .as_ref()
+            .is_ok_and(|compaction| !compaction.work_remaining);
+        if result.is_ok() {
+            if let Some(error) = self.unresolved_maintenance_failure() {
+                let cleanup_result: EngineResult<()> = Err(error);
+                attempt.finish(&cleanup_result, false);
+            } else {
+                attempt.finish(&result, retry_work_resolved);
+            }
+        } else {
+            attempt.finish(&result, false);
+        }
+        result
+    }
+
+    async fn run_owned_inner(
         self: Arc<Self>,
         _claim: OwnedMutexGuard<()>,
         _directory_lock: Arc<DirectoryLock>,
@@ -1185,7 +1228,7 @@ impl CompactionCoordinator {
         };
         let coordinator = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            coordinator.retry_deferred_cleanup();
+            coordinator.retry_registered_maintenance()?;
             job.map(|job| coordinator.execute_claimed_blocking(job))
                 .transpose()
         })
@@ -1336,7 +1379,7 @@ impl CompactionCoordinator {
                 // name durable; either the old or new manifest is then safe
                 // after a crash, while this process continues with the loaded
                 // candidate coherently.
-                if let Err(sync_error) = sync_directory(&self.data_dir) {
+                if let Err(sync_error) = self.sync_compaction_manifest_directory() {
                     inputs_are_safe_to_unlink = false;
                     publication_error = Some(StorageError::Manifest(format!(
                         "manifest installed but directory sync remained uncertain after {save_error}: {sync_error}"
@@ -1401,13 +1444,56 @@ impl CompactionCoordinator {
                 .map_err(|error| {
                     StorageError::Other(format!("compaction cleanup task failed: {error}"))
                 })?;
+        } else {
+            self.publication_reconciliation.lock().extend(input_paths);
         }
         publication_error.map_or(Ok(result), Err)
     }
 
-    fn retry_deferred_cleanup(&self) {
+    fn retry_registered_maintenance(&self) -> EngineResult<()> {
+        if !self.publication_reconciliation.lock().is_empty() {
+            self.sync_compaction_manifest_directory().map_err(|error| {
+                StorageError::Compaction(format!(
+                    "failed to reconcile installed compaction manifest durability: {error}"
+                ))
+            })?;
+            let paths = std::mem::take(&mut *self.publication_reconciliation.lock());
+            self.cleanup_or_defer(paths);
+        }
         let pending = std::mem::take(&mut *self.deferred_cleanup.lock());
         self.cleanup_or_defer(pending);
+        if let Some(error) = self.deferred_file_cleanup_failure() {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn unresolved_maintenance_failure(&self) -> Option<StorageError> {
+        if self.recovery_cleanup_incomplete {
+            return Some(StorageError::Compaction(
+                "startup SSTable cleanup scan remains registered for retry on reopen".to_string(),
+            ));
+        }
+        let reconciliation = self.publication_reconciliation.lock();
+        if let Some(first) = reconciliation.first() {
+            return Some(StorageError::Compaction(format!(
+                "{} obsolete SSTable cleanup file(s) await installed-manifest durability; first path: {}",
+                reconciliation.len(),
+                first.display()
+            )));
+        }
+        drop(reconciliation);
+        self.deferred_file_cleanup_failure()
+    }
+
+    fn deferred_file_cleanup_failure(&self) -> Option<StorageError> {
+        let pending = self.deferred_cleanup.lock();
+        let first = pending.first()?;
+        Some(StorageError::Compaction(format!(
+            "{} obsolete SSTable cleanup file(s) remain registered for retry; first path: {}",
+            pending.len(),
+            first.display()
+        )))
     }
 
     fn cleanup_or_defer(&self, paths: Vec<PathBuf>) {
@@ -1428,18 +1514,68 @@ impl CompactionCoordinator {
         self.deferred_cleanup.lock().extend(deferred);
     }
 
+    fn sync_compaction_manifest_directory(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        super::failpoints::check(
+            &self.data_dir,
+            super::failpoints::PersistenceBoundary::CompactionManifestDirectoryResync,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        sync_directory(&self.data_dir)
+    }
+
     #[cfg(test)]
     pub(super) async fn execute_job_for_test(
         self: &Arc<Self>,
         job: CompactionSelection,
     ) -> EngineResult<()> {
+        self.execute_job_with_origin_for_test(job, MaintenanceOrigin::Foreground)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn execute_background_job_for_test(
+        self: &Arc<Self>,
+        job: CompactionSelection,
+    ) -> EngineResult<()> {
+        self.execute_job_with_origin_for_test(job, MaintenanceOrigin::Background)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn execute_job_with_origin_for_test(
+        self: &Arc<Self>,
+        job: CompactionSelection,
+        origin: MaintenanceOrigin,
+    ) -> EngineResult<()> {
+        let mut attempt = self
+            .maintenance_health
+            .attempt(MaintenanceOperation::Compaction, origin);
         let _claim = self.ownership.lock().await;
         let _in_progress = InProgressGuard::new(Arc::clone(&self.compactions_in_progress));
-        let prepared = self
-            .prepare_claimed(Some(job))
-            .await?
-            .expect("an explicit compaction job always prepares a publication");
-        self.publish_prepared(prepared).await.map(|_| ())
+        let result = async {
+            let prepared = self
+                .prepare_claimed(Some(job))
+                .await?
+                .expect("an explicit compaction job always prepares a publication");
+            self.publish_prepared(prepared).await?;
+            let snapshot = self.live_manifest_entries().await;
+            Ok(!self.has_global_selectable_work(&snapshot).await?)
+        }
+        .await;
+        let retry_work_resolved = result.as_ref().copied().unwrap_or(false);
+        let public_result = result.map(|_| ());
+        if public_result.is_ok() {
+            if let Some(error) = self.unresolved_maintenance_failure() {
+                let cleanup_result: EngineResult<()> = Err(error);
+                attempt.finish(&cleanup_result, false);
+            } else {
+                attempt.finish(&public_result, retry_work_resolved);
+            }
+        } else {
+            attempt.finish(&public_result, false);
+        }
+        public_result
     }
 
     #[cfg(test)]

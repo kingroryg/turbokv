@@ -220,6 +220,14 @@ impl Manifest {
         }
 
         atomic_replace(&temp_path, &manifest_path)?;
+        #[cfg(test)]
+        super::failpoints::check(
+            data_dir,
+            super::failpoints::PersistenceBoundary::ManifestDirectorySync,
+        )
+        .map_err(|error| crate::core::Error::Internal {
+            message: error.to_string(),
+        })?;
         sync_directory(data_dir)?;
 
         info!(

@@ -200,6 +200,8 @@ the corresponding clean-tree JSON evidence artifact.
 | `write_batch(batch)` | Batch write operations |
 | `flush()` | Flush memtable to disk |
 | `compact()` | Drain the captured manual-compaction scope and report actual files, bytes, duration, reclaimed space, and remaining work |
+| `status()` | Get bounded maintenance health plus current write-backpressure causes and counters |
+| `close_with_status()` | Close cleanly with a structured unresolved-maintenance error for production monitoring |
 | `logical_stats()` | Scan a coherent snapshot for exact unique live-key and logical-byte counts |
 | `physical_stats()` | Get cheap physical gauges and counters since open without scanning logical data |
 | `stats()` | Legacy mixed physical statistics (deprecated) |

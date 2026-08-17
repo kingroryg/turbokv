@@ -43,9 +43,11 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use crate::core::{
-    CompactionResult, DbConfig, Error as CoreError, LogicalStats, PhysicalCacheStats,
-    PhysicalMemTableStats, PhysicalSSTableStats, PhysicalStats, PhysicalVersionStats, StorageStats,
-    WalStats, WriteAmplificationStats, WriteBatch, WriteStallStats,
+    CompactionResult, DatabaseStatus, DbConfig, Error as CoreError, LogicalStats,
+    MaintenanceOrigin, MaintenanceStatus, PhysicalCacheStats, PhysicalMemTableStats,
+    PhysicalSSTableStats, PhysicalStats, PhysicalVersionStats, StorageStats, WalStats,
+    WriteAmplificationStats, WriteBackpressureCauseStatus, WriteBackpressureStatus, WriteBatch,
+    WriteStallStats,
 };
 
 #[cfg(test)]
@@ -60,6 +62,7 @@ use super::{
     },
     fd::{FdConfig, FdMonitor, SSTablePool},
     iter::{RangeIter, ScanBounds, ScanSstable},
+    maintenance::{MaintenanceHealth, MaintenanceOperation},
     manifest::{atomic_replace, sync_directory, Manifest, SSTableManifestEntry, MANIFEST_VERSION},
     memtable::{MemTableConfig, MemTableManager},
     sstable::{SSTableConfig, SSTableInfo, SSTableReader, SSTableWriter},
@@ -107,6 +110,21 @@ pub enum StorageError {
 
     #[error("Storage error: {0}")]
     Other(String),
+}
+
+/// Structured graceful-shutdown failure.
+///
+/// Use [`Engine::shutdown_with_status`] when unresolved maintenance must be
+/// inspected programmatically. The legacy [`Engine::shutdown`] method maps the
+/// maintenance variant to [`StorageError::Other`] for source compatibility.
+#[derive(Debug, thiserror::Error)]
+pub enum MaintenanceShutdownError {
+    /// A storage operation failed outside the retained maintenance report.
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    /// Graceful shutdown could not settle all registered maintenance work.
+    #[error("shutdown left unresolved maintenance failures: {0}")]
+    UnresolvedMaintenance(Box<MaintenanceStatus>),
 }
 
 /// Configuration for the storage engine
@@ -235,7 +253,7 @@ pub struct Engine {
     /// empty again.
     unapplied_wal_sequences: Arc<Mutex<BTreeSet<u64>>>,
     shutdown: tokio::sync::watch::Sender<bool>,
-    background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    background_tasks: Mutex<Vec<BackgroundTask>>,
     shutdown_lock: AsyncMutex<()>,
     next_sstable_id: Arc<std::sync::atomic::AtomicU64>,
     sstable_pool: Arc<SSTablePool>,
@@ -245,8 +263,102 @@ pub struct Engine {
     sstable_stats: Arc<SstableStatistics>,
     logical_bytes_ingested: Arc<AtomicU64>,
     compactions_in_progress: Arc<AtomicU64>,
-    write_stall_count: Arc<AtomicU64>,
-    write_stall_micros: Arc<AtomicU64>,
+    maintenance_health: Arc<MaintenanceHealth>,
+    flush_post_work: Arc<FlushPostWork>,
+    write_stalls: WriteStallStatistics,
+}
+
+struct BackgroundTask {
+    operation: MaintenanceOperation,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// One lock makes the total/cause tuple coherent. It is acquired only after
+/// the pressure predicate has already selected an intentionally stalled write;
+/// ordinary unstalled writes never touch it.
+struct WriteStallStatistics {
+    counters: Mutex<WriteStallCounters>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct WriteStallCounters {
+    count: u64,
+    micros: u64,
+    immutable_memtable_count: u64,
+    immutable_memtable_micros: u64,
+    level_zero_file_count: u64,
+    level_zero_file_micros: u64,
+}
+
+impl Default for WriteStallStatistics {
+    fn default() -> Self {
+        Self {
+            counters: Mutex::new(WriteStallCounters::default()),
+        }
+    }
+}
+
+impl WriteStallStatistics {
+    fn record(&self, micros: u64, immutable_pressure: bool, level_zero_pressure: bool) {
+        let mut counters = self.counters.lock();
+        counters.count = counters.count.saturating_add(1);
+        counters.micros = counters.micros.saturating_add(micros);
+        if immutable_pressure {
+            counters.immutable_memtable_count = counters.immutable_memtable_count.saturating_add(1);
+            counters.immutable_memtable_micros =
+                counters.immutable_memtable_micros.saturating_add(micros);
+        }
+        if level_zero_pressure {
+            counters.level_zero_file_count = counters.level_zero_file_count.saturating_add(1);
+            counters.level_zero_file_micros =
+                counters.level_zero_file_micros.saturating_add(micros);
+        }
+    }
+
+    fn snapshot(&self) -> WriteStallCounters {
+        *self.counters.lock()
+    }
+}
+
+#[derive(Default)]
+struct FlushPostWork {
+    pending: Mutex<PendingFlushPostWork>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PendingFlushPostWork {
+    wal_sync: bool,
+    wal_reclamation_checkpoint: Option<u64>,
+}
+
+impl FlushPostWork {
+    fn register_wal_sync(&self) {
+        self.pending.lock().wal_sync = true;
+    }
+
+    fn complete_wal_sync(&self) {
+        self.pending.lock().wal_sync = false;
+    }
+
+    fn register_wal_reclamation(&self, checkpoint: u64) {
+        self.pending.lock().wal_reclamation_checkpoint = Some(checkpoint);
+    }
+
+    fn complete_wal_reclamation(&self, checkpoint: u64) {
+        let mut pending = self.pending.lock();
+        if pending.wal_reclamation_checkpoint == Some(checkpoint) {
+            pending.wal_reclamation_checkpoint = None;
+        }
+    }
+
+    fn snapshot(&self) -> PendingFlushPostWork {
+        *self.pending.lock()
+    }
+
+    fn is_empty(&self) -> bool {
+        let pending = self.pending.lock();
+        !pending.wal_sync && pending.wal_reclamation_checkpoint.is_none()
+    }
 }
 
 /// Related SSTable gauges and maintenance counters shared by foreground and
@@ -435,8 +547,13 @@ impl Engine {
             .map(|table| table.path.clone())
             .collect::<HashSet<_>>();
         let cleanup_directory = sstable_dir.clone();
-        let deferred_sstable_cleanup = tokio::task::spawn_blocking(move || {
-            cleanup_unreferenced_sstables(&cleanup_directory, &referenced_sstables)
+        let cleanup_data_directory = config.data_dir.clone();
+        let startup_sstable_cleanup = tokio::task::spawn_blocking(move || {
+            cleanup_unreferenced_sstables(
+                &cleanup_data_directory,
+                &cleanup_directory,
+                &referenced_sstables,
+            )
         })
         .await
         .map_err(|error| StorageError::Other(format!("SSTable cleanup task failed: {error}")))?;
@@ -537,6 +654,15 @@ impl Engine {
         let flush_lock = Arc::new(AsyncMutex::new(()));
         let mutation_barrier = Arc::new(AsyncRwLock::new(()));
         let unapplied_wal_sequences = Arc::new(Mutex::new(BTreeSet::new()));
+        let maintenance_health = Arc::new(MaintenanceHealth::default());
+        if let Some(error) = startup_sstable_cleanup.failure.as_deref() {
+            maintenance_health.record_failure(
+                MaintenanceOperation::Compaction,
+                MaintenanceOrigin::Recovery,
+                &error,
+            );
+        }
+        let flush_post_work = Arc::new(FlushPostWork::default());
         let compaction_coordinator = Arc::new(CompactionCoordinator::new(
             config.compaction_config.clone(),
             config.sstable_config.clone(),
@@ -553,7 +679,9 @@ impl Engine {
             ),
             Arc::clone(&sstable_stats),
             Arc::clone(&compactions_in_progress),
-            deferred_sstable_cleanup,
+            Arc::clone(&maintenance_health),
+            startup_sstable_cleanup.deferred_paths,
+            startup_sstable_cleanup.scan_incomplete,
         ));
 
         let engine = Self {
@@ -578,8 +706,9 @@ impl Engine {
             sstable_stats,
             logical_bytes_ingested: Arc::new(AtomicU64::new(0)),
             compactions_in_progress,
-            write_stall_count: Arc::new(AtomicU64::new(0)),
-            write_stall_micros: Arc::new(AtomicU64::new(0)),
+            maintenance_health,
+            flush_post_work,
+            write_stalls: WriteStallStatistics::default(),
         };
 
         // Start background tasks
@@ -841,7 +970,24 @@ impl Engine {
 
     /// Flush memtable to SSTable
     pub async fn flush(&self) -> Result<()> {
+        self.flush_with_origin(MaintenanceOrigin::Foreground).await
+    }
+
+    async fn flush_with_origin(&self, origin: MaintenanceOrigin) -> Result<()> {
+        let mut attempt = self
+            .maintenance_health
+            .attempt(MaintenanceOperation::Flush, origin);
+        let result = self.flush_inner().await;
+        let retry_work_resolved = result.is_ok()
+            && !self.memtable_manager.has_immutable()
+            && self.flush_post_work.is_empty();
+        attempt.finish(&result, retry_work_resolved);
+        result
+    }
+
+    async fn flush_inner(&self) -> Result<()> {
         let _flush = self.flush_lock.lock().await;
+        retry_flush_post_work(self.flush_resources(), &self.flush_post_work).await?;
         {
             // Wait for every sequence already allocated by a writer to reach a
             // memtable before freezing the generation covered by this flush.
@@ -871,10 +1017,7 @@ impl Engine {
             }
         }
 
-        // Flush WAL
-        if let Some(ref wal) = self.wal {
-            wal.flush().await?;
-        }
+        retryable_wal_sync(self.flush_resources(), &self.flush_post_work).await?;
 
         Ok(())
     }
@@ -962,12 +1105,56 @@ impl Engine {
         Ok(stats)
     }
 
+    /// Get cheap operational health and write-backpressure status.
+    ///
+    /// Failure details are bounded and remain present until a proof-producing
+    /// retry resolves the failed lane. Flush retries prove resolution by
+    /// draining the immutable FIFO and completing registered WAL post-work;
+    /// compaction retries require an exact final selection with no publication
+    /// reconciliation, startup scan failure, or deferred cleanup remaining.
+    /// Counters reset after reopen.
+    pub fn status(&self) -> DatabaseStatus {
+        let immutable_current =
+            u64::try_from(self.memtable_manager.immutable_count()).unwrap_or(u64::MAX);
+        let immutable_threshold =
+            u64::try_from(self.config.max_immutable_memtables_before_stall).unwrap_or(u64::MAX);
+        let level_zero_current = self.sstable_stats.level_zero_file_count();
+        let level_zero_threshold = self.config.max_l0_files_before_stall;
+        let immutable_active = immutable_current >= immutable_threshold;
+        let level_zero_active = level_zero_current >= level_zero_threshold;
+        let stall_counters = self.write_stalls.snapshot();
+
+        DatabaseStatus {
+            maintenance: self.maintenance_health.status(),
+            write_backpressure: WriteBackpressureStatus {
+                active: immutable_active || level_zero_active,
+                stalls_since_open: stall_counters.count,
+                stall_micros_since_open: stall_counters.micros,
+                immutable_memtables: WriteBackpressureCauseStatus {
+                    active: immutable_active,
+                    current: immutable_current,
+                    threshold: immutable_threshold,
+                    count_since_open: stall_counters.immutable_memtable_count,
+                    micros_since_open: stall_counters.immutable_memtable_micros,
+                },
+                level_zero_files: WriteBackpressureCauseStatus {
+                    active: level_zero_active,
+                    current: level_zero_current,
+                    threshold: level_zero_threshold,
+                    count_since_open: stall_counters.level_zero_file_count,
+                    micros_since_open: stall_counters.level_zero_file_micros,
+                },
+            },
+        }
+    }
+
     /// Get cheap physical gauges and process-lifetime cumulative counters.
     ///
     /// This method performs no database scan. Current gauges are sampled for
     /// monitoring and are not one transactional snapshot across components.
     /// Every `_since_open` counter resets when the engine is reopened.
     pub fn physical_stats(&self) -> PhysicalStats {
+        let stall_counters = self.write_stalls.snapshot();
         let memtable_stats = self.memtable_manager.stats();
         let buffered_versions = memtable_stats.buffered_versions;
         let active_versions = memtable_stats.active.entry_count as u64;
@@ -1041,8 +1228,8 @@ impl Engine {
                 sstable_reader_evictions_since_open: reader_cache.evictions,
             },
             stalls: WriteStallStats {
-                count_since_open: self.write_stall_count.load(Ordering::Relaxed),
-                micros_since_open: self.write_stall_micros.load(Ordering::Relaxed),
+                count_since_open: stall_counters.count,
+                micros_since_open: stall_counters.micros,
             },
             amplification: WriteAmplificationStats {
                 logical_bytes_ingested_since_open: self
@@ -1062,8 +1249,29 @@ impl Engine {
     /// This stops background tasks and flushes pending writes. Because this
     /// method borrows the still-usable engine, its exclusive directory lock is
     /// retained until the [`Engine`] is dropped. Shutdown is terminal for the
-    /// compaction coordinator: later compaction requests return no work.
+    /// compaction coordinator: later compaction requests return no work. The
+    /// final flush may resolve retained flush work; any maintenance failure
+    /// still unresolved afterward is returned through the legacy
+    /// [`StorageError::Other`] variant. Use [`Self::shutdown_with_status`] to
+    /// inspect the structured maintenance snapshot.
     pub async fn shutdown(&self) -> Result<()> {
+        self.shutdown_with_status()
+            .await
+            .map_err(|error| match error {
+                MaintenanceShutdownError::Storage(error) => error,
+                MaintenanceShutdownError::UnresolvedMaintenance(status) => StorageError::Other(
+                    format!("shutdown left unresolved maintenance failures: {status}"),
+                ),
+            })
+    }
+
+    /// Shutdown gracefully and return a structured unresolved-health snapshot.
+    ///
+    /// This is the production monitoring contract for callers which must
+    /// distinguish ordinary storage failures from retryable maintenance left
+    /// unresolved after the final flush. Like [`Self::shutdown`], this borrows
+    /// the engine and retains directory ownership until the engine is dropped.
+    pub async fn shutdown_with_status(&self) -> std::result::Result<(), MaintenanceShutdownError> {
         let _shutdown = self.shutdown_lock.lock().await;
         let compaction_pause = self.compaction_coordinator.pause_requests();
         info!("Shutting down storage engine");
@@ -1071,21 +1279,27 @@ impl Engine {
         // Signal background tasks to stop
         let _ = self.shutdown.send(true);
 
-        let handles: Vec<_> = self.background_tasks.lock().drain(..).collect();
-        let mut task_failure = None;
-        for handle in handles {
-            if let Err(error) = handle.await {
-                task_failure.get_or_insert(error);
+        let tasks: Vec<_> = self.background_tasks.lock().drain(..).collect();
+        for task in tasks {
+            if let Err(error) = task.handle.await {
+                if !self.maintenance_health.retry_pending(task.operation) {
+                    self.maintenance_health.record_failure(
+                        task.operation,
+                        MaintenanceOrigin::Background,
+                        &error,
+                    );
+                }
             }
         }
         compaction_pause.wait_until_idle().await;
 
         // Flush pending writes
-        let flush_result = self.flush().await;
+        let flush_result = self.flush_with_origin(MaintenanceOrigin::Shutdown).await;
+        let status = self.maintenance_health.status();
 
-        if let Some(error) = task_failure {
-            return Err(StorageError::Other(format!(
-                "background task failed during shutdown: {error}"
+        if !status.is_healthy() {
+            return Err(MaintenanceShutdownError::UnresolvedMaintenance(Box::new(
+                status,
             )));
         }
         flush_result?;
@@ -1139,13 +1353,17 @@ impl Engine {
     async fn maybe_stall_writes(&self) {
         let immutable_count = self.memtable_manager.immutable_count();
         let l0_count = self.sstable_stats.level_zero_file_count();
-        let should_stall = immutable_count >= self.config.max_immutable_memtables_before_stall
-            || l0_count >= self.config.max_l0_files_before_stall;
+        let immutable_pressure =
+            immutable_count >= self.config.max_immutable_memtables_before_stall;
+        let level_zero_pressure = l0_count >= self.config.max_l0_files_before_stall;
+        let should_stall = immutable_pressure || level_zero_pressure;
 
         if should_stall && self.config.write_stall_micros > 0 {
-            self.write_stall_count.fetch_add(1, Ordering::Relaxed);
-            self.write_stall_micros
-                .fetch_add(self.config.write_stall_micros, Ordering::Relaxed);
+            self.write_stalls.record(
+                self.config.write_stall_micros,
+                immutable_pressure,
+                level_zero_pressure,
+            );
             tokio::time::sleep(Duration::from_micros(self.config.write_stall_micros)).await;
         }
     }
@@ -1267,21 +1485,21 @@ impl Engine {
         &self,
         memtable: &Arc<super::memtable::MemTable>,
     ) -> Result<SSTableInfo> {
-        flush_memtable_to_sstable(
-            FlushResources {
-                config: &self.config,
-                wal: self.wal.as_ref(),
-                memtable_manager: &self.memtable_manager,
-                sstables: &self.sstables,
-                manifest: &self.manifest,
-                mutation_barrier: &self.mutation_barrier,
-                unapplied_wal_sequences: &self.unapplied_wal_sequences,
-                next_sstable_id: &self.next_sstable_id,
-                sstable_stats: &self.sstable_stats,
-            },
-            memtable,
-        )
-        .await
+        flush_memtable_to_sstable(self.flush_resources(), &self.flush_post_work, memtable).await
+    }
+
+    fn flush_resources(&self) -> FlushResources<'_> {
+        FlushResources {
+            config: &self.config,
+            wal: self.wal.as_ref(),
+            memtable_manager: &self.memtable_manager,
+            sstables: &self.sstables,
+            manifest: &self.manifest,
+            mutation_barrier: &self.mutation_barrier,
+            unapplied_wal_sequences: &self.unapplied_wal_sequences,
+            next_sstable_id: &self.next_sstable_id,
+            sstable_stats: &self.sstable_stats,
+        }
     }
 
     /// Start background flush and compaction tasks
@@ -1299,7 +1517,9 @@ impl Engine {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        if flush_engine.memtable_manager.has_immutable() {
+                        if flush_engine.memtable_manager.has_immutable()
+                            || flush_engine.maintenance_health.retry_pending(MaintenanceOperation::Flush)
+                        {
                             if let Err(e) = flush_engine.background_flush().await {
                                 error!("Background flush error: {}", e);
                             }
@@ -1334,9 +1554,16 @@ impl Engine {
             }
         });
 
-        self.background_tasks
-            .lock()
-            .extend([flush_task, compaction_task]);
+        self.background_tasks.lock().extend([
+            BackgroundTask {
+                operation: MaintenanceOperation::Flush,
+                handle: flush_task,
+            },
+            BackgroundTask {
+                operation: MaintenanceOperation::Compaction,
+                handle: compaction_task,
+            },
+        ]);
     }
 
     /// Clone engine state for background tasks
@@ -1354,6 +1581,8 @@ impl Engine {
             compaction_coordinator: self.compaction_coordinator.clone(),
             config: self.config.clone(),
             sstable_stats: self.sstable_stats.clone(),
+            maintenance_health: Arc::clone(&self.maintenance_health),
+            flush_post_work: Arc::clone(&self.flush_post_work),
         }
     }
 }
@@ -1361,8 +1590,8 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
-        for handle in self.background_tasks.get_mut().drain(..) {
-            handle.abort();
+        for task in self.background_tasks.get_mut().drain(..) {
+            task.handle.abort();
         }
     }
 }
@@ -1381,14 +1610,29 @@ struct BackgroundEngine {
     config: StorageConfig,
     wal: Option<Arc<WriteAheadLog>>,
     sstable_stats: Arc<SstableStatistics>,
+    maintenance_health: Arc<MaintenanceHealth>,
+    flush_post_work: Arc<FlushPostWork>,
 }
 
 impl BackgroundEngine {
     async fn background_flush(&self) -> Result<()> {
+        let mut attempt = self
+            .maintenance_health
+            .attempt(MaintenanceOperation::Flush, MaintenanceOrigin::Background);
+        let result = self.background_flush_inner().await;
+        let retry_work_resolved = result.is_ok()
+            && !self.memtable_manager.has_immutable()
+            && self.flush_post_work.is_empty();
+        attempt.finish(&result, retry_work_resolved);
+        result
+    }
+
+    async fn background_flush_inner(&self) -> Result<()> {
         let Some(_directory_lock) = self.directory_lock.upgrade() else {
             return Ok(());
         };
         let _flush = self.flush_lock.lock().await;
+        retry_flush_post_work(self.flush_resources(), &self.flush_post_work).await?;
         while let Some(memtable) = self.memtable_manager.peek_immutable_for_flush() {
             self.flush_memtable_to_sstable(&memtable).await?;
             if !self.memtable_manager.complete_immutable_flush(&memtable) {
@@ -1412,24 +1656,25 @@ impl BackgroundEngine {
         &self,
         memtable: &Arc<super::memtable::MemTable>,
     ) -> Result<SSTableInfo> {
-        flush_memtable_to_sstable(
-            FlushResources {
-                config: &self.config,
-                wal: self.wal.as_ref(),
-                memtable_manager: &self.memtable_manager,
-                sstables: &self.sstables,
-                manifest: &self.manifest,
-                mutation_barrier: &self.mutation_barrier,
-                unapplied_wal_sequences: &self.unapplied_wal_sequences,
-                next_sstable_id: &self.next_sstable_id,
-                sstable_stats: &self.sstable_stats,
-            },
-            memtable,
-        )
-        .await
+        flush_memtable_to_sstable(self.flush_resources(), &self.flush_post_work, memtable).await
+    }
+
+    fn flush_resources(&self) -> FlushResources<'_> {
+        FlushResources {
+            config: &self.config,
+            wal: self.wal.as_ref(),
+            memtable_manager: &self.memtable_manager,
+            sstables: &self.sstables,
+            manifest: &self.manifest,
+            mutation_barrier: &self.mutation_barrier,
+            unapplied_wal_sequences: &self.unapplied_wal_sequences,
+            next_sstable_id: &self.next_sstable_id,
+            sstable_stats: &self.sstable_stats,
+        }
     }
 }
 
+#[derive(Clone, Copy)]
 struct FlushResources<'a> {
     config: &'a StorageConfig,
     wal: Option<&'a Arc<WriteAheadLog>>,
@@ -1444,6 +1689,7 @@ struct FlushResources<'a> {
 
 async fn flush_memtable_to_sstable(
     resources: FlushResources<'_>,
+    post_work: &FlushPostWork,
     memtable: &Arc<super::memtable::MemTable>,
 ) -> Result<SSTableInfo> {
     let id = resources
@@ -1477,7 +1723,7 @@ async fn flush_memtable_to_sstable(
             )));
         }
         install_live_sstable(&resources, &info).await;
-        reclaim_wal_after_checkpoint(&resources).await?;
+        reclaim_wal_after_checkpoint(resources, post_work).await?;
         return Ok(info);
     }
 
@@ -1582,7 +1828,7 @@ async fn flush_memtable_to_sstable(
         super::failpoints::PersistenceBoundary::Checkpoint,
     )?;
 
-    truncate_wal(resources.wal, checkpoint).await;
+    retryable_wal_reclamation(resources, post_work, checkpoint).await?;
     Ok(info)
 }
 
@@ -1724,23 +1970,68 @@ async fn install_live_sstable(resources: &FlushResources<'_>, info: &SSTableInfo
         .install_if_absent(&mut sstables, info);
 }
 
-async fn reclaim_wal_after_checkpoint(resources: &FlushResources<'_>) -> Result<()> {
+async fn reclaim_wal_after_checkpoint(
+    resources: FlushResources<'_>,
+    post_work: &FlushPostWork,
+) -> Result<()> {
     let checkpoint = resources.manifest.lock().await.wal_checkpoint;
     #[cfg(test)]
     super::failpoints::check(
         &resources.config.data_dir,
         super::failpoints::PersistenceBoundary::Checkpoint,
     )?;
-    truncate_wal(resources.wal, checkpoint).await;
+    retryable_wal_reclamation(resources, post_work, checkpoint).await
+}
+
+async fn retry_flush_post_work(
+    resources: FlushResources<'_>,
+    post_work: &FlushPostWork,
+) -> Result<()> {
+    let pending = post_work.snapshot();
+    if let Some(checkpoint) = pending.wal_reclamation_checkpoint {
+        retryable_wal_reclamation(resources, post_work, checkpoint).await?;
+    }
+    if pending.wal_sync {
+        retryable_wal_sync(resources, post_work).await?;
+    }
     Ok(())
 }
 
-async fn truncate_wal(wal: Option<&Arc<WriteAheadLog>>, checkpoint: u64) {
-    if let Some(wal) = wal {
-        if let Err(error) = wal.truncate(checkpoint).await {
-            tracing::warn!("Failed to truncate WAL: {error}");
-        }
-    }
+async fn retryable_wal_sync(
+    resources: FlushResources<'_>,
+    post_work: &FlushPostWork,
+) -> Result<()> {
+    let Some(wal) = resources.wal else {
+        return Ok(());
+    };
+    post_work.register_wal_sync();
+    #[cfg(test)]
+    super::failpoints::check(
+        &resources.config.data_dir,
+        super::failpoints::PersistenceBoundary::WalFlush,
+    )?;
+    wal.flush().await?;
+    post_work.complete_wal_sync();
+    Ok(())
+}
+
+async fn retryable_wal_reclamation(
+    resources: FlushResources<'_>,
+    post_work: &FlushPostWork,
+    checkpoint: u64,
+) -> Result<()> {
+    let Some(wal) = resources.wal else {
+        return Ok(());
+    };
+    post_work.register_wal_reclamation(checkpoint);
+    #[cfg(test)]
+    super::failpoints::check(
+        &resources.config.data_dir,
+        super::failpoints::PersistenceBoundary::WalTruncation,
+    )?;
+    wal.truncate(checkpoint).await?;
+    post_work.complete_wal_reclamation(checkpoint);
+    Ok(())
 }
 
 fn sstable_open_was_not_found(error: &CoreError) -> bool {
@@ -1835,10 +2126,41 @@ fn physical_tombstone_stats_overflow() -> StorageError {
 /// does not reference them. A crash can leave both unpublished compaction
 /// outputs and already-obsolete inputs behind. Failed unlinks are handed to
 /// the coordinator's ordinary deferred-cleanup retry path.
+#[derive(Default)]
+struct StartupSstableCleanup {
+    deferred_paths: Vec<PathBuf>,
+    scan_incomplete: bool,
+    failure: Option<String>,
+}
+
+impl StartupSstableCleanup {
+    fn record_scan_failure(&mut self, message: String) {
+        self.scan_incomplete = true;
+        self.failure.get_or_insert(message);
+    }
+
+    fn defer(&mut self, path: PathBuf, message: String) {
+        self.failure.get_or_insert(message);
+        self.deferred_paths.push(path);
+    }
+}
+
 fn cleanup_unreferenced_sstables(
+    _data_directory: &std::path::Path,
     sstable_directory: &std::path::Path,
     referenced: &HashSet<PathBuf>,
-) -> Vec<PathBuf> {
+) -> StartupSstableCleanup {
+    let mut cleanup = StartupSstableCleanup::default();
+    #[cfg(test)]
+    if let Err(error) = super::failpoints::check(
+        _data_directory,
+        super::failpoints::PersistenceBoundary::SstableCleanupScan,
+    ) {
+        let message = format!("startup cleanup scan failed: {error}");
+        warn!("{message}");
+        cleanup.record_scan_failure(message);
+        return cleanup;
+    }
     // The directory lock canonicalizes the configured data directory, while
     // older manifests can contain equivalent non-canonical paths (for example,
     // macOS's /var and /private/var aliases). Compare filesystem identities in
@@ -1848,11 +2170,13 @@ fn cleanup_unreferenced_sstables(
         let canonical_path = match std::fs::canonicalize(path) {
             Ok(canonical_path) => canonical_path,
             Err(error) => {
-                warn!(
-                    "Skipping crash-leftover cleanup because manifest SSTable identity {:?} could not be resolved: {}",
-                    path, error
+                let message = format!(
+                    "startup cleanup could not resolve manifest SSTable identity {}: {error}",
+                    path.display()
                 );
-                return Vec::new();
+                warn!("{message}");
+                cleanup.record_scan_failure(message);
+                return cleanup;
             }
         };
         referenced_identities.insert(canonical_path);
@@ -1860,73 +2184,116 @@ fn cleanup_unreferenced_sstables(
     let mut directories = vec![sstable_directory.to_path_buf()];
     match std::fs::read_dir(sstable_directory) {
         Ok(entries) => {
-            directories.extend(
-                entries
-                    .filter_map(std::result::Result::ok)
-                    .filter_map(|entry| {
-                        entry
-                            .file_type()
-                            .ok()
-                            .filter(std::fs::FileType::is_dir)
-                            .map(|_| entry.path())
-                    }),
-            );
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        let message = format!(
+                            "startup cleanup could not inspect an entry in {}: {error}",
+                            sstable_directory.display()
+                        );
+                        warn!("{message}");
+                        cleanup.record_scan_failure(message);
+                        continue;
+                    }
+                };
+                match entry.file_type() {
+                    Ok(file_type) if file_type.is_dir() => directories.push(entry.path()),
+                    Ok(_) => {}
+                    Err(error) => {
+                        let message = format!(
+                            "startup cleanup could not inspect file type for {}: {error}",
+                            entry.path().display()
+                        );
+                        warn!("{message}");
+                        cleanup.record_scan_failure(message);
+                    }
+                }
+            }
         }
         Err(error) => {
-            warn!(
-                "Could not scan SSTable directory {} for crash leftovers: {}",
-                sstable_directory.display(),
-                error
+            let message = format!(
+                "startup cleanup could not scan SSTable directory {}: {error}",
+                sstable_directory.display()
             );
-            return Vec::new();
+            warn!("{message}");
+            cleanup.record_scan_failure(message);
+            return cleanup;
         }
     }
 
-    let mut deferred = Vec::new();
     for directory in directories {
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) => {
-                warn!(
-                    "Could not scan SSTable directory {} for crash leftovers: {}",
-                    directory.display(),
-                    error
+                let message = format!(
+                    "startup cleanup could not scan SSTable directory {}: {error}",
+                    directory.display()
                 );
+                warn!("{message}");
+                cleanup.record_scan_failure(message);
                 continue;
             }
         };
-        for path in entries
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "sst"))
-        {
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) => {
+                    let message = format!(
+                        "startup cleanup could not inspect an entry in {}: {error}",
+                        directory.display()
+                    );
+                    warn!("{message}");
+                    cleanup.record_scan_failure(message);
+                    continue;
+                }
+            };
+            if !path.extension().is_some_and(|extension| extension == "sst") {
+                continue;
+            }
             let canonical_path = match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => canonical_path,
                 Err(error) => {
-                    warn!(
-                        "Retaining SSTable with unresolved filesystem identity {:?}: {}",
-                        path, error
+                    let message = format!(
+                        "startup cleanup retained SSTable with unresolved identity {}: {error}",
+                        path.display()
                     );
+                    warn!("{message}");
+                    cleanup.record_scan_failure(message);
                     continue;
                 }
             };
             if referenced_identities.contains(&canonical_path) {
                 continue;
             }
+            #[cfg(test)]
+            if let Err(error) = super::failpoints::check(
+                _data_directory,
+                super::failpoints::PersistenceBoundary::SstableCleanup,
+            ) {
+                let message = format!(
+                    "startup cleanup deferred unreferenced SSTable {}: {error}",
+                    path.display()
+                );
+                warn!("{message}");
+                cleanup.defer(path, message);
+                continue;
+            }
             match remove_sstable_if_present(&path) {
                 Ok(true) => debug!("Deleted unreferenced SSTable after reopen: {:?}", path),
                 Ok(false) => {}
                 Err(error) => {
-                    warn!(
-                        "Deferring unreferenced SSTable cleanup for {:?}: {}",
-                        path, error
+                    let message = format!(
+                        "startup cleanup deferred unreferenced SSTable {}: {error}",
+                        path.display()
                     );
-                    deferred.push(path);
+                    warn!("{message}");
+                    cleanup.defer(path, message);
                 }
             }
         }
     }
-    deferred
+    cleanup
 }
 
 #[cfg(test)]
@@ -2215,6 +2582,7 @@ mod tests {
         let config = StorageConfig {
             data_dir: temp_dir.path().to_path_buf(),
             wal_enabled: false,
+            max_immutable_memtables_before_stall: usize::MAX,
             max_l0_files_before_stall: 0,
             write_stall_micros: 1,
             ..Default::default()
@@ -2226,6 +2594,17 @@ mod tests {
         let stats = engine.physical_stats();
         assert_eq!(stats.stalls.count_since_open, 1);
         assert_eq!(stats.stalls.micros_since_open, 1);
+        let backpressure = engine.status().write_backpressure;
+        assert!(backpressure.active);
+        assert_eq!(backpressure.stalls_since_open, 1);
+        assert_eq!(backpressure.stall_micros_since_open, 1);
+        assert!(!backpressure.immutable_memtables.active);
+        assert_eq!(backpressure.immutable_memtables.count_since_open, 0);
+        assert!(backpressure.level_zero_files.active);
+        assert_eq!(backpressure.level_zero_files.current, 0);
+        assert_eq!(backpressure.level_zero_files.threshold, 0);
+        assert_eq!(backpressure.level_zero_files.count_since_open, 1);
+        assert_eq!(backpressure.level_zero_files.micros_since_open, 1);
 
         engine.shutdown().await.unwrap();
         drop(engine);
@@ -2233,6 +2612,85 @@ mod tests {
         let reopened = Engine::open(config).await.unwrap();
         assert_eq!(reopened.physical_stats().stalls, WriteStallStats::default());
         reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_stall_status_attributes_immutable_memtable_pressure() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            data_dir: temp_dir.path().to_path_buf(),
+            wal_enabled: false,
+            max_immutable_memtables_before_stall: 1,
+            max_l0_files_before_stall: u64::MAX,
+            write_stall_micros: 1,
+            ..Default::default()
+        };
+        let engine = Engine::open(config).await.unwrap();
+        engine.insert(b"frozen", b"value").await.unwrap();
+        engine.flush_write_buffers().unwrap();
+        engine.memtable_manager.force_rotate().unwrap();
+
+        engine.insert(b"stalled", b"value").await.unwrap();
+
+        let backpressure = engine.status().write_backpressure;
+        assert!(backpressure.immutable_memtables.active);
+        assert_eq!(backpressure.immutable_memtables.current, 1);
+        assert_eq!(backpressure.immutable_memtables.threshold, 1);
+        assert_eq!(backpressure.immutable_memtables.count_since_open, 1);
+        assert_eq!(backpressure.immutable_memtables.micros_since_open, 1);
+        assert!(!backpressure.level_zero_files.active);
+        assert_eq!(backpressure.level_zero_files.count_since_open, 0);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_stall_status_samples_total_and_cause_counters_coherently() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            data_dir: temp_dir.path().to_path_buf(),
+            wal_enabled: false,
+            max_immutable_memtables_before_stall: 0,
+            max_l0_files_before_stall: 0,
+            write_stall_micros: 1,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(config).await.unwrap());
+        let writer_engine = Arc::clone(&engine);
+        let writer = tokio::spawn(async move {
+            for index in 0..200_u64 {
+                writer_engine
+                    .insert(&index.to_be_bytes(), b"value")
+                    .await
+                    .unwrap();
+            }
+        });
+
+        while !writer.is_finished() {
+            let status = engine.status().write_backpressure;
+            assert_eq!(
+                status.stalls_since_open,
+                status.immutable_memtables.count_since_open
+            );
+            assert_eq!(
+                status.stalls_since_open,
+                status.level_zero_files.count_since_open
+            );
+            assert_eq!(
+                status.stall_micros_since_open,
+                status.immutable_memtables.micros_since_open
+            );
+            assert_eq!(
+                status.stall_micros_since_open,
+                status.level_zero_files.micros_since_open
+            );
+            tokio::task::yield_now().await;
+        }
+        writer.await.unwrap();
+        let status = engine.status().write_backpressure;
+        assert_eq!(status.stalls_since_open, 200);
+        assert_eq!(status.immutable_memtables.count_since_open, 200);
+        assert_eq!(status.level_zero_files.count_since_open, 200);
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2609,6 +3067,14 @@ mod tests {
 
         assert!(engine.compact().await.is_err());
         failure.assert_hit();
+        let failed_health = engine.status().maintenance.compaction;
+        assert!(failed_health.retry_pending);
+        assert_eq!(failed_health.failures_since_open, 1);
+        assert_eq!(failed_health.background_failures_since_open, 0);
+        assert_eq!(
+            failed_health.unresolved_failure.unwrap().origin,
+            MaintenanceOrigin::Foreground
+        );
         let failed = engine.physical_stats();
         assert_eq!(failed.sstables.files, 2);
         assert_eq!(failed.sstables.bytes, before.sstables.bytes);
@@ -2645,6 +3111,10 @@ mod tests {
         }
 
         assert_eq!(engine.compact().await.unwrap().input_files, 2);
+        let retried_health = engine.status().maintenance.compaction;
+        assert!(!retried_health.retry_pending);
+        assert_eq!(retried_health.failures_since_open, 1);
+        assert_eq!(retried_health.successful_retries_since_open, 1);
         let retried = engine.physical_stats();
         assert_eq!(retried.sstables.files, 1);
         assert_eq!(
@@ -2662,6 +3132,195 @@ mod tests {
         );
         assert_eq!(reopened.physical_stats().sstables.files, 1);
         reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_flush_failure_is_bounded_registered_and_cleared_by_fifo_retry() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), false))
+            .await
+            .unwrap();
+        engine.insert(b"health:flush", b"value").await.unwrap();
+        engine.flush_write_buffers().unwrap();
+        engine.memtable_manager.force_rotate().unwrap();
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::ManifestInstallation,
+        );
+        let background = engine.clone_for_background();
+
+        assert!(background.background_flush().await.is_err());
+        failure.assert_hit();
+        let failed = engine.status().maintenance.flush;
+        assert!(failed.retry_pending);
+        assert_eq!(failed.failures_since_open, 1);
+        assert_eq!(failed.background_failures_since_open, 1);
+        let detail = failed.unresolved_failure.unwrap();
+        assert_eq!(detail.origin, MaintenanceOrigin::Background);
+        assert!(detail.message.len() <= 512);
+        assert!(!detail.message_truncated);
+        assert_eq!(engine.memtable_manager.immutable_count(), 1);
+        assert_eq!(
+            engine.get(b"health:flush").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+
+        background.background_flush().await.unwrap();
+        let retried = engine.status().maintenance.flush;
+        assert!(!retried.retry_pending);
+        assert_eq!(retried.failures_since_open, 1);
+        assert_eq!(retried.background_failures_since_open, 1);
+        assert_eq!(retried.successful_retries_since_open, 1);
+        assert_eq!(engine.memtable_manager.immutable_count(), 0);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_background_retry_executes_failed_wal_sync_before_clearing_health() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), true))
+            .await
+            .unwrap();
+        engine.insert(b"health:wal-sync", b"value").await.unwrap();
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::WalFlush,
+        );
+
+        assert!(engine.flush().await.is_err());
+        failure.assert_hit();
+        assert_eq!(engine.memtable_manager.immutable_count(), 0);
+        let failed = engine.status().maintenance.flush;
+        assert!(failed.retry_pending);
+        assert!(failed
+            .unresolved_failure
+            .as_ref()
+            .is_some_and(|detail| detail.message.contains("WAL flush")));
+
+        engine
+            .clone_for_background()
+            .background_flush()
+            .await
+            .unwrap();
+        let retried = engine.status().maintenance.flush;
+        assert!(!retried.retry_pending);
+        assert_eq!(retried.successful_retries_since_open, 1);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_wal_reclamation_remains_registered_until_exact_retry() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), true))
+            .await
+            .unwrap();
+        engine
+            .insert(b"health:wal-reclamation", b"value")
+            .await
+            .unwrap();
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::WalTruncation,
+        );
+
+        assert!(engine.flush().await.is_err());
+        failure.assert_hit();
+        assert_eq!(engine.memtable_manager.immutable_count(), 1);
+        let failed = engine.status().maintenance.flush;
+        assert!(failed.retry_pending);
+        assert!(failed
+            .unresolved_failure
+            .as_ref()
+            .is_some_and(|detail| detail.message.contains("WAL truncation")));
+
+        engine
+            .clone_for_background()
+            .background_flush()
+            .await
+            .unwrap();
+        assert_eq!(engine.memtable_manager.immutable_count(), 0);
+        assert!(!engine.status().maintenance.flush.retry_pending);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_final_flush_resolves_registered_background_flush_failure() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), false);
+        let engine = Engine::open(config.clone()).await.unwrap();
+        engine
+            .insert(b"shutdown:flush-health", b"value")
+            .await
+            .unwrap();
+        engine.flush_write_buffers().unwrap();
+        engine.memtable_manager.force_rotate().unwrap();
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::ManifestInstallation,
+        );
+
+        assert!(engine
+            .clone_for_background()
+            .background_flush()
+            .await
+            .is_err());
+        failure.assert_hit();
+        assert!(engine.status().maintenance.flush.retry_pending);
+
+        engine.shutdown().await.unwrap();
+        let resolved = engine.status().maintenance.flush;
+        assert!(!resolved.retry_pending);
+        assert_eq!(resolved.successful_retries_since_open, 1);
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(
+            reopened.get(b"shutdown:flush-health").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_flush_keeps_its_generation_registered_until_retry() {
+        let directory = TempDir::new().unwrap();
+        let engine = Arc::new(
+            Engine::open(isolated_config(directory.path(), false))
+                .await
+                .unwrap(),
+        );
+        engine.insert(b"cancel:flush", b"value").await.unwrap();
+        let manifest = engine.manifest.lock().await;
+        let flushing_engine = Arc::clone(&engine);
+        let flush = tokio::spawn(async move { flushing_engine.flush().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while engine.memtable_manager.immutable_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("flush must freeze a generation before manifest publication");
+
+        flush.abort();
+        assert!(flush.await.unwrap_err().is_cancelled());
+        drop(manifest);
+        assert_eq!(engine.memtable_manager.immutable_count(), 1);
+        assert_eq!(
+            engine.get(b"cancel:flush").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+        let cancelled = engine.status().maintenance.flush;
+        assert!(cancelled.retry_pending);
+        assert!(cancelled
+            .unresolved_failure
+            .unwrap()
+            .message
+            .contains("cancelled"));
+
+        engine.flush().await.unwrap();
+        assert_eq!(engine.memtable_manager.immutable_count(), 0);
+        assert!(!engine.status().maintenance.flush.retry_pending);
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3663,6 +4322,7 @@ mod tests {
         after_manifest.release();
         shutdown.await.unwrap().unwrap();
         let _ = owner.await;
+        assert!(engine.status().maintenance.is_healthy());
         assert_eq!(engine.physical_stats().compactions_in_progress, 0);
         assert_eq!(engine.physical_stats().sstables.files, 1);
         let engine = Arc::try_unwrap(engine).ok().unwrap();
@@ -4662,6 +5322,336 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrelated_component_success_does_not_clear_failed_compaction_work() {
+        let directory = TempDir::new().unwrap();
+        let sstable_directory = directory.path().join("sstables");
+        std::fs::create_dir_all(&sstable_directory).unwrap();
+        let mut manifest = Manifest::new();
+        for component in 0_u64..2 {
+            let prefix = format!("proof:{component}");
+            let deleted_key = format!("{prefix}:deleted");
+            let live_key = format!("{prefix}:live");
+            let entries = [
+                (deleted_key.as_bytes(), None, 10),
+                (live_key.as_bytes(), Some(b"live".as_slice()), 20),
+            ];
+            let mut table = write_versioned_scan_table(
+                &sstable_directory.join(format!("proof-{component}.sst")),
+                component + 1,
+                &entries,
+            );
+            table.level = 1;
+            manifest.sstables.push(table);
+        }
+        let first = manifest.sstables[0].clone();
+        let second = manifest.sstables[1].clone();
+        manifest.save(directory.path()).unwrap();
+
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.max_levels = 2;
+        config.compaction_config.l0_compaction_trigger = 4;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Engine::open(config).await.unwrap();
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::CompactionOutputPublication,
+        );
+        assert!(engine
+            .compaction_coordinator
+            .execute_background_job_for_test(super::super::compaction::CompactionSelection {
+                input_sstables: vec![first.clone()],
+                output_level: 1,
+            })
+            .await
+            .is_err());
+        failure.assert_hit();
+        assert!(engine.status().maintenance.compaction.retry_pending);
+        assert!(Manifest::load_or_create(directory.path())
+            .unwrap()
+            .sstables
+            .iter()
+            .any(|table| table.id == first.id));
+
+        engine
+            .compaction_coordinator
+            .execute_background_job_for_test(super::super::compaction::CompactionSelection {
+                input_sstables: vec![second.clone()],
+                output_level: 1,
+            })
+            .await
+            .unwrap();
+        let after_unrelated = engine.status().maintenance.compaction;
+        assert!(after_unrelated.retry_pending);
+        assert_eq!(after_unrelated.failures_since_open, 1);
+        assert_eq!(after_unrelated.background_failures_since_open, 1);
+        assert_eq!(after_unrelated.successful_retries_since_open, 0);
+        let durable = Manifest::load_or_create(directory.path()).unwrap();
+        assert!(durable.sstables.iter().any(|table| table.id == first.id));
+        assert!(!durable.sstables.iter().any(|table| table.id == second.id));
+
+        let retry = engine.clone_for_background().compact().await.unwrap();
+        assert!(retry.is_complete());
+        let resolved = engine.status().maintenance.compaction;
+        assert!(!resolved.retry_pending);
+        assert_eq!(resolved.successful_retries_since_open, 1);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_an_unresolved_background_compaction_failure() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 2;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Engine::open(config.clone()).await.unwrap();
+        for generation in 0..2 {
+            engine
+                .insert(
+                    b"shutdown:maintenance",
+                    format!("generation-{generation}").as_bytes(),
+                )
+                .await
+                .unwrap();
+            engine.flush().await.unwrap();
+        }
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::CompactionOutputPublication,
+        );
+        assert!(engine.clone_for_background().compact().await.is_err());
+        failure.assert_hit();
+        assert_eq!(
+            engine
+                .status()
+                .maintenance
+                .compaction
+                .background_failures_since_open,
+            1
+        );
+
+        let error = engine.shutdown_with_status().await.unwrap_err();
+        let shutdown_status = match error {
+            MaintenanceShutdownError::UnresolvedMaintenance(status) => status,
+            error @ MaintenanceShutdownError::Storage(_) => {
+                panic!("expected structured maintenance status, got {error}")
+            }
+        };
+        assert!(shutdown_status.compaction.retry_pending);
+        assert!(!shutdown_status.flush.retry_pending);
+        assert!(engine.status().maintenance.compaction.retry_pending);
+        let legacy_error = engine.shutdown().await.unwrap_err();
+        assert!(matches!(legacy_error, StorageError::Other(_)));
+        assert!(legacy_error
+            .to_string()
+            .contains("shutdown left unresolved maintenance failures"));
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(
+            reopened.get(b"shutdown:maintenance").await.unwrap(),
+            Some(b"generation-1".to_vec())
+        );
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_snapshots_simultaneous_failures_without_replacing_original_detail() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 2;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Engine::open(config).await.unwrap();
+        for generation in 0..2 {
+            engine
+                .insert(
+                    b"shutdown:simultaneous",
+                    format!("generation-{generation}").as_bytes(),
+                )
+                .await
+                .unwrap();
+            engine.flush().await.unwrap();
+        }
+        let compaction_failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::CompactionOutputPublication,
+        );
+        assert!(engine.clone_for_background().compact().await.is_err());
+        compaction_failure.assert_hit();
+
+        engine.insert(b"shutdown:pending", b"value").await.unwrap();
+        engine.flush_write_buffers().unwrap();
+        engine.memtable_manager.force_rotate().unwrap();
+        let original_flush_failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::ManifestInstallation,
+        );
+        assert!(engine
+            .clone_for_background()
+            .background_flush()
+            .await
+            .is_err());
+        original_flush_failure.assert_hit();
+        let original_detail = engine
+            .status()
+            .maintenance
+            .flush
+            .unresolved_failure
+            .unwrap();
+        assert_eq!(original_detail.origin, MaintenanceOrigin::Background);
+        drop(original_flush_failure);
+
+        let shutdown_flush_failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::ManifestInstallation,
+        );
+        let error = engine.shutdown_with_status().await.unwrap_err();
+        shutdown_flush_failure.assert_hit();
+        let shutdown_status = match error {
+            MaintenanceShutdownError::UnresolvedMaintenance(status) => status,
+            error @ MaintenanceShutdownError::Storage(_) => {
+                panic!("expected structured maintenance status, got {error}")
+            }
+        };
+        assert!(shutdown_status.compaction.retry_pending);
+        assert!(shutdown_status.flush.retry_pending);
+        assert_eq!(shutdown_status.flush.failures_since_open, 2);
+        assert_eq!(
+            shutdown_status.flush.unresolved_failure,
+            Some(original_detail)
+        );
+        assert_eq!(engine.status().maintenance, *shutdown_status);
+        assert_eq!(engine.memtable_manager.immutable_count(), 1);
+        assert_eq!(
+            engine.get(b"shutdown:pending").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn installed_manifest_sync_failure_registers_inputs_until_reconciliation() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), false);
+        config.compaction_config.l0_compaction_trigger = 2;
+        config.sstable_config.compression = super::super::sstable::CompressionType::None;
+        let engine = Engine::open(config).await.unwrap();
+        for generation in 0..2 {
+            engine
+                .insert(
+                    b"compaction:reconciliation",
+                    format!("generation-{generation}").as_bytes(),
+                )
+                .await
+                .unwrap();
+            engine.flush().await.unwrap();
+        }
+        let input_paths = engine
+            .sstables
+            .read()
+            .await
+            .iter()
+            .map(|table| table.path.clone())
+            .collect::<Vec<_>>();
+        let first_sync_failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::ManifestDirectorySync,
+        );
+        let resync_failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::CompactionManifestDirectoryResync,
+        );
+
+        assert!(engine.compact().await.is_err());
+        first_sync_failure.assert_hit();
+        resync_failure.assert_hit();
+        assert!(input_paths.iter().all(|path| path.exists()));
+        let pending = engine.status().maintenance.compaction;
+        assert!(pending.retry_pending);
+        assert!(pending
+            .unresolved_failure
+            .as_ref()
+            .is_some_and(|failure| failure.message.contains("directory sync")));
+
+        let retry = engine.compact().await.unwrap();
+        assert_eq!(retry.input_files, 0);
+        assert!(retry.is_complete());
+        assert!(input_paths.iter().all(|path| !path.exists()));
+        assert!(!engine.status().maintenance.compaction.retry_pending);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovered_cleanup_failure_is_immediately_unhealthy_and_retries_on_reopen() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), false);
+        let engine = Engine::open(config.clone()).await.unwrap();
+        engine.shutdown().await.unwrap();
+        drop(engine);
+        let orphan = directory.path().join("sstables/L0/recovered-orphan.sst");
+        std::fs::write(&orphan, b"crash leftover").unwrap();
+        let cleanup_failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::SstableCleanup,
+        );
+
+        let reopened = Engine::open(config.clone()).await.unwrap();
+        cleanup_failure.assert_hit();
+        let pending = reopened.status().maintenance.compaction;
+        assert!(pending.retry_pending);
+        let failure = pending.unresolved_failure.unwrap();
+        assert_eq!(failure.origin, MaintenanceOrigin::Recovery);
+        assert!(failure.message.contains(&orphan.display().to_string()));
+        let error = reopened.shutdown_with_status().await.unwrap_err();
+        assert!(matches!(
+            error,
+            MaintenanceShutdownError::UnresolvedMaintenance(status)
+                if status.compaction.retry_pending && !status.flush.retry_pending
+        ));
+        drop(reopened);
+
+        let recovered = Engine::open(config).await.unwrap();
+        assert!(!orphan.exists());
+        assert!(recovered.status().maintenance.is_healthy());
+        recovered.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_startup_cleanup_scan_stays_unhealthy_until_reopen_retry() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), false);
+        let engine = Engine::open(config.clone()).await.unwrap();
+        engine.shutdown().await.unwrap();
+        drop(engine);
+        let orphan = directory.path().join("sstables/L0/unscanned-orphan.sst");
+        std::fs::write(&orphan, b"crash leftover").unwrap();
+        let scan_failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::SstableCleanupScan,
+        );
+
+        let reopened = Engine::open(config.clone()).await.unwrap();
+        scan_failure.assert_hit();
+        let pending = reopened.status().maintenance.compaction;
+        assert!(pending.retry_pending);
+        let failure = pending.unresolved_failure.unwrap();
+        assert_eq!(failure.origin, MaintenanceOrigin::Recovery);
+        assert!(failure.message.contains("cleanup scan"));
+        assert!(orphan.exists());
+        assert!(reopened.compact().await.unwrap().is_complete());
+        assert!(reopened.status().maintenance.compaction.retry_pending);
+        assert!(matches!(
+            reopened.shutdown_with_status().await.unwrap_err(),
+            MaintenanceShutdownError::UnresolvedMaintenance(status)
+                if status.compaction.retry_pending && !status.flush.retry_pending
+        ));
+        drop(reopened);
+
+        let recovered = Engine::open(config).await.unwrap();
+        assert!(!orphan.exists());
+        assert!(recovered.status().maintenance.is_healthy());
+        recovered.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn wal_replay_floor_retains_a_tombstone_at_the_checkpoint_equality_boundary() {
         let directory = TempDir::new().unwrap();
         let mut config = isolated_config(directory.path(), true);
@@ -5175,6 +6165,13 @@ mod tests {
         assert_eq!(engine.compact().await.unwrap().input_files, 2);
         assert_eq!(engine.physical_stats().sstables.files, 1);
         assert!(input_paths.iter().all(|path| path.exists()));
+        let deferred = engine.status().maintenance.compaction;
+        assert!(deferred.retry_pending);
+        assert!(deferred
+            .unresolved_failure
+            .unwrap()
+            .message
+            .contains(&input_paths[0].display().to_string()));
         assert_eq!(
             engine.get(b"cleanup:key").await.unwrap(),
             Some(b"generation-1".to_vec())
@@ -5183,6 +6180,7 @@ mod tests {
         drop(restore);
         assert_eq!(engine.compact().await.unwrap().input_files, 0);
         assert!(input_paths.iter().all(|path| !path.exists()));
+        assert!(!engine.status().maintenance.compaction.retry_pending);
         assert_eq!(engine.physical_stats().sstables.files, 1);
         engine.shutdown().await.unwrap();
     }

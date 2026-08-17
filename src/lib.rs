@@ -75,9 +75,11 @@ pub mod storage;
 
 // Primary API
 pub use core::types::{
-    CompactionResult, CompactionStyle, Compression, DbConfig, LogicalStats, PhysicalCacheStats,
-    PhysicalMemTableStats, PhysicalSSTableStats, PhysicalStats, PhysicalVersionStats, WalStats,
-    WriteAmplificationStats, WriteBatch, WriteStallStats,
+    CompactionResult, CompactionStyle, Compression, DatabaseStatus, DbConfig, LogicalStats,
+    MaintenanceFailure, MaintenanceOperationStatus, MaintenanceOrigin, MaintenanceStatus,
+    PhysicalCacheStats, PhysicalMemTableStats, PhysicalSSTableStats, PhysicalStats,
+    PhysicalVersionStats, WalStats, WriteAmplificationStats, WriteBackpressureCauseStatus,
+    WriteBackpressureStatus, WriteBatch, WriteStallStats,
 };
 pub use storage::db::{Db, DbError, DbOptions, DbStats};
 pub use storage::iter::{EntryGuard, PrefixIter, RangeIter, ScanEntry, ScanError, ScanResult};
@@ -85,7 +87,9 @@ pub use storage::iter::{EntryGuard, PrefixIter, RangeIter, ScanEntry, ScanError,
 // Advanced API
 pub use core::crypto::crc32_checksum;
 pub use storage::compaction::CompactionConfig;
-pub use storage::engine::{Engine, Result as StorageResult, StorageConfig, StorageError};
+pub use storage::engine::{
+    Engine, MaintenanceShutdownError, Result as StorageResult, StorageConfig, StorageError,
+};
 pub use storage::memtable::{MemTableConfig, MemTableManager};
 pub use storage::sstable::{SSTableConfig, SSTableInfo};
 pub use storage::wal::{WalConfig, WriteAheadLog};
