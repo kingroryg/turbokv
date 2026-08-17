@@ -24,6 +24,22 @@ TurboKV is a high-performance, embedded key-value database written in Rust. It p
 - **Bloom Filters**: Fast negative lookups
 - **Compression**: LZ4, Snappy, and Zstd support
 
+## Exclusive Directory Ownership
+
+An open TurboKV database exclusively owns its canonicalized data directory.
+Opening the same directory from another `Db` or `Engine`, in the same process
+or another process, fails with a dedicated directory-locked error. Shared
+multi-writer access is unsupported.
+
+TurboKV uses a persistent `.turbokv.lock` file with a non-blocking advisory
+lock on Unix and Windows. The file is intentionally not deleted on close; the
+operating system releases ownership when the database handle closes or the
+process terminates. All programs accessing the directory must honor advisory
+locks, and the underlying filesystem must implement the platform's locking
+semantics. `Db::close` stops background work, flushes pending writes, and then
+releases ownership. `Engine::shutdown(&self)` stops and flushes the engine but
+retains ownership until the still-usable `Engine` is dropped.
+
 ## Development
 
 ```bash

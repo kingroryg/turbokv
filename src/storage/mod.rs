@@ -7,12 +7,16 @@
 //! Read Path:  Query -> MemTable -> SSTables (newest first, with Bloom filters)
 //! ```
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 pub mod buffer_pool;
 pub mod cache;
 pub mod cached_time;
 pub mod compaction;
 pub mod db;
 pub mod direct_io;
+mod directory_lock;
 pub mod engine;
 #[cfg(test)]
 mod failpoints;
@@ -36,3 +40,20 @@ pub use memtable::{MemTable, MemTableConfig, MemTableEntry, MemTableManager};
 pub use sstable::bloom::PrefixBloomFilter;
 pub use sstable::{SSTableConfig, SSTableInfo, SSTableReader, SSTableWriter};
 pub use wal::{WalConfig, WalEntry, WalError, WriteAheadLog};
+
+struct InProgressGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl InProgressGuard {
+    fn new(counter: Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter }
+    }
+}
+
+impl Drop for InProgressGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}

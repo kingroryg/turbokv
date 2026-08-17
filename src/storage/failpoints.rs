@@ -47,6 +47,10 @@ struct ArmedState {
 static ARMED: LazyLock<Mutex<HashMap<FailureTarget, Arc<ArmedState>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+fn canonical_data_dir(data_dir: &Path) -> PathBuf {
+    std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf())
+}
+
 /// RAII registration for one injected failure.
 pub(crate) struct ArmedFailure {
     target: FailureTarget,
@@ -88,7 +92,7 @@ pub(crate) fn arm_on_hit(
 ) -> ArmedFailure {
     assert!(hit_number > 0, "failure hit number must be positive");
     let target = FailureTarget {
-        data_dir: data_dir.to_path_buf(),
+        data_dir: canonical_data_dir(data_dir),
         boundary,
     };
     let state = Arc::new(ArmedState {
@@ -103,7 +107,7 @@ pub(crate) fn arm_on_hit(
 /// Returns an injected error exactly once when an armed boundary is reached.
 pub(crate) fn check(data_dir: &Path, boundary: PersistenceBoundary) -> Result<()> {
     let target = FailureTarget {
-        data_dir: data_dir.to_path_buf(),
+        data_dir: canonical_data_dir(data_dir),
         boundary,
     };
     let mut armed = ARMED.lock();
