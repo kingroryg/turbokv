@@ -418,6 +418,7 @@ impl Db {
             sstable_flush_bytes_written: stats.sstable_flush_bytes_written,
             compaction_bytes_read: stats.compaction_bytes_read,
             compaction_bytes_written: stats.compaction_bytes_written,
+            compactions_in_progress: stats.compactions_in_progress,
             immutable_memtables: stats.immutable_memtables,
             l0_sstable_count: stats.l0_sstable_count,
             write_stall_count: stats.write_stall_count,
@@ -447,6 +448,8 @@ pub struct DbStats {
     pub compaction_bytes_read: u64,
     /// Total bytes written by compaction jobs
     pub compaction_bytes_written: u64,
+    /// Compaction selections or jobs currently in progress
+    pub compactions_in_progress: u64,
     /// Immutable memtables waiting to be flushed
     pub immutable_memtables: u64,
     /// Number of level-0 SSTables
