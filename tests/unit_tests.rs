@@ -78,8 +78,12 @@ mod types_tests {
     #[test]
     fn test_compaction_result_default() {
         let result = CompactionResult::default();
-        assert_eq!(result.files_compacted, 0);
+        assert_eq!(result.input_files, 0);
+        assert_eq!(result.output_files, 0);
+        assert_eq!(result.bytes_read, 0);
+        assert_eq!(result.bytes_written, 0);
         assert_eq!(result.bytes_reclaimed, 0);
+        assert!(result.is_complete());
     }
 }
 

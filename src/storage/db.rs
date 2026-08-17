@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::types::Compression;
-use crate::core::{DbConfig, LogicalStats, PhysicalStats, WriteBatch};
+use crate::core::{CompactionResult, DbConfig, LogicalStats, PhysicalStats, WriteBatch};
 
 use super::directory_lock::LOCKED_DIRECTORY_GUIDANCE;
 use super::engine::{Engine, StorageConfig, StorageError};
@@ -431,10 +431,17 @@ impl Db {
         Ok(())
     }
 
-    /// Trigger manual compaction
-    pub async fn compact(&self) -> Result<()> {
-        self.engine.compact().await?;
-        Ok(())
+    /// Compact every eligible SSTable in the scope captured after acquiring
+    /// the shared compaction coordinator.
+    ///
+    /// Concurrent flushes are preserved and start outside that fixed scope,
+    /// though overlap closure can pull one into a scoped job for safety. The
+    /// returned result reports all actual I/O performed by the drain and sets
+    /// [`CompactionResult::work_remaining`] when another job is globally
+    /// selectable in the drain's final live-state observation. Like any
+    /// concurrent status sample, a later flush can immediately make it stale.
+    pub async fn compact(&self) -> Result<CompactionResult> {
+        Ok(self.engine.compact().await?)
     }
 
     /// Get legacy mixed physical statistics.

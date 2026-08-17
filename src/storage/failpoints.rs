@@ -18,6 +18,7 @@ pub(crate) enum PersistenceBoundary {
     ManifestInstallation,
     Checkpoint,
     CompactionOutputPublication,
+    CompactionManifestPublication,
 }
 
 impl PersistenceBoundary {
@@ -29,6 +30,48 @@ impl PersistenceBoundary {
             Self::ManifestInstallation => "manifest installation",
             Self::Checkpoint => "checkpoint",
             Self::CompactionOutputPublication => "compaction output publication",
+            Self::CompactionManifestPublication => "compaction manifest publication",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionCrashBoundary {
+    OutputPublication,
+    ManifestPublication,
+}
+
+const COMPACTION_CRASH_BOUNDARY_TOKENS: [(CompactionCrashBoundary, &str); 2] = [
+    (
+        CompactionCrashBoundary::OutputPublication,
+        "compaction-output-publication",
+    ),
+    (
+        CompactionCrashBoundary::ManifestPublication,
+        "compaction-manifest-publication",
+    ),
+];
+
+impl CompactionCrashBoundary {
+    fn stable_token(self) -> &'static str {
+        COMPACTION_CRASH_BOUNDARY_TOKENS
+            .iter()
+            .find(|(boundary, _)| *boundary == self)
+            .map(|(_, token)| *token)
+            .expect("every compaction crash boundary has a stable token")
+    }
+
+    fn from_stable_token(token: &str) -> Option<Self> {
+        COMPACTION_CRASH_BOUNDARY_TOKENS
+            .iter()
+            .find(|(_, stable_token)| *stable_token == token)
+            .map(|(boundary, _)| *boundary)
+    }
+
+    fn persistence_boundary(self) -> PersistenceBoundary {
+        match self {
+            Self::OutputPublication => PersistenceBoundary::CompactionOutputPublication,
+            Self::ManifestPublication => PersistenceBoundary::CompactionManifestPublication,
         }
     }
 }
@@ -42,6 +85,7 @@ struct FailureTarget {
 struct ArmedState {
     remaining_hits: AtomicUsize,
     hit: AtomicBool,
+    crash: bool,
 }
 
 static ARMED: LazyLock<Mutex<HashMap<FailureTarget, Arc<ArmedState>>>> =
@@ -90,6 +134,23 @@ pub(crate) fn arm_on_hit(
     boundary: PersistenceBoundary,
     hit_number: usize,
 ) -> ArmedFailure {
+    arm_with_action(data_dir, boundary, hit_number, false)
+}
+
+fn arm_crash_on_hit(
+    data_dir: &Path,
+    boundary: PersistenceBoundary,
+    hit_number: usize,
+) -> ArmedFailure {
+    arm_with_action(data_dir, boundary, hit_number, true)
+}
+
+fn arm_with_action(
+    data_dir: &Path,
+    boundary: PersistenceBoundary,
+    hit_number: usize,
+    crash: bool,
+) -> ArmedFailure {
     assert!(hit_number > 0, "failure hit number must be positive");
     let target = FailureTarget {
         data_dir: canonical_data_dir(data_dir),
@@ -98,6 +159,7 @@ pub(crate) fn arm_on_hit(
     let state = Arc::new(ArmedState {
         remaining_hits: AtomicUsize::new(hit_number),
         hit: AtomicBool::new(false),
+        crash,
     });
     let previous = ARMED.lock().insert(target.clone(), Arc::clone(&state));
     assert!(previous.is_none(), "persistence boundary already armed");
@@ -119,12 +181,38 @@ pub(crate) fn check(data_dir: &Path, boundary: PersistenceBoundary) -> Result<()
             .remove(&target)
             .expect("armed failure remains registered until its selected hit");
         state.hit.store(true, Ordering::Release);
+        if state.crash {
+            drop(armed);
+            std::process::abort();
+        }
         return Err(StorageError::Other(format!(
             "injected test failure at {} boundary",
             boundary.name()
         )));
     }
     Ok(())
+}
+
+/// Abort at a crash-only boundary. Unlike [`check`], this can be called after
+/// a manifest commit because it never returns an ordinary error that could
+/// unwind output guards and delete newly authoritative files.
+pub(crate) fn crash_if_armed(data_dir: &Path, boundary: PersistenceBoundary) {
+    let target = FailureTarget {
+        data_dir: canonical_data_dir(data_dir),
+        boundary,
+    };
+    let mut armed = ARMED.lock();
+    let should_crash = armed.get(&target).is_some_and(|state| {
+        state.crash && state.remaining_hits.fetch_sub(1, Ordering::AcqRel) == 1
+    });
+    if should_crash {
+        let state = armed
+            .remove(&target)
+            .expect("armed crash remains registered until its selected hit");
+        state.hit.store(true, Ordering::Release);
+        drop(armed);
+        std::process::abort();
+    }
 }
 
 #[cfg(test)]
@@ -134,7 +222,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{arm, arm_on_hit, PersistenceBoundary};
+    use super::{arm, arm_crash_on_hit, arm_on_hit, CompactionCrashBoundary, PersistenceBoundary};
     use crate::storage::engine::{Engine, Result, StorageConfig};
     use crate::storage::manifest::Manifest;
     use crate::storage::sstable::CompressionType;
@@ -173,6 +261,117 @@ mod tests {
 
         drop(engine);
         temp
+    }
+
+    fn split_compaction_config(path: &Path) -> StorageConfig {
+        let mut config = test_config(path);
+        config.compaction_config.l0_compaction_trigger = 2;
+        config.compaction_config.max_levels = 2;
+        config.compaction_config.target_file_size = 20 * 1024;
+        config.sstable_config.block_size = 512;
+        config
+    }
+
+    async fn split_compaction_fixture(path: &Path) -> (Engine, StorageConfig) {
+        let config = split_compaction_config(path);
+        let engine = Engine::open(config.clone()).await.unwrap();
+        for generation in 0_usize..2 {
+            for key_index in 0_usize..48 {
+                let value = (0_usize..512)
+                    .map(|offset| {
+                        generation
+                            .wrapping_mul(53)
+                            .wrapping_add(key_index.wrapping_mul(97))
+                            .wrapping_add(offset) as u8
+                    })
+                    .collect::<Vec<_>>();
+                engine
+                    .insert(format!("split:{key_index:04}").as_bytes(), &value)
+                    .await
+                    .unwrap();
+            }
+            engine.flush().await.unwrap();
+        }
+        (engine, config)
+    }
+
+    struct SplitCompactionBaseline {
+        output_count: usize,
+        boundary_hits: Vec<usize>,
+    }
+
+    async fn split_compaction_baseline() -> SplitCompactionBaseline {
+        let baseline = TempDir::new().unwrap();
+        let (engine, _) = split_compaction_fixture(baseline.path()).await;
+        let output_count = usize::try_from(engine.compact().await.unwrap().output_files).unwrap();
+        assert!(output_count >= 3);
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let mut boundary_hits = vec![1, output_count.div_ceil(2), output_count];
+        boundary_hits.sort_unstable();
+        boundary_hits.dedup();
+        SplitCompactionBaseline {
+            output_count,
+            boundary_hits,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_crash_child() {
+        let Ok(data_dir) = std::env::var("TURBOKV_COMPACTION_CRASH_DIR") else {
+            return;
+        };
+        let boundary_token = std::env::var("TURBOKV_COMPACTION_CRASH_BOUNDARY").unwrap();
+        let crash_boundary = CompactionCrashBoundary::from_stable_token(&boundary_token)
+            .unwrap_or_else(|| panic!("unknown compaction crash boundary: {boundary_token}"));
+        let hit = std::env::var("TURBOKV_COMPACTION_CRASH_HIT")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        let (engine, _) = split_compaction_fixture(Path::new(&data_dir)).await;
+        let _crash = arm_crash_on_hit(
+            Path::new(&data_dir),
+            crash_boundary.persistence_boundary(),
+            hit,
+        );
+        let result = engine.compact().await;
+        panic!("crash boundary returned instead of aborting: {result:?}");
+    }
+
+    async fn run_compaction_crash_child(
+        path: &Path,
+        boundary: CompactionCrashBoundary,
+        hit: usize,
+    ) {
+        let executable = std::env::current_exe().unwrap();
+        let path = path.to_path_buf();
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(executable)
+                .arg("--exact")
+                .arg("storage::failpoints::tests::compaction_crash_child")
+                .arg("--nocapture")
+                .env("TURBOKV_COMPACTION_CRASH_DIR", path)
+                .env("TURBOKV_COMPACTION_CRASH_BOUNDARY", boundary.stable_token())
+                .env("TURBOKV_COMPACTION_CRASH_HIT", hit.to_string())
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            !output.status.success(),
+            "crash child unexpectedly succeeded:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    fn uncommitted_compaction_file_count(path: &Path) -> usize {
+        std::fs::read_dir(path.join("sstables"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sst"))
+            .count()
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -460,6 +659,147 @@ mod tests {
             );
         }
         assert_eq!(reopened.stats().l0_sstable_count, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_split_output_and_manifest_boundary_reopens_from_the_input_generation() {
+        let baseline = split_compaction_baseline().await;
+        for hit in baseline.boundary_hits {
+            let temp = TempDir::new().unwrap();
+            let (engine, config) = split_compaction_fixture(temp.path()).await;
+            let before = engine.physical_stats();
+            let input_ids = Manifest::load_or_create(temp.path())
+                .unwrap()
+                .sstables
+                .into_iter()
+                .map(|table| table.id)
+                .collect::<Vec<_>>();
+            let failure = arm_on_hit(
+                temp.path(),
+                PersistenceBoundary::CompactionOutputPublication,
+                hit,
+            );
+
+            assert_injected(
+                engine.compact().await,
+                PersistenceBoundary::CompactionOutputPublication,
+            );
+            failure.assert_hit();
+            assert_eq!(engine.physical_stats().sstables.files, 2);
+            assert_eq!(
+                engine
+                    .physical_stats()
+                    .amplification
+                    .compaction_input_bytes_since_open,
+                before.sstables.bytes
+            );
+            assert!(
+                engine
+                    .physical_stats()
+                    .amplification
+                    .compaction_output_bytes_since_open
+                    > 0
+            );
+            assert_eq!(uncommitted_compaction_file_count(temp.path()), 0);
+            assert_eq!(
+                Manifest::load_or_create(temp.path())
+                    .unwrap()
+                    .sstables
+                    .into_iter()
+                    .map(|table| table.id)
+                    .collect::<Vec<_>>(),
+                input_ids
+            );
+            drop(engine);
+
+            let reopened = Engine::open(config).await.unwrap();
+            assert!(reopened.get(b"split:0000").await.unwrap().is_some());
+            assert_eq!(reopened.physical_stats().sstables.files, 2);
+            reopened.shutdown().await.unwrap();
+        }
+
+        let temp = TempDir::new().unwrap();
+        let (engine, config) = split_compaction_fixture(temp.path()).await;
+        let input_ids = Manifest::load_or_create(temp.path())
+            .unwrap()
+            .sstables
+            .into_iter()
+            .map(|table| table.id)
+            .collect::<Vec<_>>();
+        let failure = arm(temp.path(), PersistenceBoundary::ManifestInstallation);
+        assert_injected(
+            engine.compact().await,
+            PersistenceBoundary::ManifestInstallation,
+        );
+        failure.assert_hit();
+        assert_eq!(uncommitted_compaction_file_count(temp.path()), 0);
+        assert_eq!(
+            Manifest::load_or_create(temp.path())
+                .unwrap()
+                .sstables
+                .into_iter()
+                .map(|table| table.id)
+                .collect::<Vec<_>>(),
+            input_ids
+        );
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert!(reopened.get(b"split:0047").await.unwrap().is_some());
+        assert_eq!(reopened.physical_stats().sstables.files, 2);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_crashes_at_split_and_manifest_boundaries_reopen_atomically() {
+        let baseline = split_compaction_baseline().await;
+        for hit in baseline.boundary_hits {
+            let temp = TempDir::new().unwrap();
+            run_compaction_crash_child(
+                temp.path(),
+                CompactionCrashBoundary::OutputPublication,
+                hit,
+            )
+            .await;
+
+            let durable = Manifest::load_or_create(temp.path()).unwrap();
+            assert_eq!(durable.sstables.len(), 2);
+            assert_eq!(uncommitted_compaction_file_count(temp.path()), hit);
+
+            let reopened = Engine::open(split_compaction_config(temp.path()))
+                .await
+                .unwrap();
+            assert_eq!(uncommitted_compaction_file_count(temp.path()), 0);
+            assert_eq!(reopened.physical_stats().sstables.files, 2);
+            assert!(reopened.get(b"split:0000").await.unwrap().is_some());
+            assert!(reopened.get(b"split:0047").await.unwrap().is_some());
+            reopened.shutdown().await.unwrap();
+        }
+
+        let temp = TempDir::new().unwrap();
+        run_compaction_crash_child(temp.path(), CompactionCrashBoundary::ManifestPublication, 1)
+            .await;
+        let durable = Manifest::load_or_create(temp.path()).unwrap();
+        assert_eq!(durable.sstables.len(), baseline.output_count);
+        assert_eq!(
+            uncommitted_compaction_file_count(temp.path()),
+            baseline.output_count
+        );
+
+        let reopened = Engine::open(split_compaction_config(temp.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.physical_stats().sstables.files,
+            baseline.output_count as u64
+        );
+        assert_eq!(
+            uncommitted_compaction_file_count(temp.path()),
+            baseline.output_count
+        );
+        assert!(reopened.get(b"split:0000").await.unwrap().is_some());
+        assert!(reopened.get(b"split:0047").await.unwrap().is_some());
+        reopened.shutdown().await.unwrap();
     }
 
     #[test]
