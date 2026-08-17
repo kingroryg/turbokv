@@ -1,14 +1,16 @@
 //! Executable production contracts exercised through TurboKV's public API.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use tempfile::TempDir;
-use turbokv::{Db, DbError, DbOptions, WriteBatch};
+use turbokv::{Db, DbError, DbOptions, Engine, StorageConfig, StorageError, WriteBatch};
 
 const CRASH_WRITER_PATH: &str = "TURBOKV_CONTRACT_CRASH_WRITER_PATH";
 const CRASH_WRITER_MODE: &str = "TURBOKV_CONTRACT_CRASH_WRITER_MODE";
 const CRASH_WRITER_READY: &str = "TURBOKV_CONTRACT_CRASH_WRITER_READY";
+const LOCK_HOLDER_PATH: &str = "TURBOKV_CONTRACT_LOCK_HOLDER_PATH";
+const LOCK_HOLDER_READY: &str = "TURBOKV_CONTRACT_LOCK_HOLDER_READY";
 
 fn durability_modes() -> [(&'static str, DbOptions); 3] {
     [
@@ -16,6 +18,38 @@ fn durability_modes() -> [(&'static str, DbOptions); 3] {
         ("durable", DbOptions::durable()),
         ("paranoid", DbOptions::paranoid()),
     ]
+}
+
+fn wait_until_ready(child: &mut Child, marker: &str, context: &str) {
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line).unwrap();
+        if bytes_read == 0 {
+            let status = child.wait().unwrap();
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("{context}: child exited before readiness ({status}): {stderr}");
+        }
+        if line.contains(marker) {
+            return;
+        }
+    }
+}
+
+fn expect_directory_locked(result: Result<Db, DbError>) -> std::path::PathBuf {
+    match result {
+        Err(DbError::DirectoryLocked { path }) => path,
+        Err(error) => panic!("expected a directory-locked error, got: {error}"),
+        Ok(_) => panic!("a second database unexpectedly acquired the directory"),
+    }
 }
 
 #[tokio::test]
@@ -32,6 +66,193 @@ async fn sync_writes_without_wal_is_rejected() {
 
     assert!(matches!(result, Err(DbError::InvalidOptions(_))));
     assert!(!database_path.exists());
+}
+
+#[tokio::test]
+async fn same_process_second_opener_fails_and_clean_close_releases_the_lock() {
+    let temp = TempDir::new().unwrap();
+    let database_path = temp.path().join("database");
+    let first = Db::open_with_options(&database_path, DbOptions::fast())
+        .await
+        .unwrap();
+
+    let locked_path =
+        expect_directory_locked(Db::open_with_options(&database_path, DbOptions::fast()).await);
+    assert_eq!(locked_path, database_path.canonicalize().unwrap());
+
+    let second_error = match Db::open_with_options(&database_path, DbOptions::fast()).await {
+        Err(error) => error,
+        Ok(_) => panic!("a second database unexpectedly acquired the directory"),
+    };
+    assert!(second_error.to_string().contains("close or drop"));
+    assert!(second_error
+        .to_string()
+        .contains("shared multi-writer access is unsupported"));
+
+    first.close().await.unwrap();
+    let reopened = Db::open_with_options(&database_path, DbOptions::fast())
+        .await
+        .unwrap();
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn engine_shutdown_retains_ownership_until_the_engine_is_dropped() {
+    let temp = TempDir::new().unwrap();
+    let database_path = temp.path().join("database");
+    let config = StorageConfig::fast(database_path.clone());
+    let engine = Engine::open(config.clone()).await.unwrap();
+
+    engine.shutdown().await.unwrap();
+    let error = match Engine::open(config.clone()).await {
+        Err(error) => error,
+        Ok(_) => panic!("shutdown unexpectedly released a live engine's directory lock"),
+    };
+    assert!(matches!(error, StorageError::DirectoryLocked { .. }));
+
+    drop(engine);
+    let reopened = Engine::open(config).await.unwrap();
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_a_database_releases_its_directory_lock() {
+    let temp = TempDir::new().unwrap();
+    let database_path = temp.path().join("database");
+    let db = Db::open_with_options(&database_path, DbOptions::fast())
+        .await
+        .unwrap();
+
+    drop(db);
+
+    let reopened = Db::open_with_options(&database_path, DbOptions::fast())
+        .await
+        .unwrap();
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_partial_open_failure_releases_the_directory_lock() {
+    let temp = TempDir::new().unwrap();
+    let database_path = temp.path().join("database");
+    std::fs::create_dir(&database_path).unwrap();
+    let invalid_sstable_path = database_path.join("sstables");
+    std::fs::write(&invalid_sstable_path, b"not a directory").unwrap();
+
+    let error = match Db::open_with_options(&database_path, DbOptions::fast()).await {
+        Err(error) => error,
+        Ok(_) => panic!("database unexpectedly opened with a file at its SSTable path"),
+    };
+    assert!(matches!(error, DbError::Storage(StorageError::Io(_))));
+    assert!(database_path.join(".turbokv.lock").is_file());
+
+    std::fs::remove_file(invalid_sstable_path).unwrap();
+    let reopened = Db::open_with_options(&database_path, DbOptions::fast())
+        .await
+        .unwrap();
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn lock_io_failures_are_distinct_from_lock_contention() {
+    let temp = TempDir::new().unwrap();
+    let database_path = temp.path().join("database");
+    std::fs::create_dir(&database_path).unwrap();
+    std::fs::create_dir(database_path.join(".turbokv.lock")).unwrap();
+
+    let error = match Db::open_with_options(&database_path, DbOptions::fast()).await {
+        Err(error) => error,
+        Ok(_) => panic!("database unexpectedly opened with a directory at its lock-file path"),
+    };
+    assert!(matches!(
+        error,
+        DbError::Storage(StorageError::DirectoryLockIo { .. })
+    ));
+    assert!(!database_path.join("wal").exists());
+    assert!(!database_path.join("sstables").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn canonical_path_aliases_share_one_same_process_lock() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let database_path = temp.path().join("database");
+    let alias_path = temp.path().join("database-alias");
+    let first = Db::open_with_options(&database_path, DbOptions::fast())
+        .await
+        .unwrap();
+    symlink(&database_path, &alias_path).unwrap();
+
+    let locked_path =
+        expect_directory_locked(Db::open_with_options(&alias_path, DbOptions::fast()).await);
+    assert_eq!(locked_path, database_path.canonicalize().unwrap());
+
+    first.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retargeting_an_opened_symlink_cannot_redirect_database_writes() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let owned_path = temp.path().join("owned");
+    let other_path = temp.path().join("other");
+    let alias_path = temp.path().join("database-alias");
+    std::fs::create_dir(&owned_path).unwrap();
+    std::fs::create_dir(&other_path).unwrap();
+    symlink(&owned_path, &alias_path).unwrap();
+
+    let db = Db::open_with_options(&alias_path, DbOptions::fast())
+        .await
+        .unwrap();
+    std::fs::remove_file(&alias_path).unwrap();
+    symlink(&other_path, &alias_path).unwrap();
+
+    db.insert(b"key", b"value").await.unwrap();
+    db.flush().await.unwrap();
+    db.close().await.unwrap();
+
+    assert!(owned_path.join("MANIFEST").is_file());
+    assert!(!other_path.join("MANIFEST").exists());
+    assert!(!other_path.join("sstables").exists());
+}
+
+#[tokio::test]
+async fn another_process_cannot_open_the_directory_until_its_owner_terminates() {
+    let temp = TempDir::new().unwrap();
+
+    for iteration in 0..3 {
+        let database_path = temp.path().join(format!("database-{iteration}"));
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("directory_lock_holder_process")
+            .arg("--nocapture")
+            .env(LOCK_HOLDER_PATH, &database_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        wait_until_ready(&mut child, LOCK_HOLDER_READY, "directory-lock holder");
+        let locked_path =
+            expect_directory_locked(Db::open_with_options(&database_path, DbOptions::fast()).await);
+        assert_eq!(locked_path, database_path.canonicalize().unwrap());
+
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert!(
+            !status.success(),
+            "lock holder must be killed by its parent"
+        );
+
+        let reopened = Db::open_with_options(&database_path, DbOptions::fast())
+            .await
+            .unwrap();
+        reopened.close().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -238,33 +459,7 @@ async fn wal_modes_recover_after_writer_process_exits_without_destructors() {
             .spawn()
             .unwrap();
 
-        let stdout = child.stdout.take().unwrap();
-        let mut reader = BufReader::new(stdout);
-        let mut ready = false;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let bytes_read = reader.read_line(&mut line).unwrap();
-            if bytes_read == 0 {
-                break;
-            }
-            if line.contains(CRASH_WRITER_READY) {
-                ready = true;
-                break;
-            }
-        }
-
-        if !ready {
-            let status = child.wait().unwrap();
-            let mut stderr = String::new();
-            child
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut stderr)
-                .unwrap();
-            panic!("{mode}: crash writer exited before readiness ({status}): {stderr}");
-        }
+        wait_until_ready(&mut child, CRASH_WRITER_READY, mode);
 
         child.kill().unwrap();
         let status = child.wait().unwrap();
@@ -297,6 +492,26 @@ async fn wal_modes_recover_after_writer_process_exits_without_destructors() {
             "{mode}: acknowledged batch deletes must be replayed from the WAL"
         );
     }
+}
+
+#[test]
+fn directory_lock_holder_process() {
+    let Some(database_path) = std::env::var_os(LOCK_HOLDER_PATH) else {
+        return;
+    };
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let _db = Db::open_with_options(database_path, DbOptions::fast())
+            .await
+            .unwrap();
+        println!("{LOCK_HOLDER_READY}");
+        std::io::stdout().flush().unwrap();
+
+        loop {
+            std::thread::park();
+        }
+    });
 }
 
 #[test]

@@ -46,11 +46,15 @@ use crate::core::{CompactionResult, DbConfig, StorageStats, WriteBatch};
 
 use super::{
     compaction::{CompactionConfig, Compactor},
+    directory_lock::{
+        AcquireError as DirectoryLockAcquireError, DirectoryLock, LOCKED_DIRECTORY_GUIDANCE,
+    },
     fd::{FdConfig, FdMonitor, SSTablePool},
     manifest::{atomic_replace, sync_directory, Manifest, SSTableManifestEntry},
     memtable::{MemTableConfig, MemTableManager},
     sstable::{SSTableConfig, SSTableInfo, SSTableReader, SSTableWriter},
     wal::{WalConfig, WriteAheadLog},
+    InProgressGuard,
 };
 
 /// Result type for storage operations
@@ -76,6 +80,20 @@ pub enum StorageError {
 
     #[error("Compaction error: {0}")]
     Compaction(String),
+
+    #[error(
+        "database directory is already open for exclusive access: {}; {guidance}",
+        path.display(),
+        guidance = LOCKED_DIRECTORY_GUIDANCE
+    )]
+    DirectoryLocked { path: PathBuf },
+
+    #[error("failed to acquire the database-directory lock at {}: {source}", path.display())]
+    DirectoryLockIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("Storage error: {0}")]
     Other(String),
@@ -189,6 +207,7 @@ impl StorageConfig {
 /// Main storage engine
 pub struct Engine {
     config: StorageConfig,
+    directory_lock: Arc<DirectoryLock>,
     wal: Option<Arc<WriteAheadLog>>,
     memtable_manager: Arc<MemTableManager>,
     sstables: Arc<RwLock<Vec<SSTableInfo>>>,
@@ -206,6 +225,8 @@ pub struct Engine {
     /// empty again.
     unapplied_wal_sequences: Arc<Mutex<BTreeSet<u64>>>,
     shutdown: tokio::sync::watch::Sender<bool>,
+    background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    shutdown_lock: AsyncMutex<()>,
     next_sstable_id: Arc<std::sync::atomic::AtomicU64>,
     sstable_pool: Arc<SSTablePool>,
     #[allow(dead_code)]
@@ -227,12 +248,23 @@ pub struct Engine {
 
 impl Engine {
     /// Open or create a storage engine
-    pub async fn open(config: StorageConfig) -> Result<Self> {
+    pub async fn open(mut config: StorageConfig) -> Result<Self> {
         // Initialize cached timestamp
         super::cached_time::init();
 
         // Create directories
         tokio::fs::create_dir_all(&config.data_dir).await?;
+        let directory_lock = Arc::new(DirectoryLock::acquire(&config.data_dir).map_err(
+            |error| match error {
+                DirectoryLockAcquireError::Locked { path } => {
+                    StorageError::DirectoryLocked { path }
+                }
+                DirectoryLockAcquireError::Io { path, source } => {
+                    StorageError::DirectoryLockIo { path, source }
+                }
+            },
+        )?);
+        config.data_dir = directory_lock.path().to_path_buf();
         let wal_dir = config.data_dir.join("wal");
         let sstable_dir = config.data_dir.join("sstables");
         tokio::fs::create_dir_all(&wal_dir).await?;
@@ -266,7 +298,14 @@ impl Engine {
 
         // Create WAL if enabled
         let wal = if config.wal_enabled {
-            let wal = Arc::new(WriteAheadLog::new(&wal_dir, config.wal_config.clone()).await?);
+            let wal = Arc::new(
+                WriteAheadLog::new_with_directory_lock(
+                    &wal_dir,
+                    config.wal_config.clone(),
+                    Arc::downgrade(&directory_lock),
+                )
+                .await?,
+            );
             wal.ensure_next_sequence_at_least(persisted_next_sequence);
             Some(wal)
         } else {
@@ -344,6 +383,7 @@ impl Engine {
 
         let engine = Self {
             config,
+            directory_lock,
             wal,
             memtable_manager,
             sstables: Arc::new(RwLock::new(sstables)),
@@ -354,6 +394,8 @@ impl Engine {
             batch_visibility: Arc::new(RwLock::new(())),
             unapplied_wal_sequences: Arc::new(Mutex::new(BTreeSet::new())),
             shutdown: shutdown_tx,
+            background_tasks: Mutex::new(Vec::new()),
+            shutdown_lock: AsyncMutex::new(()),
             next_sstable_id,
             sstable_pool,
             fd_monitor,
@@ -777,15 +819,35 @@ impl Engine {
         }
     }
 
-    /// Shutdown the engine gracefully
+    /// Shutdown the engine gracefully.
+    ///
+    /// This stops background tasks and flushes pending writes. Because this
+    /// method borrows the still-usable engine, its exclusive directory lock is
+    /// retained until the [`Engine`] is dropped.
     pub async fn shutdown(&self) -> Result<()> {
+        let _shutdown = self.shutdown_lock.lock().await;
         info!("Shutting down storage engine");
 
         // Signal background tasks to stop
         let _ = self.shutdown.send(true);
 
+        let handles: Vec<_> = self.background_tasks.lock().drain(..).collect();
+        let mut task_failure = None;
+        for handle in handles {
+            if let Err(error) = handle.await {
+                task_failure.get_or_insert(error);
+            }
+        }
+
         // Flush pending writes
-        self.flush().await?;
+        let flush_result = self.flush().await;
+
+        if let Some(error) = task_failure {
+            return Err(StorageError::Other(format!(
+                "background task failed during shutdown: {error}"
+            )));
+        }
+        flush_result?;
 
         info!("Storage engine shutdown complete");
         Ok(())
@@ -1070,7 +1132,7 @@ impl Engine {
         let flush_engine = engine.clone();
         let mut shutdown_rx = self.shutdown.subscribe();
         let flush_interval = self.config.flush_interval;
-        tokio::spawn(async move {
+        let flush_task = tokio::spawn(async move {
             let mut interval = interval(flush_interval);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -1094,7 +1156,7 @@ impl Engine {
         let compact_engine = engine.clone();
         let mut shutdown_rx = self.shutdown.subscribe();
         let compaction_interval = self.config.compaction_interval;
-        tokio::spawn(async move {
+        let compaction_task = tokio::spawn(async move {
             let mut interval = interval(compaction_interval);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -1111,12 +1173,17 @@ impl Engine {
                 }
             }
         });
+
+        self.background_tasks
+            .lock()
+            .extend([flush_task, compaction_task]);
     }
 
     /// Clone engine state for background tasks
     fn clone_for_background(&self) -> BackgroundEngine {
         BackgroundEngine {
             wal: self.wal.clone(),
+            directory_lock: Arc::downgrade(&self.directory_lock),
             memtable_manager: self.memtable_manager.clone(),
             sstables: self.sstables.clone(),
             manifest: self.manifest.clone(),
@@ -1138,8 +1205,18 @@ impl Engine {
     }
 }
 
+impl Drop for Engine {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        for handle in self.background_tasks.get_mut().drain(..) {
+            handle.abort();
+        }
+    }
+}
+
 /// Clone of engine state for background tasks
 struct BackgroundEngine {
+    directory_lock: std::sync::Weak<DirectoryLock>,
     memtable_manager: Arc<MemTableManager>,
     sstables: Arc<RwLock<Vec<SSTableInfo>>>,
     manifest: Arc<Mutex<Manifest>>,
@@ -1163,6 +1240,9 @@ struct BackgroundEngine {
 
 impl BackgroundEngine {
     async fn background_flush(&self) -> Result<()> {
+        let Some(_directory_lock) = self.directory_lock.upgrade() else {
+            return Ok(());
+        };
         let _flush = self.flush_lock.lock().await;
         while let Some(memtable) = self.memtable_manager.peek_immutable_for_flush() {
             self.flush_memtable_to_sstable(&memtable).await?;
@@ -1177,6 +1257,9 @@ impl BackgroundEngine {
     }
 
     async fn compact(&self) -> Result<CompactionResult> {
+        let Some(_directory_lock) = self.directory_lock.upgrade() else {
+            return Ok(CompactionResult::default());
+        };
         let _in_progress = InProgressGuard::new(Arc::clone(&self.compactions_in_progress));
         let sstables = self.sstables.read().await;
         let manifest_entries: Vec<SSTableManifestEntry> = sstables
@@ -1743,23 +1826,6 @@ impl Drop for PendingWalApplication<'_> {
     }
 }
 
-struct InProgressGuard {
-    counter: Arc<AtomicU64>,
-}
-
-impl InProgressGuard {
-    fn new(counter: Arc<AtomicU64>) -> Self {
-        counter.fetch_add(1, Ordering::AcqRel);
-        Self { counter }
-    }
-}
-
-impl Drop for InProgressGuard {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 fn wal_data_entry_size(key: &[u8], value: &[u8]) -> u64 {
     const WAL_ENTRY_HEADER_SIZE: usize = 32;
     (WAL_ENTRY_HEADER_SIZE + 4 + key.len() + value.len()) as u64
@@ -2275,6 +2341,61 @@ mod tests {
             engine.get(b"blocked:key").await.unwrap(),
             Some(b"new".to_vec())
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_group_commit_retains_directory_ownership_after_engine_drop() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), true);
+        config.wal_config = WalConfig::paranoid();
+        let engine = Arc::new(Engine::open(config.clone()).await.unwrap());
+        let wal = Arc::clone(engine.wal.as_ref().unwrap());
+
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_wal = Arc::clone(&wal);
+        let lock_holder = tokio::task::spawn_blocking(move || {
+            let file_guard = lock_wal.lock_current_file_for_test();
+            let _ = locked_tx.send(());
+            release_rx.recv().unwrap();
+            drop(file_guard);
+        });
+        locked_rx.await.unwrap();
+
+        let queued_engine = Arc::clone(&engine);
+        let queued =
+            tokio::spawn(async move { queued_engine.insert(b"cancelled:key", b"value").await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while wal.group_commit_in_progress_for_test() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued group commit did not start");
+
+        queued.abort();
+        assert!(queued.await.unwrap_err().is_cancelled());
+        drop(engine);
+
+        let error = match Engine::open(config.clone()).await {
+            Err(error) => error,
+            Ok(_) => panic!("queued WAL mutation unexpectedly released directory ownership"),
+        };
+        assert!(matches!(error, StorageError::DirectoryLocked { .. }));
+
+        release_tx.send(()).unwrap();
+        lock_holder.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while wal.group_commit_in_progress_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued group commit did not finish");
+        drop(wal);
+
+        let reopened = Engine::open(config).await.unwrap();
+        reopened.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

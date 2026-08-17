@@ -30,12 +30,13 @@
 //! # }
 //! ```
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::types::Compression;
 use crate::core::{DbConfig, WriteBatch};
 
+use super::directory_lock::LOCKED_DIRECTORY_GUIDANCE;
 use super::engine::{Engine, StorageConfig, StorageError};
 use super::sstable::CompressionType;
 
@@ -48,14 +49,30 @@ pub enum DbError {
     #[error("Invalid database options: {0}")]
     InvalidOptions(String),
 
+    #[error(
+        "database directory is already open for exclusive access: {}; {guidance}",
+        path.display(),
+        guidance = LOCKED_DIRECTORY_GUIDANCE
+    )]
+    DirectoryLocked { path: PathBuf },
+
     #[error("Storage error: {0}")]
-    Storage(#[from] StorageError),
+    Storage(#[source] StorageError),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
     #[error("Database error: {0}")]
     Other(String),
+}
+
+impl From<StorageError> for DbError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::DirectoryLocked { path } => Self::DirectoryLocked { path },
+            error => Self::Storage(error),
+        }
+    }
 }
 
 /// Configuration options for the database.
@@ -185,6 +202,14 @@ impl DbOptions {
 /// failed batch is not partially published, but its complete WAL envelope may
 /// be recovered after reopen if failure occurred after the durable append. A
 /// failed [`Db::close`] consumes the handle and does not promise persistence.
+///
+/// # Exclusive directory ownership
+///
+/// Each database owns an exclusive advisory lock on its canonicalized data
+/// directory. Opening the same directory through another [`Db`] or [`Engine`],
+/// in this process or another process, returns [`DbError::DirectoryLocked`].
+/// Shared multi-writer access is unsupported. The lock is retained while this
+/// database and any of its active background mutations exist.
 pub struct Db {
     engine: Arc<Engine>,
 }
@@ -192,7 +217,8 @@ pub struct Db {
 impl Db {
     /// Open a database at the given path with default options
     ///
-    /// Creates the directory if it doesn't exist.
+    /// Creates the directory if it doesn't exist and then acquires exclusive
+    /// ownership before opening mutable database state.
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open_with_options(path, DbOptions::default()).await
     }
@@ -200,7 +226,8 @@ impl Db {
     /// Open a database with custom options.
     ///
     /// Returns [`DbError::InvalidOptions`] before creating database files when
-    /// the requested durability combination is contradictory.
+    /// the requested durability combination is contradictory. Returns
+    /// [`DbError::DirectoryLocked`] if another database owns the directory.
     pub async fn open_with_options<P: AsRef<Path>>(path: P, options: DbOptions) -> Result<Self> {
         if options.sync_writes && !options.wal_enabled {
             return Err(DbError::InvalidOptions(
@@ -385,9 +412,10 @@ impl Db {
     /// Close the database cleanly after persisting pending writes.
     ///
     /// This consumes the database handle. Success means buffered writes have
-    /// been flushed to the storage engine and its background tasks have been
-    /// asked to stop. Dropping a [`Db`] does not provide this clean-close
-    /// guarantee; call `close` when pending writes must be persisted.
+    /// been flushed, background tasks have stopped, and the directory lock has
+    /// been released as this handle is dropped. Dropping a [`Db`] does not
+    /// provide the persistence guarantee; call `close` when pending writes must
+    /// be persisted.
     pub async fn close(self) -> Result<()> {
         self.engine.shutdown().await?;
         Ok(())

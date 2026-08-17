@@ -6,6 +6,10 @@
 //! benchmark-heavy workloads and durable mode using a WAL for crash recovery.
 //! See the [`optimizations`] module for implementation notes.
 //!
+//! A TurboKV database exclusively owns its canonicalized data directory while
+//! open. Shared multi-writer access, whether from the same process or another
+//! process, is unsupported and rejected with [`DbError::DirectoryLocked`].
+//!
 //! ## Quick Start
 //!
 //! ```rust,no_run

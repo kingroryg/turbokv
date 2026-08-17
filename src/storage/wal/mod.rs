@@ -34,7 +34,7 @@ use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -42,6 +42,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
 use crate::core::crypto::crc32_checksum;
+use crate::storage::{directory_lock::DirectoryLock, InProgressGuard};
 use file::{
     create_file, entry_size, finalize_header, inspect_segment, open_recovered_file,
     read_and_validate_header, read_entry_versioned, synchronize_segment_header,
@@ -80,10 +81,28 @@ pub struct WriteAheadLog {
     /// Atomic batch spans used to keep durable checkpoints on batch boundaries.
     batch_ranges: Arc<RwLock<BTreeMap<u64, u64>>>,
     write_tx: mpsc::Sender<WriteRequest>,
+    #[allow(dead_code)]
+    group_commit_in_progress: Arc<AtomicU64>,
 }
 
 impl WriteAheadLog {
     pub async fn new(wal_dir: impl AsRef<Path>, config: WalConfig) -> Result<Self> {
+        Self::new_inner(wal_dir, config, None).await
+    }
+
+    pub(crate) async fn new_with_directory_lock(
+        wal_dir: impl AsRef<Path>,
+        config: WalConfig,
+        directory_lock: Weak<DirectoryLock>,
+    ) -> Result<Self> {
+        Self::new_inner(wal_dir, config, Some(directory_lock)).await
+    }
+
+    async fn new_inner(
+        wal_dir: impl AsRef<Path>,
+        config: WalConfig,
+        directory_lock: Option<Weak<DirectoryLock>>,
+    ) -> Result<Self> {
         let wal_dir = wal_dir.as_ref().to_path_buf();
         tokio::fs::create_dir_all(&wal_dir)
             .await
@@ -100,8 +119,18 @@ impl WriteAheadLog {
         let bg_file = Arc::clone(&current_file);
         let bg_config = config.clone();
         let bg_dir = wal_dir.clone();
+        let group_commit_in_progress = Arc::new(AtomicU64::new(0));
+        let bg_group_commit_in_progress = Arc::clone(&group_commit_in_progress);
         tokio::spawn(async move {
-            Self::group_commit_loop(write_rx, bg_file, bg_config, bg_dir).await;
+            Self::group_commit_loop(
+                write_rx,
+                bg_file,
+                bg_config,
+                bg_dir,
+                directory_lock,
+                bg_group_commit_in_progress,
+            )
+            .await;
         });
 
         Ok(Self {
@@ -111,6 +140,7 @@ impl WriteAheadLog {
             sequence: Arc::new(AtomicU64::new(sequence)),
             batch_ranges: Arc::new(RwLock::new(batch_ranges)),
             write_tx,
+            group_commit_in_progress,
         })
     }
 
@@ -469,6 +499,11 @@ impl WriteAheadLog {
         self.current_file.write()
     }
 
+    #[cfg(test)]
+    pub(crate) fn group_commit_in_progress_for_test(&self) -> u64 {
+        self.group_commit_in_progress.load(Ordering::Acquire)
+    }
+
     // ========================================
     // Private methods
     // ========================================
@@ -560,6 +595,8 @@ impl WriteAheadLog {
         current_file: Arc<RwLock<WalFile>>,
         config: WalConfig,
         wal_dir: PathBuf,
+        directory_lock: Option<Weak<DirectoryLock>>,
+        group_commit_in_progress: Arc<AtomicU64>,
     ) {
         // Adaptive group commit: no artificial delay for single writers,
         // but batches concurrent writers efficiently.
@@ -600,6 +637,18 @@ impl WriteAheadLog {
                     }
                 }
             }
+
+            // Engine-owned WALs may outlive a cancelled append future. Do not
+            // mutate after the Engine's directory ownership has ended; if a
+            // mutation already started, retain ownership through its response.
+            let _directory_lock = match directory_lock.as_ref() {
+                Some(directory_lock) => match directory_lock.upgrade() {
+                    Some(directory_lock) => Some(directory_lock),
+                    None => break,
+                },
+                None => None,
+            };
+            let _in_progress = InProgressGuard::new(Arc::clone(&group_commit_in_progress));
 
             let result = write_batch_sync(&current_file, &batch, &config, &wal_dir);
             let ok = result.is_ok();
