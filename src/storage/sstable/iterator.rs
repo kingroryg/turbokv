@@ -1,10 +1,10 @@
 //! SSTable iterator implementation
 
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::sync::Arc;
 
-use byteorder::{LittleEndian, ReadBytesExt};
 use bytes::Bytes;
 
+use super::codec::{data_end, decode_entry_ref, parse_block_offsets, SSTableEntryRef};
 use super::reader::SSTableEntry;
 use super::SSTableReader;
 use crate::core::error::Result;
@@ -12,11 +12,17 @@ use crate::core::error::Result;
 /// Iterator over SSTable entries
 pub struct SSTableIterator<'a> {
     reader: &'a SSTableReader,
+    cursor: SSTableCursorState,
+}
+
+/// Block traversal state shared by borrowed and reader-owning cursors.
+struct SSTableCursorState {
     current_block_idx: usize,
-    current_block_data: Option<Vec<u8>>,
-    current_block_position: usize,
-    current_block_entries: Vec<u32>, // key_offset
+    current_block_data: Option<Bytes>,
+    current_block_entries: Vec<u32>,
+    current_data_end: usize,
     current_entry_idx: usize,
+    failed: bool,
 }
 
 impl<'a> SSTableIterator<'a> {
@@ -24,71 +30,47 @@ impl<'a> SSTableIterator<'a> {
     pub(crate) fn new(reader: &'a SSTableReader) -> Self {
         Self {
             reader,
-            current_block_idx: 0,
-            current_block_data: None,
-            current_block_position: 0,
-            current_block_entries: Vec::new(),
-            current_entry_idx: 0,
+            cursor: SSTableCursorState::new(0),
         }
     }
 
-    /// Load next block
-    fn load_next_block(&mut self) -> Result<bool> {
-        let index_entries = self.reader.index().entries();
+    /// Advance while preserving tombstones and sequence metadata.
+    pub(crate) fn next_versioned(&mut self) -> Option<Result<(Bytes, SSTableEntry)>> {
+        self.cursor
+            .next_versioned_ref(self.reader)
+            .map(|entry| entry.map(|(key, entry)| (key, entry.into_entry())))
+    }
+}
 
+impl SSTableCursorState {
+    fn new(current_block_idx: usize) -> Self {
+        Self {
+            current_block_idx,
+            current_block_data: None,
+            current_block_entries: Vec::new(),
+            current_data_end: 0,
+            current_entry_idx: 0,
+            failed: false,
+        }
+    }
+
+    fn load_next_block(&mut self, reader: &SSTableReader) -> Result<bool> {
+        let index_entries = reader.index().entries();
         if self.current_block_idx >= index_entries.len() {
             return Ok(false);
         }
 
         let entry = &index_entries[self.current_block_idx];
-        let block_data = self
-            .reader
-            .read_block(entry.block_offset, entry.block_size)?;
-
-        // Parse block structure to get entry offsets
-        self.parse_block_structure(&block_data)?;
-
+        let block_data = reader.read_block_shared(entry.block_offset, entry.block_size)?;
+        self.current_block_entries = parse_block_offsets(&block_data)?;
+        self.current_data_end = data_end(block_data.len(), self.current_block_entries.len())?;
         self.current_block_data = Some(block_data);
-        self.current_block_position = 0;
         self.current_entry_idx = 0;
         self.current_block_idx += 1;
-
         Ok(true)
     }
 
-    /// Parse block structure to extract entry offsets
-    fn parse_block_structure(&mut self, block_data: &[u8]) -> Result<()> {
-        self.current_block_entries.clear();
-
-        let data_len = block_data.len();
-        if data_len < 4 {
-            return Ok(());
-        }
-
-        // Read number of entries from the end
-        let mut cursor = Cursor::new(block_data);
-        cursor.seek(SeekFrom::End(-4))?;
-        let entry_count = cursor.read_u32::<LittleEndian>()? as usize;
-
-        // Read offsets
-        let offsets_start = data_len - 4 - (entry_count * 4);
-        cursor.seek(SeekFrom::Start(offsets_start as u64))?;
-
-        let mut offsets = Vec::with_capacity(entry_count);
-        for _ in 0..entry_count {
-            offsets.push(cursor.read_u32::<LittleEndian>()?);
-        }
-
-        // Store key offsets
-        for i in 0..entry_count {
-            self.current_block_entries.push(offsets[i]);
-        }
-
-        Ok(())
-    }
-
-    /// Read next key-value pair from current block
-    fn read_next_entry(&mut self) -> Result<Option<(Bytes, SSTableEntry)>> {
+    fn read_next_entry(&mut self, format_version: u32) -> Result<Option<(Bytes, SSTableEntryRef)>> {
         if self.current_entry_idx >= self.current_block_entries.len() {
             return Ok(None);
         }
@@ -96,41 +78,82 @@ impl<'a> SSTableIterator<'a> {
         let Some(block_data) = self.current_block_data.as_ref() else {
             return Ok(None);
         };
-        let key_offset = self.current_block_entries[self.current_entry_idx];
-
-        let mut cursor = Cursor::new(block_data.as_slice());
-
-        // Read key
-        cursor.seek(SeekFrom::Start(key_offset as u64))?;
-        let key_len = cursor.read_u32::<LittleEndian>()? as usize;
-        let mut key = vec![0u8; key_len];
-        cursor.read_exact(&mut key)?;
-
-        // Read value - no need to seek, we're already positioned after the key
-        let entry = self.reader.read_entry_value(&mut cursor)?;
-
+        let key_offset = self.current_block_entries[self.current_entry_idx] as usize;
+        let entry_end = self
+            .current_block_entries
+            .get(self.current_entry_idx + 1)
+            .map_or(self.current_data_end, |offset| *offset as usize);
+        // An error belongs to this physical entry. Advance first so callers can
+        // never observe the same error forever.
         self.current_entry_idx += 1;
 
-        Ok(Some((Bytes::from(key), entry)))
+        decode_entry_ref(format_version, block_data.clone(), key_offset, entry_end).map(Some)
     }
 
-    /// Advance while preserving tombstones and sequence metadata.
-    pub(crate) fn next_versioned(&mut self) -> Option<Result<(Bytes, SSTableEntry)>> {
+    fn next_versioned_ref(
+        &mut self,
+        reader: &SSTableReader,
+    ) -> Option<Result<(Bytes, SSTableEntryRef)>> {
+        if self.failed {
+            return None;
+        }
         loop {
             if self.current_block_data.is_some() {
-                match self.read_next_entry() {
+                match self.read_next_entry(reader.format_version()) {
                     Ok(Some(entry)) => return Some(Ok(entry)),
                     Ok(None) => self.current_block_data = None,
-                    Err(error) => return Some(Err(error)),
+                    Err(error) => {
+                        self.failed = true;
+                        self.current_block_data = None;
+                        return Some(Err(error));
+                    }
                 }
             }
 
-            match self.load_next_block() {
+            match self.load_next_block(reader) {
                 Ok(true) => continue,
                 Ok(false) => return None,
-                Err(error) => return Some(Err(error)),
+                Err(error) => {
+                    self.failed = true;
+                    self.current_block_data = None;
+                    return Some(Err(error));
+                }
             }
         }
+    }
+}
+
+impl std::iter::FusedIterator for SSTableIterator<'_> {}
+
+/// An owned, seekable SSTable cursor used by database scans.
+///
+/// The cursor retains its reader independently of the live SSTable list, so a
+/// compaction may unlink an input after source capture without invalidating an
+/// in-progress scan.
+pub(crate) struct SSTableRangeCursor {
+    reader: Arc<SSTableReader>,
+    cursor: SSTableCursorState,
+}
+
+impl SSTableRangeCursor {
+    pub(crate) fn new(reader: Arc<SSTableReader>, start: &[u8]) -> Self {
+        let current_block_idx = reader
+            .index()
+            .entries()
+            .partition_point(|entry| entry.last_key.as_ref() < start);
+        Self {
+            reader,
+            cursor: SSTableCursorState::new(current_block_idx),
+        }
+    }
+
+    pub(crate) fn next_versioned_ref(&mut self) -> Option<Result<(Bytes, SSTableEntryRef)>> {
+        self.cursor.next_versioned_ref(&self.reader)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_block(&self) -> Option<&Bytes> {
+        self.cursor.current_block_data.as_ref()
     }
 }
 
@@ -140,5 +163,102 @@ impl<'a> Iterator for SSTableIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         self.next_versioned()
             .map(|entry| entry.map(|(key, entry)| (key, entry.value.into_option())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::storage::sstable::{BlockBuilder, CompressionType, SSTableConfig, SSTableWriter};
+
+    #[test]
+    fn hostile_entry_count_is_rejected_without_arithmetic_overflow() {
+        let mut block = vec![0_u8; 8];
+        block[4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_block_offsets(&block).is_err());
+    }
+
+    #[test]
+    fn entry_length_cannot_consume_the_following_entry() {
+        let mut builder = BlockBuilder::new(1024);
+        assert!(builder.add_versioned(b"a", Some(b"one"), 1));
+        assert!(builder.add_versioned(b"b", Some(b"two"), 2));
+        let mut block = builder.finish();
+        let offsets = parse_block_offsets(&block).unwrap();
+        // [key length][a][sequence][marker] precede the first value length.
+        block[14..18].copy_from_slice(&100_u32.to_le_bytes());
+        let block = Bytes::from(block);
+
+        let error = decode_entry_ref(
+            super::super::types::SSTABLE_VERSION,
+            block,
+            offsets[0] as usize,
+            offsets[1] as usize,
+        )
+        .err()
+        .expect("cross-entry value length must be rejected");
+        assert!(error.to_string().contains("value length"));
+    }
+
+    #[test]
+    fn shortened_value_length_cannot_hide_trailing_entry_bytes() {
+        let mut builder = BlockBuilder::new(1024);
+        assert!(builder.add_versioned(b"a", Some(b"one"), 1));
+        assert!(builder.add_versioned(b"b", Some(b"two"), 2));
+        let mut block = builder.finish();
+        let offsets = parse_block_offsets(&block).unwrap();
+        block[14..18].copy_from_slice(&1_u32.to_le_bytes());
+        let block = Bytes::from(block);
+
+        let error = decode_entry_ref(
+            super::super::types::SSTABLE_VERSION,
+            block,
+            offsets[0] as usize,
+            offsets[1] as usize,
+        )
+        .err()
+        .expect("trailing bytes must be rejected");
+        assert!(error.to_string().contains("trailing bytes"));
+    }
+
+    #[test]
+    fn borrowed_iterator_reports_a_late_block_error_once_then_fuses() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("corrupt.sst");
+        let mut writer = SSTableWriter::new(
+            &path,
+            SSTableConfig {
+                compression: CompressionType::None,
+                ..SSTableConfig::default()
+            },
+        )
+        .unwrap();
+        writer.add_versioned(b"key", Some(b"value"), 1).unwrap();
+        writer.finish().unwrap();
+
+        let reader = SSTableReader::open(&path).unwrap();
+        let offset = reader.index().entries()[0].block_offset;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x80;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+
+        let mut iterator = reader.iter();
+        assert!(iterator.next().unwrap().is_err());
+        assert!(iterator.next().is_none());
+        assert!(iterator.next().is_none());
     }
 }

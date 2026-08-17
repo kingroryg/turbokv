@@ -24,6 +24,7 @@ use tracing::info;
 
 use super::table::{MemTable, MemTableError, Result};
 use super::types::{MemTableConfig, MemTableEntry, MemTableManagerStats};
+use crate::storage::version::VersionOrder;
 
 /// Thread-local write buffer size (number of entries before flush to main memtable)
 const THREAD_LOCAL_BUFFER_SIZE: usize = 64;
@@ -340,18 +341,25 @@ impl MemTableManager {
 
     /// Get the raw entry (including tombstones) for compaction
     pub fn get_entry(&self, key: &[u8]) -> Option<MemTableEntry> {
-        let mut newest = self.active.read().get_entry(key);
-        for table in self.immutable.read().iter() {
+        // Active-first capture closes the rotation handoff: if rotation happens
+        // before this read, the immutable pass sees the old table; if it
+        // happens after, this candidate already retains the entry.
+        let mut newest = self
+            .active
+            .read()
+            .get_entry(key)
+            .map(|entry| (entry, u64::MAX));
+        for (generation_rank, table) in self.immutable.read().iter().enumerate() {
             if let Some(entry) = table.get_entry(key) {
-                if newest
-                    .as_ref()
-                    .map_or(true, |current| entry.sequence > current.sequence)
-                {
-                    newest = Some(entry);
+                let generation_rank = generation_rank as u64;
+                if newest.as_ref().map_or(true, |(current, current_rank)| {
+                    memory_entry_is_newer(&entry, generation_rank, current, *current_rank)
+                }) {
+                    newest = Some((entry, generation_rank));
                 }
             }
         }
-        newest
+        newest.map(|(entry, _)| entry)
     }
 
     /// Scan a range of keys across all memtables
@@ -378,6 +386,15 @@ impl MemTableManager {
     /// Scan a prefix while retaining sequence numbers and tombstones.
     pub(crate) fn scan_prefix_entries(&self, prefix: &[u8]) -> Vec<(Vec<u8>, MemTableEntry)> {
         self.merge_entries(|key| key.starts_with(prefix))
+    }
+
+    /// Retain the current immutable read view for a streaming scan.
+    ///
+    /// The caller must first exclude mutations and rotate the active table.
+    /// Cloned handles remain valid after a concurrent flush removes a table
+    /// from the manager's live list.
+    pub(crate) fn snapshot_immutable_tables(&self) -> Vec<Arc<MemTable>> {
+        self.immutable.read().clone()
     }
 
     /// Rotate the active memtable to immutable
@@ -531,24 +548,31 @@ impl MemTableManager {
     fn merge_entries(&self, include: impl Fn(&[u8]) -> bool) -> Vec<(Vec<u8>, MemTableEntry)> {
         use std::collections::BTreeMap;
 
-        let mut merged: BTreeMap<Vec<u8>, MemTableEntry> = BTreeMap::new();
-        let mut merge_table = |table: &MemTable| {
+        // Capture active before immutable for the same rotation-handoff reason
+        // as point reads. Arc retention keeps either physical side valid.
+        let active = self.active.read().clone();
+        let immutable = self.immutable.read().clone();
+        let mut merged: BTreeMap<Vec<u8>, (MemTableEntry, u64)> = BTreeMap::new();
+        let mut merge_table = |table: &MemTable, generation_rank: u64| {
             for (key, entry) in table.get_all_entries() {
                 if include(&key)
-                    && merged
-                        .get(&key)
-                        .map_or(true, |current| entry.sequence > current.sequence)
+                    && merged.get(&key).map_or(true, |(current, current_rank)| {
+                        memory_entry_is_newer(&entry, generation_rank, current, *current_rank)
+                    })
                 {
-                    merged.insert(key, entry);
+                    merged.insert(key, (entry, generation_rank));
                 }
             }
         };
 
-        for table in self.immutable.read().iter() {
-            merge_table(table);
+        for (generation_rank, table) in immutable.iter().enumerate() {
+            merge_table(table, generation_rank as u64);
         }
-        merge_table(&self.active.read());
-        merged.into_iter().collect()
+        merge_table(&active, u64::MAX);
+        merged
+            .into_iter()
+            .map(|(key, (entry, _))| (key, entry))
+            .collect()
     }
 
     /// Get statistics for all memtables
@@ -583,6 +607,16 @@ impl MemTableManager {
 
         Ok(())
     }
+}
+
+fn memory_entry_is_newer(
+    candidate: &MemTableEntry,
+    candidate_rank: u64,
+    current: &MemTableEntry,
+    current_rank: u64,
+) -> bool {
+    VersionOrder::memory(candidate.sequence, candidate_rank)
+        > VersionOrder::memory(current.sequence, current_rank)
 }
 
 impl Drop for MemTableManager {

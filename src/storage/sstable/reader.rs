@@ -12,6 +12,7 @@ use bytes::Bytes;
 use memmap2::{Mmap, MmapOptions};
 
 use super::super::cache::{BlockCache, CacheKey};
+use super::codec::{data_end, decode_entry_ref, parse_block_offsets};
 use super::types::{SSTABLE_VERSION_V1, SSTABLE_VERSION_V2};
 use super::{
     decompress_block, BloomFilter, CompressionType, SSTableIterator, FOOTER_SIZE, SSTABLE_MAGIC,
@@ -233,26 +234,44 @@ impl SSTableReader {
         };
 
         // Read and decompress block
-        let block_data = self.read_block(block_info.offset, block_info.size)?;
+        let block_data = self.read_block_shared(block_info.offset, block_info.size)?;
 
         // Search within block
         self.search_block_entry(&block_data, key)
     }
 
-    /// Read and decompress a block (with cache)
-    pub(crate) fn read_block(&self, offset: u64, size: u32) -> Result<Vec<u8>> {
+    /// Read and decompress a block into shared storage.
+    ///
+    /// Cache hits clone only a `Bytes` handle. On a miss, the decompressor's
+    /// output allocation becomes the cached block without another full copy.
+    pub(crate) fn read_block_shared(&self, offset: u64, size: u32) -> Result<Bytes> {
+        if size < 5 {
+            return Err(Error::SSTable {
+                message: "Block size is smaller than its footer".to_string(),
+                source: None,
+            });
+        }
         let cache_key = CacheKey::new(self.file_id, offset);
 
         // Check cache first
         if let Some(ref cache) = self.cache {
             if let Some(cached) = cache.get(&cache_key) {
-                return Ok(cached.to_vec());
+                return Ok(cached);
             }
         }
 
         // Cache miss - read from mmap
-        let block_end = offset + size as u64 - 5; // -5 for footer
-        let footer_end = (block_end + 5) as usize;
+        let footer_end_u64 = offset
+            .checked_add(u64::from(size))
+            .ok_or_else(|| Error::SSTable {
+                message: "Block offset/size overflow".to_string(),
+                source: None,
+            })?;
+        let block_end = footer_end_u64 - 5;
+        let footer_end = usize::try_from(footer_end_u64).map_err(|_| Error::SSTable {
+            message: "Block offset/size cannot be represented in memory".to_string(),
+            source: None,
+        })?;
         if footer_end > self.mmap.len() {
             return Err(Error::SSTable {
                 message: format!(
@@ -279,11 +298,11 @@ impl SSTableReader {
         }
 
         // Decompress
-        let decompressed = decompress_block(block_data, compression)?;
+        let decompressed = Bytes::from(decompress_block(block_data, compression)?);
 
         // Store in cache
         if let Some(ref cache) = self.cache {
-            cache.insert(cache_key, Bytes::copy_from_slice(&decompressed));
+            cache.insert(cache_key, decompressed.clone());
         }
 
         Ok(decompressed)
@@ -292,47 +311,31 @@ impl SSTableReader {
     /// Search for key within a block
     fn search_block_entry(
         &self,
-        block_data: &[u8],
+        block_data: &Bytes,
         target_key: &[u8],
     ) -> Result<Option<SSTableEntry>> {
-        let mut cursor = Cursor::new(block_data);
-
-        // First, read the footer to get entry count and offsets
-        let data_len = block_data.len();
-        if data_len < 4 {
-            return Ok(None);
-        }
-
-        // Read number of entries from the end
-        cursor.seek(SeekFrom::End(-4))?;
-        let entry_count = cursor.read_u32::<LittleEndian>()? as usize;
-
-        // Read offsets
-        let offsets_start = data_len - 4 - (entry_count * 4);
-        cursor.seek(SeekFrom::Start(offsets_start as u64))?;
-
-        let mut offsets = Vec::with_capacity(entry_count);
-        for _ in 0..entry_count {
-            offsets.push(cursor.read_u32::<LittleEndian>()?);
-        }
+        let offsets = parse_block_offsets(block_data)?;
+        let block_data_end = data_end(block_data.len(), offsets.len())?;
 
         // Binary search through entries
         let mut left = 0;
-        let mut right = entry_count;
+        let mut right = offsets.len();
 
         while left < right {
             let mid = left + (right - left) / 2;
-            cursor.seek(SeekFrom::Start(offsets[mid] as u64))?;
+            let entry_end = offsets
+                .get(mid + 1)
+                .map_or(block_data_end, |offset| *offset as usize);
+            let (key, entry) = decode_entry_ref(
+                self.format_version,
+                block_data.clone(),
+                offsets[mid] as usize,
+                entry_end,
+            )?;
 
-            // Read key at mid position
-            let key_len = cursor.read_u32::<LittleEndian>()? as usize;
-            let mut key = vec![0u8; key_len];
-            cursor.read_exact(&mut key)?;
-
-            match key.as_slice().cmp(target_key) {
+            match key.as_ref().cmp(target_key) {
                 std::cmp::Ordering::Equal => {
-                    // Found it, read value
-                    return self.read_entry_value(&mut cursor).map(Some);
+                    return Ok(Some(entry.into_entry()));
                 }
                 std::cmp::Ordering::Less => left = mid + 1,
                 std::cmp::Ordering::Greater => right = mid,
@@ -340,48 +343,6 @@ impl SSTableReader {
         }
 
         Ok(None)
-    }
-
-    pub(crate) fn read_entry_value(&self, cursor: &mut Cursor<&[u8]>) -> Result<SSTableEntry> {
-        if self.format_version == SSTABLE_VERSION_V1 {
-            let value_len = cursor.read_u32::<LittleEndian>()? as usize;
-            let mut value = vec![0u8; value_len];
-            cursor.read_exact(&mut value)?;
-            return Ok(SSTableEntry {
-                sequence: None,
-                value: if value.is_empty() {
-                    SSTableValue::Tombstone
-                } else {
-                    SSTableValue::Value(Bytes::from(value))
-                },
-            });
-        }
-
-        let sequence = if self.format_version >= SSTABLE_VERSION {
-            Some(cursor.read_u64::<LittleEndian>()?)
-        } else {
-            None
-        };
-
-        let marker = cursor.read_u8()?;
-        let value_len = cursor.read_u32::<LittleEndian>()? as usize;
-        let mut value = vec![0u8; value_len];
-        cursor.read_exact(&mut value)?;
-
-        match marker {
-            0 => Ok(SSTableEntry {
-                sequence,
-                value: SSTableValue::Tombstone,
-            }),
-            1 => Ok(SSTableEntry {
-                sequence,
-                value: SSTableValue::Value(Bytes::from(value)),
-            }),
-            other => Err(Error::SSTable {
-                message: format!("Invalid SSTable value marker: {}", other),
-                source: None,
-            }),
-        }
     }
 
     /// Create iterator over all entries
@@ -392,6 +353,10 @@ impl SSTableReader {
     /// Get reference to index
     pub(crate) fn index(&self) -> &SSTableIndex {
         &self.index
+    }
+
+    pub(crate) fn format_version(&self) -> u32 {
+        self.format_version
     }
 
     /// Deserialize bloom filter from raw data
@@ -476,7 +441,11 @@ impl SSTableIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
     use super::*;
+    use crate::storage::cache::BlockCache;
     use crate::storage::sstable::{CompressionType, SSTableConfig, SSTableWriter};
     use tempfile::TempDir;
 
@@ -525,5 +494,86 @@ mod tests {
         let removed = reader.get_entry(b"removed").unwrap().unwrap();
         assert_eq!(removed.sequence, None);
         assert!(matches!(removed.value, SSTableValue::Tombstone));
+    }
+
+    #[test]
+    fn shared_block_cache_hits_reuse_the_decompressed_allocation() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("cached.sst");
+        let mut writer = SSTableWriter::new(&path, uncompressed_config()).unwrap();
+        writer.add_versioned(b"key", Some(b"value"), 1).unwrap();
+        writer.finish().unwrap();
+
+        let cache = Arc::new(BlockCache::new(1024 * 1024));
+        let reader = SSTableReader::open_with_cache(path, Arc::clone(&cache)).unwrap();
+        let index = &reader.index().entries()[0];
+        let first = reader
+            .read_block_shared(index.block_offset, index.block_size)
+            .unwrap();
+        let second = reader
+            .read_block_shared(index.block_offset, index.block_size)
+            .unwrap();
+
+        assert_eq!(first.as_ptr(), second.as_ptr());
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    fn mutate_first_uncompressed_block(path: &Path, mutate: impl FnOnce(&mut [u8])) {
+        let reader = SSTableReader::open(path).unwrap();
+        let index = reader.index().entries()[0].clone();
+        drop(reader);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(index.block_offset)).unwrap();
+        let mut bytes = vec![0_u8; index.block_size as usize];
+        file.read_exact(&mut bytes).unwrap();
+        let data_end = bytes.len() - 5;
+        mutate(&mut bytes[..data_end]);
+        let checksum = crc32fast::hash(&bytes[..data_end]);
+        bytes[data_end + 1..data_end + 5].copy_from_slice(&checksum.to_le_bytes());
+        file.seek(SeekFrom::Start(index.block_offset)).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn point_and_iterator_reject_the_same_cross_entry_value_length() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("cross-entry.sst");
+        let mut writer = SSTableWriter::new(&path, uncompressed_config()).unwrap();
+        writer.add_versioned(b"a", Some(b"one"), 1).unwrap();
+        writer.add_versioned(b"b", Some(b"two"), 2).unwrap();
+        writer.finish().unwrap();
+
+        mutate_first_uncompressed_block(&path, |block| {
+            block[14..18].copy_from_slice(&100_u32.to_le_bytes());
+        });
+        let reader = SSTableReader::open(path).unwrap();
+        let point_error = reader.get_entry(b"a").unwrap_err().to_string();
+        let iteration_error = reader.iter().next().unwrap().unwrap_err().to_string();
+
+        assert_eq!(point_error, iteration_error);
+        assert!(point_error.contains("value length"));
+    }
+
+    #[test]
+    fn point_and_iterator_reject_the_same_nonzero_tombstone_length() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("invalid-tombstone.sst");
+        let mut writer = SSTableWriter::new(&path, uncompressed_config()).unwrap();
+        writer.add_versioned(b"a", Some(b"one"), 1).unwrap();
+        writer.finish().unwrap();
+
+        mutate_first_uncompressed_block(&path, |block| block[13] = 0);
+        let reader = SSTableReader::open(path).unwrap();
+        let point_error = reader.get_entry(b"a").unwrap_err().to_string();
+        let iteration_error = reader.iter().next().unwrap().unwrap_err().to_string();
+
+        assert_eq!(point_error, iteration_error);
+        assert!(point_error.contains("tombstone"));
     }
 }

@@ -17,6 +17,7 @@ use crossbeam_skiplist::SkipMap;
 use tracing::info;
 
 use super::types::{MemTableConfig, MemTableEntry, MemTableStats};
+use crate::storage::prefix_upper_bound;
 
 /// Result type for MemTable operations
 pub type Result<T> = std::result::Result<T, MemTableError>;
@@ -404,13 +405,6 @@ impl MemTable {
     pub fn is_empty(&self) -> bool {
         self.entry_count.load(Ordering::Relaxed) == 0
     }
-}
-
-fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-    let last_incrementable = prefix.iter().rposition(|byte| *byte != u8::MAX)?;
-    let mut end = prefix[..=last_incrementable].to_vec();
-    end[last_incrementable] += 1;
-    Some(end)
 }
 
 #[cfg(test)]
