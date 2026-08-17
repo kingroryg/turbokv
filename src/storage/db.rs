@@ -161,17 +161,14 @@ impl DbOptions {
 /// Range and prefix results are ordered lexicographically by raw key bytes.
 /// Operations supplied to one bulk or batch call are applied in iterator order,
 /// so the last operation for a duplicate key determines the state observed
-/// immediately after success, subject to the limitations below.
+/// immediately after success.
 ///
-/// Fast mode currently buffers individual inserts. Mixing buffered inserts
-/// with deletes, batches, or bulk inserts does not yet guarantee program order;
-/// a later direct mutation can be overtaken when the older insert buffer is
-/// drained.
-///
-/// Point, range, and prefix reads in this version can expose an older SSTable
-/// value when a newer tombstone for the same key resides in another storage
-/// layer. Applications that require cross-layer deletion consistency must not
-/// rely on the affected read until that limitation is removed.
+/// Every mutation is assigned one engine-wide sequence number. Point, range,
+/// and prefix reads resolve all currently visible in-memory and persisted
+/// copies by that sequence before filtering tombstones. Completed flush,
+/// reopen, and compaction operations preserve that ordering. A concurrent
+/// flush can still create a temporary visibility window until immutable
+/// publication becomes retryable and atomic.
 ///
 /// Batches guarantee ordered application and all operations are visible after
 /// a successful return. This version does not provide isolation from
@@ -278,8 +275,7 @@ impl Db {
     /// Remove a key.
     ///
     /// This is a no-op if the key doesn't exist. Success means the tombstone has
-    /// reached the selected durability point. See [`Db`] for the current
-    /// cross-layer deletion visibility limitation.
+    /// reached the selected durability point.
     pub async fn remove<K: AsRef<[u8]>>(&self, key: K) -> Result<()> {
         self.engine.delete(key.as_ref()).await?;
         Ok(())

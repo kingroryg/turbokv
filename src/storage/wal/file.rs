@@ -120,7 +120,7 @@ pub(crate) fn recover_file(path: &Path, _config: &WalConfig) -> Result<(WalFile,
     loop {
         match read_entry_versioned(&mut reader, has_legacy_extension) {
             Ok(entry) => {
-                last_sequence = entry.sequence;
+                last_sequence = last_sequence.max(entry.sequence);
             }
             Err(WalError::Eof) => break,
             Err(e) => {
@@ -270,6 +270,7 @@ pub(crate) fn write_entries_batch<T: AsRef<WalEntry>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn reads_legacy_entry_extension_without_exposing_it() {
@@ -292,5 +293,28 @@ mod tests {
         let entry = read_entry_versioned(&mut bytes.as_slice(), true).unwrap();
         assert_eq!(entry.sequence, 7);
         assert_eq!(entry.data.as_ref(), payload);
+    }
+
+    #[test]
+    fn recovery_uses_maximum_sequence_when_physical_order_differs() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig::durable();
+        let mut file = create_file(directory.path(), 3, &config).unwrap();
+
+        for sequence in [5, 3] {
+            let entry = WalEntry {
+                sequence,
+                timestamp: 0,
+                entry_type: EntryType::Data,
+                data: Bytes::from(encode_kv(b"key", b"value")),
+            };
+            write_entry(&mut file.file, &entry).unwrap();
+        }
+        let path = file.path.clone();
+        drop(file);
+
+        let (recovered, next_sequence) = recover_file(&path, &config).unwrap();
+        assert_eq!(recovered.last_sequence, 5);
+        assert_eq!(next_sequence, 6);
     }
 }

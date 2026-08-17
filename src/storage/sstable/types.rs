@@ -6,7 +6,9 @@ use std::path::PathBuf;
 
 pub const SSTABLE_MAGIC: &[u8; 8] = b"HANSHIRO";
 pub const SSTABLE_VERSION_V1: u32 = 1;
-pub const SSTABLE_VERSION: u32 = 2;
+pub const SSTABLE_VERSION_V2: u32 = 2;
+/// Format v3 stores an engine-wide sequence number with every entry.
+pub const SSTABLE_VERSION: u32 = 3;
 pub const DEFAULT_BLOCK_SIZE: usize = 16 * 1024; // 16KB, better for larger security events
 pub const FOOTER_SIZE: usize = 40;
 
@@ -41,6 +43,12 @@ pub struct SSTableInfo {
     pub max_key: Vec<u8>,
     pub creation_time: u64,
     pub level: u32,
+    /// Lowest sequence retained by this table.
+    #[serde(default)]
+    pub min_sequence: u64,
+    /// Highest sequence retained by this table.
+    #[serde(default)]
+    pub max_sequence: u64,
 }
 
 impl SSTableInfo {

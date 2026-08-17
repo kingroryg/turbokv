@@ -10,7 +10,7 @@
 //! │  │                    Data Blocks                      │    │
 //! │  │  ┌──────────────────────────────────────────────┐   │    │
 //! │  │  │ Block 1 (Default: 16KB)                      │   │    │
-//! │  │  │ Entries: [key_len][key][tag][val_len][val]   │   │    │
+//! │  │  │ Entries: [key_len][key][seq][tag][len][val]   │   │    │
 //! │  │  │ Offsets: [entry_offset ...][entry_count]     │   │    │
 //! │  │  │ Block Footer: [compression][crc32]           │   │    │
 //! │  │  └──────────────────────────────────────────────┘   │    │
@@ -51,7 +51,7 @@ pub use bloom::{BloomFilter, PrefixBloomFilter};
 pub use builder::{BlockBuilder, IndexBuilder};
 pub use compression::{compress_block, decompress_block, CompressionType};
 pub use iterator::SSTableIterator;
+pub(crate) use reader::SSTableEntry;
 pub use reader::SSTableReader;
-pub(crate) use reader::SSTableValue;
 pub use types::{SSTableConfig, SSTableInfo, FOOTER_SIZE, SSTABLE_MAGIC, SSTABLE_VERSION};
 pub use writer::SSTableWriter;

@@ -81,16 +81,25 @@ impl MemTable {
     /// Returns the sequence number assigned to this operation.
     #[inline]
     pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<u64> {
-        if self.read_only.load(Ordering::Acquire) {
-            return Err(MemTableError::ReadOnly);
-        }
-
-        if self.should_flush() {
-            return Err(MemTableError::Full);
-        }
-
-        // Relaxed ordering - monotonicity guaranteed, no memory barrier overhead
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        self.insert_with_sequence(key, value, sequence)?;
+        Ok(sequence)
+    }
+
+    /// Insert a key-value pair with an engine-assigned sequence number.
+    ///
+    /// An older mutation is ignored if a newer version of the key has already
+    /// reached this memtable.
+    #[inline]
+    pub(crate) fn insert_with_sequence(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        sequence: u64,
+    ) -> Result<()> {
+        if !self.prepare_mutation(key, sequence)? {
+            return Ok(());
+        }
 
         // Inline size estimation for fast path
         let entry_size = key.len() + value.len() + 32; // 32 for entry overhead
@@ -116,7 +125,7 @@ impl MemTable {
         }
         // Overwrite of existing non-tombstone: don't change counts
 
-        Ok(sequence)
+        Ok(())
     }
 
     /// Delete a key by inserting a tombstone
@@ -124,16 +133,21 @@ impl MemTable {
     /// Returns the sequence number assigned to this operation.
     #[inline]
     pub fn delete(&self, key: &[u8]) -> Result<u64> {
-        if self.read_only.load(Ordering::Acquire) {
-            return Err(MemTableError::ReadOnly);
-        }
-
-        if self.should_flush() {
-            return Err(MemTableError::Full);
-        }
-
-        // Relaxed ordering - monotonicity guaranteed, no memory barrier overhead
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        self.delete_with_sequence(key, sequence)?;
+        Ok(sequence)
+    }
+
+    /// Insert a tombstone with an engine-assigned sequence number.
+    ///
+    /// An older mutation is ignored if a newer version of the key has already
+    /// reached this memtable.
+    #[inline]
+    pub(crate) fn delete_with_sequence(&self, key: &[u8], sequence: u64) -> Result<()> {
+        if !self.prepare_mutation(key, sequence)? {
+            return Ok(());
+        }
+
         let entry = MemTableEntry::tombstone(sequence);
 
         // Check if we're deleting an existing non-tombstone entry
@@ -155,7 +169,7 @@ impl MemTable {
         // Approximate size (just key + overhead)
         self.size_bytes.fetch_add(key.len() + 32, Ordering::Relaxed);
 
-        Ok(sequence)
+        Ok(())
     }
 
     /// Get a value by key
@@ -284,6 +298,26 @@ impl MemTable {
     /// Get the current sequence number
     pub fn current_sequence(&self) -> u64 {
         self.sequence.load(Ordering::Relaxed)
+    }
+
+    fn observe_sequence(&self, sequence: u64) {
+        self.sequence
+            .fetch_max(sequence.saturating_add(1), Ordering::Relaxed);
+    }
+
+    fn prepare_mutation(&self, key: &[u8], sequence: u64) -> Result<bool> {
+        if self.read_only.load(Ordering::Acquire) {
+            return Err(MemTableError::ReadOnly);
+        }
+        if self.should_flush() {
+            return Err(MemTableError::Full);
+        }
+
+        self.observe_sequence(sequence);
+        Ok(self
+            .data
+            .get(key)
+            .map_or(true, |entry| entry.value().sequence <= sequence))
     }
 
     /// Get statistics for this memtable
@@ -452,5 +486,18 @@ mod tests {
             table.insert(b"key2", b"value"),
             Err(MemTableError::ReadOnly)
         ));
+    }
+
+    #[test]
+    fn older_explicit_sequence_cannot_replace_newer_version() {
+        let table = MemTable::new(test_config());
+
+        table.delete_with_sequence(b"key", 12).unwrap();
+        table.insert_with_sequence(b"key", b"stale", 11).unwrap();
+
+        let entry = table.get_entry(b"key").unwrap();
+        assert_eq!(entry.sequence, 12);
+        assert!(entry.is_tombstone());
+        assert_eq!(table.current_sequence(), 13);
     }
 }

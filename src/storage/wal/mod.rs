@@ -193,7 +193,7 @@ impl WriteAheadLog {
             file.file.write_all(&buf)?;
             file.size += entry_bytes;
             file.entry_count += 1;
-            file.last_sequence = sequence;
+            file.last_sequence = file.last_sequence.max(sequence);
 
             Ok(sequence)
         })
@@ -219,7 +219,7 @@ impl WriteAheadLog {
         write_entry(&mut file.file, entry)?;
         file.size += entry_bytes;
         file.entry_count += 1;
-        file.last_sequence = entry.sequence;
+        file.last_sequence = file.last_sequence.max(entry.sequence);
 
         if sync {
             // Paranoid mode: fsync to disk (survives power loss)
@@ -307,7 +307,7 @@ impl WriteAheadLog {
             file.file.write_all(&buf)?;
             file.size += entry_bytes;
             file.entry_count += 1;
-            file.last_sequence = sequence;
+            file.last_sequence = file.last_sequence.max(sequence);
 
             Ok(sequence)
         })
@@ -402,6 +402,12 @@ impl WriteAheadLog {
 
     pub fn current_sequence(&self) -> u64 {
         self.sequence.load(Ordering::SeqCst)
+    }
+
+    /// Ensure future WAL entries do not reuse sequences already persisted in
+    /// SSTables (including databases created without a WAL).
+    pub(crate) fn ensure_next_sequence_at_least(&self, next_sequence: u64) {
+        self.sequence.fetch_max(next_sequence, Ordering::SeqCst);
     }
 
     /// Returns the current WAL file size in bytes (synchronous).
@@ -510,7 +516,7 @@ impl WriteAheadLog {
         f.file.write_all(encoded)?;
         f.size += total_batch_size;
         f.entry_count += entry_count;
-        f.last_sequence = last_sequence;
+        f.last_sequence = f.last_sequence.max(last_sequence);
 
         if self.config.sync_on_write {
             f.file.sync_all()?;
@@ -666,8 +672,8 @@ fn write_batch_sync(
     write_entries_batch(&mut f.file, &entries)?;
     f.size += total_batch_size;
     f.entry_count += entries.len() as u64;
-    if let Some(last_entry) = entries.last() {
-        f.last_sequence = last_entry.sequence;
+    if let Some(max_sequence) = entries.iter().map(|entry| entry.sequence).max() {
+        f.last_sequence = f.last_sequence.max(max_sequence);
     }
 
     if config.sync_on_write {

@@ -21,7 +21,7 @@ use tracing::{debug, info};
 use crate::core::error::{Error, Result};
 
 use super::manifest::SSTableManifestEntry;
-use super::sstable::{SSTableConfig, SSTableReader, SSTableWriter};
+use super::sstable::{SSTableConfig, SSTableEntry, SSTableReader, SSTableWriter};
 
 /// Compaction configuration
 #[derive(Debug, Clone)]
@@ -167,13 +167,14 @@ impl Compactor {
 
         // Initialize heap with first entry from each iterator
         for (idx, iter) in iterators.iter_mut().enumerate() {
-            if let Some(result) = iter.next() {
-                let (key, value) = result?;
-                heap.push(Reverse(MergeEntry {
+            if let Some(result) = iter.next_versioned() {
+                let (key, entry) = result?;
+                heap.push(Reverse(MergeEntry::new(
                     key,
-                    value,
-                    source: idx,
-                }));
+                    entry,
+                    &job.input_sstables[idx],
+                    idx,
+                )));
             }
         }
 
@@ -187,20 +188,23 @@ impl Compactor {
             if is_duplicate {
                 entries_dropped += 1;
             } else {
-                writer.add(&entry.key, entry.value.as_deref())?;
-                live_keys.push(entry.key.to_vec());
+                writer.add_versioned(&entry.key, entry.value.as_deref(), entry.sequence)?;
+                if entry.value.is_some() {
+                    live_keys.push(entry.key.to_vec());
+                }
                 entries_merged += 1;
                 last_key = Some(entry.key.clone());
             }
 
             // Advance the iterator that provided this entry
-            if let Some(result) = iterators[entry.source].next() {
-                let (key, value) = result?;
-                heap.push(Reverse(MergeEntry {
+            if let Some(result) = iterators[entry.source].next_versioned() {
+                let (key, next_entry) = result?;
+                heap.push(Reverse(MergeEntry::new(
                     key,
-                    value,
-                    source: entry.source,
-                }));
+                    next_entry,
+                    &job.input_sstables[entry.source],
+                    entry.source,
+                )));
             }
         }
 
@@ -226,18 +230,8 @@ impl Compactor {
             entry_count: output_info.entry_count,
             min_key: output_info.min_key,
             max_key: output_info.max_key,
-            min_sequence: job
-                .input_sstables
-                .iter()
-                .map(|s| s.min_sequence)
-                .min()
-                .unwrap_or(0),
-            max_sequence: job
-                .input_sstables
-                .iter()
-                .map(|s| s.max_sequence)
-                .max()
-                .unwrap_or(0),
+            min_sequence: output_info.min_sequence,
+            max_sequence: output_info.max_sequence,
             creation_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -302,12 +296,28 @@ impl Compactor {
 struct MergeEntry {
     key: Bytes,
     value: Option<Bytes>,
+    sequence: u64,
+    source_id: u64,
     source: usize,
+}
+
+impl MergeEntry {
+    fn new(key: Bytes, entry: SSTableEntry, table: &SSTableManifestEntry, source: usize) -> Self {
+        Self {
+            key,
+            value: entry.value.into_option(),
+            sequence: entry.sequence.unwrap_or(0),
+            source_id: table.id,
+            source,
+        }
+    }
 }
 
 impl PartialEq for MergeEntry {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
+            && self.sequence == other.sequence
+            && self.source_id == other.source_id
     }
 }
 
@@ -321,9 +331,14 @@ impl PartialOrd for MergeEntry {
 
 impl Ord for MergeEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Compare by key first, then by source index (higher source = newer data)
+        // The reverse heap pops keys ascending and, for duplicate keys, the
+        // highest sequence first. Table id is a deterministic compatibility
+        // tie-breaker for legacy tables without per-entry sequences.
         match self.key.cmp(&other.key) {
-            std::cmp::Ordering::Equal => other.source.cmp(&self.source),
+            std::cmp::Ordering::Equal => match other.sequence.cmp(&self.sequence) {
+                std::cmp::Ordering::Equal => other.source_id.cmp(&self.source_id),
+                sequence_order => sequence_order,
+            },
             other_ord => other_ord,
         }
     }
@@ -331,7 +346,39 @@ impl Ord for MergeEntry {
 
 #[cfg(test)]
 mod tests {
+    use super::super::sstable::CompressionType;
     use super::*;
+    use std::sync::atomic::AtomicU64;
+    use tempfile::TempDir;
+
+    fn write_versioned_table(
+        path: &std::path::Path,
+        id: u64,
+        sequence: u64,
+        value: Option<&[u8]>,
+    ) -> SSTableManifestEntry {
+        let config = SSTableConfig {
+            compression: CompressionType::None,
+            ..SSTableConfig::default()
+        };
+        let mut writer = SSTableWriter::new(path, config).unwrap();
+        writer
+            .add_versioned(b"ordered:key", value, sequence)
+            .unwrap();
+        let info = writer.finish().unwrap();
+        SSTableManifestEntry {
+            id,
+            level: 0,
+            path: path.to_path_buf(),
+            size: info.file_size,
+            entry_count: info.entry_count,
+            min_key: info.min_key,
+            max_key: info.max_key,
+            min_sequence: info.min_sequence,
+            max_sequence: info.max_sequence,
+            creation_time: id,
+        }
+    }
 
     #[test]
     fn test_compaction_config_defaults() {
@@ -369,5 +416,39 @@ mod tests {
         let job = compactor.pick_compaction(&sstables);
         assert!(job.is_some());
         assert_eq!(job.unwrap().output_level, 1);
+    }
+
+    #[test]
+    fn compaction_selects_sequence_not_input_position() {
+        let directory = TempDir::new().unwrap();
+        let sstable_directory = directory.path().join("sstables");
+        std::fs::create_dir_all(&sstable_directory).unwrap();
+        let newest_tombstone = write_versioned_table(&sstable_directory.join("1.sst"), 1, 20, None);
+        let stale_value =
+            write_versioned_table(&sstable_directory.join("2.sst"), 2, 10, Some(b"stale"));
+
+        let compactor = Compactor::new(
+            CompactionConfig::default(),
+            SSTableConfig {
+                compression: CompressionType::None,
+                ..SSTableConfig::default()
+            },
+            directory.path().to_path_buf(),
+            Arc::new(AtomicU64::new(3)),
+        );
+        let result = compactor
+            .execute(CompactionJob {
+                input_sstables: vec![newest_tombstone, stale_value],
+                output_level: 1,
+                output_path: sstable_directory.join("3.sst"),
+            })
+            .unwrap();
+
+        let output = result.output_sstable.unwrap();
+        assert_eq!((output.min_sequence, output.max_sequence), (20, 20));
+        let reader = SSTableReader::open(output.path).unwrap();
+        let entry = reader.get_entry(b"ordered:key").unwrap().unwrap();
+        assert_eq!(entry.sequence, Some(20));
+        assert!(entry.value.into_option().is_none());
     }
 }
