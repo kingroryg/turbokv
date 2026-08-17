@@ -166,9 +166,9 @@ impl DbOptions {
 /// Every mutation is assigned one engine-wide sequence number. Point, range,
 /// and prefix reads resolve all currently visible in-memory and persisted
 /// copies by that sequence before filtering tombstones. Completed flush,
-/// reopen, and compaction operations preserve that ordering. A concurrent
-/// flush can still create a temporary visibility window until immutable
-/// publication becomes retryable and atomic.
+/// reopen, and compaction operations preserve that ordering. A frozen
+/// immutable generation remains in the live read view until its durable
+/// SSTable and manifest installation are reflected there.
 ///
 /// Batches guarantee ordered application and all operations are visible after
 /// a successful return. This version does not provide isolation from
@@ -177,9 +177,11 @@ impl DbOptions {
 /// # Operational errors
 ///
 /// Except for [`DbError::InvalidOptions`], an error can occur after storage
-/// side effects. Callers must treat a failed mutation, flush, or batch as having
-/// an indeterminate outcome and verify state before a non-idempotent retry.
-/// A failed [`Db::close`] consumes the handle and does not promise persistence.
+/// side effects. A flush failure cannot remove an uninstalled frozen
+/// generation; any such generation remains live for retry while the database
+/// is open. Callers must treat a failed mutation or batch as having an
+/// indeterminate outcome and verify state before a non-idempotent retry. A
+/// failed [`Db::close`] consumes the handle and does not promise persistence.
 pub struct Db {
     engine: Arc<Engine>,
 }

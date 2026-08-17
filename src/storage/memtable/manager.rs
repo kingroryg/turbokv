@@ -31,6 +31,15 @@ const THREAD_LOCAL_BUFFER_SIZE: usize = 64;
 /// serializing independent writes or allocating one lock per key.
 const MUTATION_LOCK_STRIPES: usize = 65_536;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ImmutableGenerationId(usize);
+
+impl ImmutableGenerationId {
+    fn of(table: &Arc<MemTable>) -> Self {
+        Self(Arc::as_ptr(table) as usize)
+    }
+}
+
 /// Global counter for assigning unique manager IDs
 static MANAGER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -63,6 +72,8 @@ pub struct MemTableManager {
     pub active: Arc<RwLock<Arc<MemTable>>>,
     /// Immutable memtables awaiting flush
     pub immutable: Arc<RwLock<Vec<Arc<MemTable>>>>,
+    /// Stable SSTable ids reserved by immutable generations while they retry.
+    flush_ids: Mutex<HashMap<ImmutableGenerationId, u64>>,
     /// Configuration for new memtables
     config: MemTableConfig,
     /// Next engine-wide mutation sequence.
@@ -84,6 +95,7 @@ impl MemTableManager {
             id,
             active: Arc::new(RwLock::new(active)),
             immutable: Arc::new(RwLock::new(Vec::new())),
+            flush_ids: Mutex::new(HashMap::new()),
             config,
             next_sequence: AtomicU64::new(next_sequence),
         }
@@ -367,6 +379,57 @@ impl MemTableManager {
         }
     }
 
+    /// Borrow the oldest immutable without removing it from the read view.
+    pub(crate) fn peek_immutable_for_flush(&self) -> Option<Arc<MemTable>> {
+        self.immutable.read().first().cloned()
+    }
+
+    /// Reserve one stable SSTable id for this immutable across retries.
+    pub(crate) fn reserved_flush_id(&self, table: &Arc<MemTable>) -> Option<u64> {
+        self.flush_ids
+            .lock()
+            .get(&ImmutableGenerationId::of(table))
+            .copied()
+    }
+
+    /// Reserve one stable SSTable id for this immutable across retries.
+    pub(crate) fn reserve_flush_id(&self, table: &Arc<MemTable>, proposed_id: u64) -> u64 {
+        *self
+            .flush_ids
+            .lock()
+            .entry(ImmutableGenerationId::of(table))
+            .or_insert(proposed_id)
+    }
+
+    /// Remove exactly the immutable generation whose durable install completed.
+    pub(crate) fn complete_immutable_flush(&self, table: &Arc<MemTable>) -> bool {
+        let mut immutable = self.immutable.write();
+        let Some(front) = immutable.first() else {
+            return false;
+        };
+        if !Arc::ptr_eq(front, table) {
+            return false;
+        }
+
+        let completed = immutable.remove(0);
+        self.flush_ids
+            .lock()
+            .remove(&ImmutableGenerationId::of(&completed));
+        true
+    }
+
+    /// Lowest sequence not represented by the immutable currently installing.
+    pub(crate) fn minimum_live_sequence_excluding(&self, excluded: &Arc<MemTable>) -> Option<u64> {
+        let active_min = self.active.read().sequence_bounds().map(|(min, _)| min);
+        self.immutable
+            .read()
+            .iter()
+            .filter(|table| !Arc::ptr_eq(table, excluded))
+            .filter_map(|table| table.sequence_bounds().map(|(min, _)| min))
+            .chain(active_min)
+            .min()
+    }
+
     /// Check if there are immutable memtables waiting to be flushed
     pub fn has_immutable(&self) -> bool {
         !self.immutable.read().is_empty()
@@ -561,6 +624,26 @@ mod tests {
         for i in 0..12 {
             assert!(manager.get(format!("key{}", i).as_bytes()).is_some());
         }
+    }
+
+    #[test]
+    fn retryable_flush_peek_retains_generation_until_exact_completion() {
+        let manager = MemTableManager::new(test_config());
+        manager.insert(b"key", b"value").unwrap();
+        manager.force_rotate().unwrap();
+
+        let first_attempt = manager.peek_immutable_for_flush().unwrap();
+        assert_eq!(manager.immutable_count(), 1);
+        assert_eq!(manager.reserve_flush_id(&first_attempt, 7), 7);
+
+        let retry = manager.peek_immutable_for_flush().unwrap();
+        assert!(Arc::ptr_eq(&first_attempt, &retry));
+        assert_eq!(manager.reserved_flush_id(&retry), Some(7));
+        assert_eq!(manager.reserve_flush_id(&retry, 99), 7);
+        assert!(manager.complete_immutable_flush(&retry));
+        assert_eq!(manager.immutable_count(), 0);
+        assert_eq!(manager.reserved_flush_id(&retry), None);
+        assert!(!manager.complete_immutable_flush(&retry));
     }
 
     #[test]

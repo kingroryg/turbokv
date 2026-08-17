@@ -285,6 +285,18 @@ impl MemTable {
             .collect()
     }
 
+    /// Return the lowest and highest engine sequence retained by this table.
+    pub(crate) fn sequence_bounds(&self) -> Option<(u64, u64)> {
+        self.data.iter().fold(None, |bounds, entry| {
+            let sequence = entry.value().sequence;
+            Some(
+                bounds.map_or((sequence, sequence), |(min, max): (u64, u64)| {
+                    (min.min(sequence), max.max(sequence))
+                }),
+            )
+        })
+    }
+
     /// Get all entries as raw key-value pairs (for SSTable writing)
     ///
     /// Tombstones are included with `None` values.

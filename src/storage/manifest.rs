@@ -1,6 +1,6 @@
 //! The manifest tracks:
 //! - All SSTables and their metadata
-//! - WAL checkpoint (last flushed sequence)
+//! - WAL checkpoint (first sequence that recovery must replay)
 //! - Database version for compatibility
 //!
 //! Manifest File Format
@@ -9,7 +9,7 @@
 //! ├─────────────────────────────────────────────────────────────┤
 //! │  Magic: "HNSHMNFT" (8 bytes)                                │
 //! │  Version: u32                                               │
-//! │  WAL Checkpoint: u64 (last flushed sequence)                │
+//! │  WAL Checkpoint: u64 (next replay sequence)                 │
 //! │  SSTable Count: u32                                         │
 //! │  SSTable Entries: [SSTableManifestEntry...]                 │
 //! │  Checksum: u32 (CRC32)                                      │
@@ -37,8 +37,8 @@ const LEGACY_MANIFEST_VERSION: u32 = 1;
 pub struct Manifest {
     /// Manifest version for compatibility
     pub version: u64,
-    /// Last WAL sequence that was flushed to SSTable
-    /// On recovery, replay WAL entries > this sequence
+    /// First WAL sequence not known to be represented by installed SSTables.
+    /// On recovery, replay WAL entries greater than or equal to this sequence.
     pub wal_checkpoint: u64,
     /// All SSTable metadata
     pub sstables: Vec<SSTableManifestEntry>,
@@ -213,13 +213,8 @@ impl Manifest {
             file.sync_all()?;
         }
 
-        // Atomic rename
-        std::fs::rename(&temp_path, &manifest_path)?;
-
-        // Fsync directory to ensure the rename is durable
-        if let Ok(dir) = std::fs::File::open(data_dir) {
-            let _ = dir.sync_all();
-        }
+        atomic_replace(&temp_path, &manifest_path)?;
+        sync_directory(data_dir)?;
 
         info!(
             "Saved manifest: wal_checkpoint={}, sstables={}",
@@ -230,7 +225,7 @@ impl Manifest {
         Ok(())
     }
 
-    /// Update WAL checkpoint after successful flush
+    /// Update the exclusive durable frontier after a successful flush.
     pub fn update_checkpoint(&mut self, sequence: u64) {
         self.wal_checkpoint = sequence;
         self.version += 1;
@@ -317,6 +312,54 @@ impl Manifest {
     }
 }
 
+#[cfg(not(windows))]
+pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: both vectors are valid, NUL-terminated UTF-16 paths and remain
+    // alive for the duration of the system call.
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Persist a directory entry update where the platform exposes directory fsync.
+#[cfg(unix)]
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+/// Rust has no portable directory-sync operation on these targets. Atomic
+/// replacement and file fsync still preserve the strongest available ordering.
+#[cfg(not(unix))]
+pub(crate) fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 impl Default for Manifest {
     fn default() -> Self {
         Self::new()
@@ -399,5 +442,23 @@ mod tests {
         let manifest = Manifest::load_or_create(temp_dir.path()).unwrap();
         assert_eq!(manifest.wal_checkpoint, 42);
         assert!(manifest.sstables.is_empty());
+    }
+
+    #[test]
+    fn atomically_replaces_an_existing_manifest() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manifest = Manifest::new();
+        manifest.wal_checkpoint = 1;
+        manifest.save(temp_dir.path()).unwrap();
+
+        manifest.wal_checkpoint = 2;
+        manifest.save(temp_dir.path()).unwrap();
+
+        assert_eq!(
+            Manifest::load_or_create(temp_dir.path())
+                .unwrap()
+                .wal_checkpoint,
+            2
+        );
     }
 }
