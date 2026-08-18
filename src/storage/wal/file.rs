@@ -120,6 +120,14 @@ impl WalFile {
             .saturating_add(1)
             .max(filename_sequence.saturating_add(1)))
     }
+
+    pub fn next_written_sequence(&self) -> u64 {
+        if self.entry_count == 0 {
+            self.first_sequence
+        } else {
+            self.last_sequence.saturating_add(1)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -657,7 +665,8 @@ pub(crate) fn write_entries_batch<T: AsRef<WalEntry>>(
         buffer.extend_from_slice(&entry.data);
     }
 
-    // Single syscall for all entries
+    // One buffered write_all call for the segment chunk. write_all retries
+    // short writes so every encoded entry reaches the file before syncing.
     writer.write_all(&buffer)?;
     Ok(())
 }

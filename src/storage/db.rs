@@ -147,11 +147,12 @@ impl DbOptions {
         }
     }
 
-    /// Per-mutation synced write-ahead logging.
+    /// Per-mutation durable write-ahead logging.
     ///
-    /// A mutation is acknowledged only after its WAL write has been synced.
-    /// This is the strongest durability mode and is intended for sudden power
-    /// loss, subject to the filesystem and storage device honoring sync.
+    /// Concurrent mutations may share one ordered WAL write and sync barrier;
+    /// each is acknowledged only after the group containing it is durable. This
+    /// is the strongest durability mode and is intended for sudden power loss,
+    /// subject to the filesystem and storage device honoring sync.
     ///
     /// Best for: financial transactions, critical records
     pub fn paranoid() -> Self {
@@ -208,6 +209,9 @@ impl DbOptions {
 /// indeterminate outcome and verify state before a non-idempotent retry. A
 /// failed batch is not partially published, but its complete WAL envelope may
 /// be recovered after reopen if failure occurred after the durable append. A
+/// paranoid group-commit error poisons further writes on that open handle;
+/// reopen to repair any partial tail and determine whether complete records
+/// from the outcome-indeterminate failed group are recoverable. A
 /// failed [`Db::close`] consumes the handle and does not promise persistence.
 /// Background maintenance failures are retained in [`Db::status`]; clean close
 /// fails while any compaction failure remains unresolved. Its final flush can
@@ -467,11 +471,12 @@ impl Db {
 
     /// Get cheap maintenance health and write-backpressure status.
     ///
-    /// A failed flush, compaction, or obsolete-file cleanup remains visible
-    /// until a retry proves that lane's work is resolved. Only one bounded
-    /// failure detail is kept per lane; cumulative counters retain the
-    /// historical signal. Current pressure values are monitoring samples
-    /// rather than a transactional snapshot with storage statistics.
+    /// A failed flush, compaction, obsolete-file cleanup, or paranoid WAL
+    /// barrier remains visible until a retry proves that lane's work is
+    /// resolved. A poisoned WAL requires reopen. Only one bounded failure
+    /// detail is kept per lane; cumulative counters retain the historical
+    /// signal. Current pressure values are monitoring samples rather than a
+    /// transactional snapshot with storage statistics.
     pub fn status(&self) -> DatabaseStatus {
         self.engine.status()
     }

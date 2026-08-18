@@ -216,7 +216,7 @@ pub struct DatabaseStatus {
 /// proven retry clears the detail.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaintenanceStatus {
-    /// Memtable-flush health.
+    /// Memtable-flush, WAL-sync, and poisoned write-path health.
     pub flush: MaintenanceOperationStatus,
     /// SSTable-compaction health.
     pub compaction: MaintenanceOperationStatus,
@@ -290,7 +290,7 @@ pub struct MaintenanceFailure {
 /// Origin of a maintenance attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaintenanceOrigin {
-    /// An explicit foreground flush or compaction request.
+    /// An explicit foreground write, flush, or compaction request.
     Foreground,
     /// An automatic background maintenance request.
     Background,

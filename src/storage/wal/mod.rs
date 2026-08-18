@@ -5,10 +5,8 @@
 //! │                    Write Path (Group Commit)                    │
 //! ├─────────────────────────────────────────────────────────────────┤
 //! │  Writer 1 ──┐                                                   │
-//! │  Writer 2 ──┼──► Channel ──► Background Task ──► Batch fsync    │
+//! │  Writer 2 ──┼──► FIFO ──► Sequence + write ──► Shared fsync     │
 //! │  Writer 3 ──┘                                                   │
-//! │                                                                 │
-//! │  append_batch() ──────────► Direct Write (bypasses group commit)│
 //! └─────────────────────────────────────────────────────────────────┘
 //!
 //! ## File Format (v4)
@@ -26,7 +24,10 @@ mod iterator;
 mod types;
 
 pub use iterator::WalEntryIterator;
-pub use types::{encode_delete, encode_kv, EntryType, Result, WalConfig, WalEntry, WalError};
+pub use types::{
+    encode_delete, encode_kv, EntryType, Result, WalConfig, WalEntry, WalError,
+    MAX_GROUP_COMMIT_DELAY_US,
+};
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
@@ -42,7 +43,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
 use crate::core::crypto::crc32_checksum;
-use crate::storage::{directory_lock::DirectoryLock, InProgressGuard};
+use crate::storage::{directory_lock::DirectoryLock, manifest::sync_directory, InProgressGuard};
 use file::{
     create_file, entry_size, finalize_header, inspect_segment, open_recovered_file,
     read_and_validate_header, read_entry_versioned, synchronize_segment_header,
@@ -57,12 +58,166 @@ thread_local! {
 }
 
 struct WriteRequest {
+    record: PendingWalRecord,
+    response: oneshot::Sender<Result<BatchAppend>>,
+}
+
+enum GroupCommitCommand {
+    Write(WriteRequest),
+    Barrier(oneshot::Sender<Result<()>>),
+}
+
+struct PendingWalRecord {
+    entry_type: EntryType,
+    data: Bytes,
+    operation_count: u64,
+}
+
+struct PreparedWriteRequest {
     entry: WalEntry,
-    response: oneshot::Sender<Result<()>>,
+    sequences: Vec<u64>,
+    response: oneshot::Sender<Result<BatchAppend>>,
 }
 
 pub(crate) struct BatchAppend {
     pub sequences: Vec<u64>,
+}
+
+#[derive(Clone)]
+struct GroupCommitFailure(Arc<str>);
+
+impl GroupCommitFailure {
+    fn from_error(error: &WalError) -> Self {
+        Self(Arc::from(format!("paranoid group commit failed: {error}")))
+    }
+
+    fn into_error(self) -> WalError {
+        WalError::Io {
+            message: self.0.to_string(),
+            source: None,
+        }
+    }
+}
+
+struct GroupCommitWriter {
+    current_file: Arc<RwLock<WalFile>>,
+    sequence: Arc<AtomicU64>,
+    durable_sequence: Arc<AtomicU64>,
+    batch_ranges: Arc<RwLock<BTreeMap<u64, u64>>>,
+    config: WalConfig,
+    wal_dir: PathBuf,
+    directory_lock: Option<Weak<DirectoryLock>>,
+    failure: Arc<RwLock<Option<GroupCommitFailure>>>,
+    in_progress: Arc<AtomicU64>,
+    syncs: Arc<AtomicU64>,
+    largest_group: Arc<AtomicU64>,
+    byte_accounting: Arc<WalByteAccounting>,
+}
+
+impl GroupCommitWriter {
+    async fn run(self, mut rx: mpsc::Receiver<GroupCommitCommand>) {
+        let mut pending = None;
+        loop {
+            let command = match pending.take() {
+                Some(command) => command,
+                None => match rx.recv().await {
+                    Some(command) => command,
+                    None => break,
+                },
+            };
+            let first = match command {
+                GroupCommitCommand::Write(request) => request,
+                GroupCommitCommand::Barrier(response) => {
+                    let _ = response.send(Ok(()));
+                    continue;
+                }
+            };
+
+            let _in_progress = InProgressGuard::new(Arc::clone(&self.in_progress));
+            let mut group = vec![first];
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_micros(self.config.group_commit_delay_us);
+            pending =
+                collect_group(&mut rx, &mut group, self.config.max_batch_size, deadline).await;
+
+            // Engine-owned WALs may outlive a cancelled append future. Do not
+            // mutate after the Engine's directory ownership has ended; if a
+            // mutation already started, retain ownership through its response.
+            let _directory_lock = match self.directory_lock.as_ref() {
+                Some(directory_lock) => match directory_lock.upgrade() {
+                    Some(directory_lock) => Some(directory_lock),
+                    None => {
+                        poison_group(
+                            &mut rx,
+                            pending.take(),
+                            group.into_iter().map(|request| request.response).collect(),
+                            &self.failure,
+                            WalError::ChannelClosed,
+                        )
+                        .await;
+                        break;
+                    }
+                },
+                None => None,
+            };
+
+            self.largest_group
+                .fetch_max(group.len() as u64, Ordering::Relaxed);
+            let start_sequence = match reserve_group_sequences(&self.sequence, &group) {
+                Ok(start_sequence) => start_sequence,
+                Err(error) => {
+                    poison_group(
+                        &mut rx,
+                        pending.take(),
+                        group.into_iter().map(|request| request.response).collect(),
+                        &self.failure,
+                        error,
+                    )
+                    .await;
+                    break;
+                }
+            };
+            let prepared = prepare_group(group, start_sequence);
+            self.syncs.fetch_add(1, Ordering::Relaxed);
+            match write_group_sync(
+                &self.current_file,
+                &prepared,
+                &self.config,
+                &self.wal_dir,
+                &self.batch_ranges,
+                &self.byte_accounting,
+            ) {
+                Ok(()) => {
+                    let next_durable = prepared
+                        .last()
+                        .and_then(|request| request.sequences.last())
+                        .copied()
+                        .unwrap_or(start_sequence)
+                        .saturating_add(1);
+                    self.durable_sequence.store(next_durable, Ordering::Release);
+                    for request in prepared {
+                        let _ = request.response.send(Ok(BatchAppend {
+                            sequences: request.sequences,
+                        }));
+                    }
+                }
+                Err(error) => {
+                    poison_group(
+                        &mut rx,
+                        pending.take(),
+                        prepared
+                            .into_iter()
+                            .map(|request| request.response)
+                            .collect(),
+                        &self.failure,
+                        error,
+                    )
+                    .await;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 struct EncodedBatchRecord {
@@ -118,9 +273,15 @@ pub struct WriteAheadLog {
     /// Atomic batch spans used to keep durable checkpoints on batch boundaries.
     batch_ranges: Arc<RwLock<BTreeMap<u64, u64>>>,
     byte_accounting: Arc<WalByteAccounting>,
-    write_tx: mpsc::Sender<WriteRequest>,
+    write_tx: mpsc::Sender<GroupCommitCommand>,
+    durable_sequence: Arc<AtomicU64>,
+    group_commit_failure: Arc<RwLock<Option<GroupCommitFailure>>>,
     #[allow(dead_code)]
     group_commit_in_progress: Arc<AtomicU64>,
+    #[allow(dead_code)]
+    group_commit_syncs: Arc<AtomicU64>,
+    #[allow(dead_code)]
+    largest_group_commit: Arc<AtomicU64>,
 }
 
 impl WriteAheadLog {
@@ -141,6 +302,17 @@ impl WriteAheadLog {
         config: WalConfig,
         directory_lock: Option<Weak<DirectoryLock>>,
     ) -> Result<Self> {
+        if config.max_batch_size == 0 {
+            return Err(WalError::InvalidFormat(
+                "paranoid group commit maximum must be greater than zero".to_string(),
+            ));
+        }
+        if config.group_commit_delay_us > MAX_GROUP_COMMIT_DELAY_US {
+            return Err(WalError::InvalidFormat(format!(
+                "paranoid group commit delay must not exceed {MAX_GROUP_COMMIT_DELAY_US} microseconds"
+            )));
+        }
+
         let wal_dir = wal_dir.as_ref().to_path_buf();
         tokio::fs::create_dir_all(&wal_dir)
             .await
@@ -149,68 +321,74 @@ impl WriteAheadLog {
                 source: Some(e),
             })?;
 
-        let (wal_file, sequence, batch_ranges) = Self::open_or_create(&wal_dir, &config).await?;
+        let (wal_file, initial_sequence, batch_ranges) =
+            Self::open_or_create(&wal_dir, &config).await?;
+        sync_wal_directory(&wal_dir)?;
         let byte_accounting = Arc::new(WalByteAccounting::new(retained_wal_bytes(&wal_dir)?));
         let current_file = Arc::new(RwLock::new(wal_file));
-        let (write_tx, write_rx) = mpsc::channel::<WriteRequest>(config.max_batch_size * 2);
+        let queue_capacity = config.max_batch_size.saturating_mul(2).clamp(1, 1 << 20);
+        let (write_tx, write_rx) = mpsc::channel::<GroupCommitCommand>(queue_capacity);
 
-        // Spawn background group commit loop
         let bg_file = Arc::clone(&current_file);
         let bg_config = config.clone();
         let bg_dir = wal_dir.clone();
+        let sequence = Arc::new(AtomicU64::new(initial_sequence));
+        let bg_sequence = Arc::clone(&sequence);
+        let durable_sequence = Arc::new(AtomicU64::new(initial_sequence));
+        let bg_durable_sequence = Arc::clone(&durable_sequence);
+        let batch_ranges = Arc::new(RwLock::new(batch_ranges));
+        let bg_batch_ranges = Arc::clone(&batch_ranges);
         let group_commit_in_progress = Arc::new(AtomicU64::new(0));
         let bg_group_commit_in_progress = Arc::clone(&group_commit_in_progress);
+        let group_commit_failure = Arc::new(RwLock::new(None));
+        let bg_group_commit_failure = Arc::clone(&group_commit_failure);
+        let group_commit_syncs = Arc::new(AtomicU64::new(0));
+        let bg_group_commit_syncs = Arc::clone(&group_commit_syncs);
+        let largest_group_commit = Arc::new(AtomicU64::new(0));
+        let bg_largest_group_commit = Arc::clone(&largest_group_commit);
         let bg_byte_accounting = Arc::clone(&byte_accounting);
-        tokio::spawn(async move {
-            Self::group_commit_loop(
-                write_rx,
-                bg_file,
-                bg_config,
-                bg_dir,
-                directory_lock,
-                bg_group_commit_in_progress,
-                bg_byte_accounting,
-            )
-            .await;
-        });
+        let group_commit_writer = GroupCommitWriter {
+            current_file: bg_file,
+            sequence: bg_sequence,
+            durable_sequence: bg_durable_sequence,
+            batch_ranges: bg_batch_ranges,
+            config: bg_config,
+            wal_dir: bg_dir,
+            directory_lock,
+            failure: bg_group_commit_failure,
+            in_progress: bg_group_commit_in_progress,
+            syncs: bg_group_commit_syncs,
+            largest_group: bg_largest_group_commit,
+            byte_accounting: bg_byte_accounting,
+        };
+        tokio::spawn(group_commit_writer.run(write_rx));
 
         Ok(Self {
             wal_dir,
             config,
             current_file,
-            sequence: Arc::new(AtomicU64::new(sequence)),
-            batch_ranges: Arc::new(RwLock::new(batch_ranges)),
+            sequence,
+            batch_ranges,
             byte_accounting,
             write_tx,
+            durable_sequence,
+            group_commit_failure,
             group_commit_in_progress,
+            group_commit_syncs,
+            largest_group_commit,
         })
     }
 
     pub async fn append(&self, key: &[u8], value: &[u8]) -> Result<u64> {
         if self.config.sync_on_write {
-            // Sync mode (paranoid): use traditional path with fsync
-            let entry = self.create_entry(key, value, EntryType::Data)?;
-            let sequence = entry.sequence;
-
-            // Try direct path if lock is free, otherwise use group commit
-            let lock_available = self.current_file.try_write().is_some();
-
-            if lock_available {
-                self.write_entry_direct(&entry, true)?;
-            } else {
-                // Lock contended - use group commit to share fsync
-                let (tx, rx) = oneshot::channel();
-                let req = WriteRequest {
-                    entry,
-                    response: tx,
-                };
-                self.write_tx
-                    .send(req)
-                    .await
-                    .map_err(|_| WalError::ChannelClosed)?;
-                rx.await.map_err(|_| WalError::ChannelClosed)??;
-            }
-            Ok(sequence)
+            let appended = self
+                .enqueue_paranoid(PendingWalRecord {
+                    entry_type: EntryType::Data,
+                    data: Bytes::from(encode_kv(key, value)),
+                    operation_count: 1,
+                })
+                .await?;
+            Ok(appended.sequences[0])
         } else {
             // Non-sync mode (durable): use zero-allocation fast path
             self.append_zero_alloc(key, value, EntryType::Data)
@@ -287,62 +465,16 @@ impl WriteAheadLog {
         })
     }
 
-    /// Write entry directly to buffered file
-    /// This bypasses the channel overhead that causes convoy effect
-    /// If `sync` is true, flushes and fsyncs after write (paranoid mode)
-    fn write_entry_direct(&self, entry: &WalEntry, sync: bool) -> Result<()> {
-        let entry_bytes = entry_size(entry) as u64;
-
-        // Check if rotation needed (check while holding read lock, then upgrade if needed)
-        let needs_rotation = {
-            let file = self.current_file.read();
-            file.should_rotate(entry_bytes, self.config.max_file_size)
-        };
-
-        if needs_rotation {
-            rotate_sync(
-                &self.current_file,
-                &self.wal_dir,
-                &self.config,
-                &self.byte_accounting,
-            )?;
-        }
-
-        let mut file = self.current_file.write();
-        write_entry(&mut file.file, entry)?;
-        self.byte_accounting.record_append(entry_bytes);
-        file.record_append(entry_bytes, 1, entry.sequence, entry.sequence);
-
-        if sync {
-            // Paranoid mode: fsync to disk (survives power loss)
-            file.file.sync_all()?;
-        }
-        Ok(())
-    }
-
     pub async fn append_delete(&self, key: &[u8]) -> Result<u64> {
         if self.config.sync_on_write {
-            // Sync mode: use traditional path with fsync
-            let entry = self.create_delete_entry(key)?;
-            let sequence = entry.sequence;
-
-            let lock_available = self.current_file.try_write().is_some();
-
-            if lock_available {
-                self.write_entry_direct(&entry, true)?;
-            } else {
-                let (tx, rx) = oneshot::channel();
-                let req = WriteRequest {
-                    entry,
-                    response: tx,
-                };
-                self.write_tx
-                    .send(req)
-                    .await
-                    .map_err(|_| WalError::ChannelClosed)?;
-                rx.await.map_err(|_| WalError::ChannelClosed)??;
-            }
-            Ok(sequence)
+            let appended = self
+                .enqueue_paranoid(PendingWalRecord {
+                    entry_type: EntryType::Delete,
+                    data: Bytes::from(encode_delete(key)),
+                    operation_count: 1,
+                })
+                .await?;
+            Ok(appended.sequences[0])
         } else {
             // Non-sync mode: use zero-allocation fast path
             self.append_delete_zero_alloc(key)
@@ -405,7 +537,11 @@ impl WriteAheadLog {
         })
     }
 
-    /// Append multiple key-value pairs in a single batch (bypasses group commit)
+    /// Append multiple key-value pairs as one checksummed physical record.
+    ///
+    /// In paranoid mode the envelope is one member of a shared commit group;
+    /// the group-size limit counts this caller once, regardless of its logical
+    /// operation count.
     pub async fn append_batch(&self, entries: &[(&[u8], Option<&[u8]>)]) -> Result<Vec<u64>> {
         Ok(self.append_batch_with_metadata(entries).await?.sequences)
     }
@@ -420,6 +556,20 @@ impl WriteAheadLog {
             });
         }
 
+        if self.config.sync_on_write {
+            return self
+                .enqueue_paranoid(PendingWalRecord {
+                    entry_type: EntryType::Batch,
+                    data: Bytes::from(encode_batch(entries)?),
+                    operation_count: u64::try_from(entries.len()).map_err(|_| {
+                        WalError::InvalidFormat(
+                            "batch operation count does not fit a sequence range".to_string(),
+                        )
+                    })?,
+                })
+                .await;
+        }
+
         let batch = self.encode_entries_batch(entries)?;
         self.write_encoded_batch(&batch).await?;
         self.batch_ranges
@@ -432,8 +582,14 @@ impl WriteAheadLog {
     }
 
     pub async fn flush(&self) -> Result<()> {
+        if self.config.sync_on_write {
+            self.await_group_commit_barrier().await?;
+        }
         let mut file = self.current_file.write();
         finalize_header(&mut file)?;
+        sync_wal_directory(&self.wal_dir)?;
+        self.durable_sequence
+            .fetch_max(file.next_written_sequence(), Ordering::Release);
         Ok(())
     }
 
@@ -523,6 +679,17 @@ impl WriteAheadLog {
         self.sequence.load(Ordering::SeqCst)
     }
 
+    /// Exclusive upper bound of WAL sequences covered by a successful sync.
+    ///
+    /// Unsynced durable-mode appends do not advance this frontier. A failed
+    /// paranoid group leaves it unchanged even though recovery may later find
+    /// complete records from the failed, outcome-indeterminate attempt. Reopen
+    /// validates and syncs every retained segment before initializing the
+    /// recovered frontier.
+    pub fn durable_sequence(&self) -> u64 {
+        self.durable_sequence.load(Ordering::Acquire)
+    }
+
     /// Move a proposed checkpoint back to the start of any batch it splits.
     pub(crate) fn align_checkpoint(&self, proposed: u64) -> u64 {
         let ranges = self.batch_ranges.read();
@@ -567,34 +734,61 @@ impl WriteAheadLog {
         self.group_commit_in_progress.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn group_commit_syncs_for_test(&self) -> u64 {
+        self.group_commit_syncs.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn largest_group_commit_for_test(&self) -> u64 {
+        self.largest_group_commit.load(Ordering::Acquire)
+    }
+
     // ========================================
     // Private methods
     // ========================================
 
-    fn create_entry(&self, key: &[u8], value: &[u8], entry_type: EntryType) -> Result<WalEntry> {
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
-        let timestamp = super::cached_time::now_ms();
-        let data = encode_kv(key, value);
-
-        Ok(WalEntry {
-            sequence,
-            timestamp,
-            entry_type,
-            data: Bytes::from(data),
+    async fn enqueue_paranoid(&self, record: PendingWalRecord) -> Result<BatchAppend> {
+        self.submit_group_command(|response| {
+            GroupCommitCommand::Write(WriteRequest { record, response })
         })
+        .await
     }
 
-    fn create_delete_entry(&self, key: &[u8]) -> Result<WalEntry> {
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
-        let timestamp = super::cached_time::now_ms();
-        let data = encode_delete(key);
+    async fn await_group_commit_barrier(&self) -> Result<()> {
+        self.submit_group_command(GroupCommitCommand::Barrier).await
+    }
 
-        Ok(WalEntry {
-            sequence,
-            timestamp,
-            entry_type: EntryType::Delete,
-            data: Bytes::from(data),
-        })
+    async fn submit_group_command<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T>>) -> GroupCommitCommand,
+    ) -> Result<T> {
+        if let Some(failure) = self.group_commit_failure.read().clone() {
+            return Err(failure.into_error());
+        }
+
+        let (response, receive) = oneshot::channel();
+        if self.write_tx.send(command(response)).await.is_err() {
+            return Err(self
+                .group_commit_failure
+                .read()
+                .clone()
+                .map_or(WalError::ChannelClosed, GroupCommitFailure::into_error));
+        }
+
+        receive.await.map_err(|_| {
+            self.group_commit_failure
+                .read()
+                .clone()
+                .map_or(WalError::ChannelClosed, GroupCommitFailure::into_error)
+        })?
+    }
+
+    pub(crate) fn group_commit_failure_for_status(&self) -> Option<String> {
+        self.group_commit_failure
+            .read()
+            .clone()
+            .map(|failure| failure.into_error().to_string())
     }
 
     fn encode_entries_batch(
@@ -657,84 +851,6 @@ impl WriteAheadLog {
             &self.config,
             &self.byte_accounting,
         )
-    }
-
-    async fn group_commit_loop(
-        mut rx: mpsc::Receiver<WriteRequest>,
-        current_file: Arc<RwLock<WalFile>>,
-        config: WalConfig,
-        wal_dir: PathBuf,
-        directory_lock: Option<Weak<DirectoryLock>>,
-        group_commit_in_progress: Arc<AtomicU64>,
-        byte_accounting: Arc<WalByteAccounting>,
-    ) {
-        // Adaptive group commit: no artificial delay for single writers,
-        // but batches concurrent writers efficiently.
-        //
-        // Key insight: during fsync of batch N, writes for batch N+1 accumulate
-        // in the channel. When fsync completes, we grab all pending writes immediately.
-        // The fsync latency itself provides the batching window.
-
-        loop {
-            // Wait for first write (blocking)
-            let first = match rx.recv().await {
-                Some(req) => req,
-                None => break,
-            };
-
-            let mut batch = vec![first];
-
-            // Immediately grab ALL other pending writes (non-blocking)
-            // This is the key optimization: no artificial delay
-            while batch.len() < config.max_batch_size {
-                match rx.try_recv() {
-                    Ok(req) => batch.push(req),
-                    Err(_) => break, // No more pending writes
-                }
-            }
-
-            // If batch is small and we expect high concurrency, optionally wait briefly
-            // This helps batch writes that arrive during the write (not fsync) phase
-            if batch.len() < 4 && config.group_commit_delay_us > 0 {
-                let brief_wait = std::time::Duration::from_micros(
-                    config.group_commit_delay_us.min(100), // Cap at 100μs
-                );
-                let deadline = tokio::time::Instant::now() + brief_wait;
-                while batch.len() < config.max_batch_size {
-                    match tokio::time::timeout_at(deadline, rx.recv()).await {
-                        Ok(Some(req)) => batch.push(req),
-                        _ => break,
-                    }
-                }
-            }
-
-            // Engine-owned WALs may outlive a cancelled append future. Do not
-            // mutate after the Engine's directory ownership has ended; if a
-            // mutation already started, retain ownership through its response.
-            let _directory_lock = match directory_lock.as_ref() {
-                Some(directory_lock) => match directory_lock.upgrade() {
-                    Some(directory_lock) => Some(directory_lock),
-                    None => break,
-                },
-                None => None,
-            };
-            let _in_progress = InProgressGuard::new(Arc::clone(&group_commit_in_progress));
-
-            let result =
-                write_batch_sync(&current_file, &batch, &config, &wal_dir, &byte_accounting);
-            let ok = result.is_ok();
-
-            for req in batch {
-                let _ = req.response.send(if ok {
-                    Ok(())
-                } else {
-                    Err(WalError::Io {
-                        message: "Batch write failed".to_string(),
-                        source: None,
-                    })
-                });
-            }
-        }
     }
 
     async fn open_or_create(
@@ -843,41 +959,255 @@ impl WriteAheadLog {
 // Synchronous helper routines
 // ========================================
 
-fn write_batch_sync(
+async fn collect_group(
+    rx: &mut mpsc::Receiver<GroupCommitCommand>,
+    group: &mut Vec<WriteRequest>,
+    maximum: usize,
+    deadline: tokio::time::Instant,
+) -> Option<GroupCommitCommand> {
+    while group.len() < maximum {
+        match rx.try_recv() {
+            Ok(GroupCommitCommand::Write(request)) => {
+                group.push(request);
+                continue;
+            }
+            Ok(command @ GroupCommitCommand::Barrier(_)) => return Some(command),
+            Err(mpsc::error::TryRecvError::Disconnected) => return None,
+            Err(mpsc::error::TryRecvError::Empty) => {}
+        }
+
+        if deadline <= tokio::time::Instant::now() {
+            return None;
+        }
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(GroupCommitCommand::Write(request))) => group.push(request),
+            Ok(Some(command @ GroupCommitCommand::Barrier(_))) => return Some(command),
+            Ok(None) | Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn reserve_group_sequences(sequence: &AtomicU64, group: &[WriteRequest]) -> Result<u64> {
+    let operation_count = group.iter().try_fold(0_u64, |total, request| {
+        total
+            .checked_add(request.record.operation_count)
+            .ok_or_else(|| WalError::InvalidFormat("group sequence range overflows".to_string()))
+    })?;
+    sequence
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_add(operation_count)
+        })
+        .map_err(|_| WalError::InvalidFormat("group sequence range overflows".to_string()))
+}
+
+fn prepare_group(group: Vec<WriteRequest>, start_sequence: u64) -> Vec<PreparedWriteRequest> {
+    let mut next_sequence = start_sequence;
+    group
+        .into_iter()
+        .map(|request| {
+            let end_sequence = next_sequence + request.record.operation_count;
+            let sequences = (next_sequence..end_sequence).collect();
+            let entry = WalEntry {
+                sequence: next_sequence,
+                timestamp: super::cached_time::now_ms(),
+                entry_type: request.record.entry_type,
+                data: request.record.data,
+            };
+            next_sequence = end_sequence;
+            PreparedWriteRequest {
+                entry,
+                sequences,
+                response: request.response,
+            }
+        })
+        .collect()
+}
+
+async fn poison_group(
+    rx: &mut mpsc::Receiver<GroupCommitCommand>,
+    pending: Option<GroupCommitCommand>,
+    responses: Vec<oneshot::Sender<Result<BatchAppend>>>,
+    shared_failure: &RwLock<Option<GroupCommitFailure>>,
+    error: WalError,
+) {
+    let failure = install_group_failure(shared_failure, &error);
+    rx.close();
+    for response in responses {
+        let _ = response.send(Err(failure.clone().into_error()));
+    }
+    if let Some(command) = pending {
+        fail_group_command(command, &failure);
+    }
+    while let Some(command) = rx.recv().await {
+        fail_group_command(command, &failure);
+    }
+}
+
+fn fail_group_command(command: GroupCommitCommand, failure: &GroupCommitFailure) {
+    match command {
+        GroupCommitCommand::Write(request) => {
+            let _ = request.response.send(Err(failure.clone().into_error()));
+        }
+        GroupCommitCommand::Barrier(response) => {
+            let _ = response.send(Err(failure.clone().into_error()));
+        }
+    }
+}
+
+fn install_group_failure(
+    shared_failure: &RwLock<Option<GroupCommitFailure>>,
+    error: &WalError,
+) -> GroupCommitFailure {
+    let mut stored = shared_failure.write();
+    stored
+        .get_or_insert_with(|| GroupCommitFailure::from_error(error))
+        .clone()
+}
+
+fn write_group_sync(
     current_file: &Arc<RwLock<WalFile>>,
-    batch: &[WriteRequest],
+    group: &[PreparedWriteRequest],
     config: &WalConfig,
     wal_dir: &Path,
+    batch_ranges: &RwLock<BTreeMap<u64, u64>>,
     byte_accounting: &WalByteAccounting,
 ) -> Result<()> {
-    let entries: Vec<&WalEntry> = batch.iter().map(|req| &req.entry).collect();
-
-    let total_batch_size: u64 = entries.iter().map(|e| entry_size(e) as u64).sum();
-    let needs_rotation = {
-        let f = current_file.read();
-        f.should_rotate(total_batch_size, config.max_file_size)
-    };
-    if needs_rotation {
-        rotate_sync(current_file, wal_dir, config, byte_accounting)?;
-    }
-
     let mut f = current_file.write();
-    write_entries_batch(&mut f.file, &entries)?;
-    byte_accounting.record_append(total_batch_size);
-    if let (Some(min_sequence), Some(max_sequence)) = (
-        entries.iter().map(|entry| entry.sequence).min(),
-        entries.iter().map(|entry| entry.sequence).max(),
-    ) {
-        f.record_append(
-            total_batch_size,
-            entries.len() as u64,
-            min_sequence,
-            max_sequence,
-        );
+    let mut rotated = false;
+    let mut start = 0;
+    while start < group.len() {
+        let first_size = entry_size(&group[start].entry) as u64;
+        if f.should_rotate(first_size, config.max_file_size) {
+            rotate_group_segment(&mut f, wal_dir, config, byte_accounting)?;
+            rotated = true;
+        }
+
+        let mut end = start;
+        let mut chunk_bytes = 0_u64;
+        while end < group.len() {
+            let request_bytes = entry_size(&group[end].entry) as u64;
+            let candidate_bytes = chunk_bytes
+                .checked_add(request_bytes)
+                .ok_or_else(|| WalError::InvalidFormat("group byte size overflows".to_string()))?;
+            let has_prior_entry = f.entry_count > 0 || end > start;
+            if has_prior_entry && f.size.saturating_add(candidate_bytes) > config.max_file_size {
+                break;
+            }
+            chunk_bytes = candidate_bytes;
+            end += 1;
+        }
+
+        write_group_chunk(&mut f, &group[start..end], chunk_bytes, byte_accounting)?;
+        start = end;
+        if start < group.len() {
+            rotate_group_segment(&mut f, wal_dir, config, byte_accounting)?;
+            rotated = true;
+        }
     }
 
-    if config.sync_on_write {
-        f.file.sync_all()?;
+    {
+        let mut ranges = batch_ranges.write();
+        for request in group {
+            if request.entry.entry_type == EntryType::Batch {
+                let last_sequence = request
+                    .sequences
+                    .last()
+                    .copied()
+                    .expect("paranoid batch has at least one operation");
+                ranges.insert(request.entry.sequence, last_sequence);
+            }
+        }
+    }
+
+    sync_wal_data(&f.file, wal_dir)?;
+    if rotated {
+        sync_wal_directory(wal_dir)?;
+    }
+    Ok(())
+}
+
+fn write_group_chunk(
+    file: &mut WalFile,
+    group: &[PreparedWriteRequest],
+    encoded_bytes: u64,
+    byte_accounting: &WalByteAccounting,
+) -> Result<()> {
+    let entries: Vec<&WalEntry> = group.iter().map(|request| &request.entry).collect();
+    write_entries_batch(&mut file.file, &entries)?;
+    byte_accounting.record_append(encoded_bytes);
+
+    let first = group
+        .first()
+        .expect("group-commit segment chunk is nonempty");
+    let last = group
+        .last()
+        .expect("group-commit segment chunk is nonempty");
+    let last_sequence = last
+        .sequences
+        .last()
+        .copied()
+        .unwrap_or(last.entry.sequence);
+    let operation_count = group.iter().fold(0_u64, |total, request| {
+        total.saturating_add(request.sequences.len() as u64)
+    });
+    file.record_append(
+        encoded_bytes,
+        operation_count,
+        first.entry.sequence,
+        last_sequence,
+    );
+    Ok(())
+}
+
+fn rotate_group_segment(
+    file: &mut WalFile,
+    wal_dir: &Path,
+    config: &WalConfig,
+    byte_accounting: &WalByteAccounting,
+) -> Result<()> {
+    finalize_header(file)?;
+    let new_sequence = file.next_segment_sequence()?;
+    *file = create_file(wal_dir, new_sequence, config)?;
+    byte_accounting.record_segment_created();
+    info!("Rotated WAL file, new sequence: {}", new_sequence);
+    Ok(())
+}
+
+fn sync_wal_data(file: &File, _wal_dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    check_wal_failpoint(
+        _wal_dir,
+        super::failpoints::PersistenceBoundary::WalDataSync,
+    )?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn sync_wal_directory(wal_dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    check_wal_failpoint(
+        wal_dir,
+        super::failpoints::PersistenceBoundary::WalDirectorySync,
+    )?;
+    sync_directory(wal_dir)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_wal_failpoint(
+    wal_dir: &Path,
+    boundary: super::failpoints::PersistenceBoundary,
+) -> Result<()> {
+    super::failpoints::check(wal_dir, boundary).map_err(|error| WalError::Io {
+        message: error.to_string(),
+        source: None,
+    })?;
+    if let Some(data_dir) = wal_dir.parent() {
+        super::failpoints::check(data_dir, boundary).map_err(|error| WalError::Io {
+            message: error.to_string(),
+            source: None,
+        })?;
     }
     Ok(())
 }
@@ -889,14 +1219,7 @@ fn rotate_sync(
     byte_accounting: &WalByteAccounting,
 ) -> Result<()> {
     let mut current = current_file.write();
-    finalize_header(&mut current)?;
-
-    let new_seq = current.next_segment_sequence()?;
-    *current = create_file(wal_dir, new_seq, config)?;
-    byte_accounting.record_segment_created();
-
-    info!("Rotated WAL file, new sequence: {}", new_seq);
-    Ok(())
+    rotate_group_segment(&mut current, wal_dir, config, byte_accounting)
 }
 
 fn retained_wal_bytes(wal_dir: &Path) -> Result<u64> {
@@ -1048,7 +1371,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn queued_group_commit_single_and_direct_batch_follow_sequence_order() {
+    async fn queued_group_commit_single_and_atomic_batch_follow_sequence_order() {
         let directory = TempDir::new().unwrap();
         let wal = Arc::new(
             WriteAheadLog::new(directory.path(), WalConfig::paranoid())
@@ -1068,9 +1391,13 @@ mod tests {
         locked_rx.await.unwrap();
         let queued_wal = Arc::clone(&wal);
         let queued = tokio::spawn(async move { queued_wal.append(b"key", b"old").await });
-        while wal.current_sequence() < 1 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while wal.group_commit_in_progress_for_test() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first commit group did not reach the WAL lock");
 
         let batch_wal = Arc::clone(&wal);
         let batch = tokio::spawn(async move {
@@ -1081,9 +1408,6 @@ mod tests {
                 ])
                 .await
         });
-        while wal.current_sequence() < 3 {
-            tokio::task::yield_now().await;
-        }
         release_tx.send(()).unwrap();
         lock_holder.await.unwrap();
 
@@ -1097,6 +1421,346 @@ mod tests {
                 .map(|entry| entry.sequence)
                 .collect::<Vec<_>>(),
             [0, 1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_group_size_is_rejected_instead_of_hanging() {
+        let directory = TempDir::new().unwrap();
+        let error = match WriteAheadLog::new(
+            directory.path(),
+            WalConfig::paranoid().with_max_group_size(0),
+        )
+        .await
+        {
+            Ok(_) => panic!("zero group size unexpectedly opened a WAL"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, WalError::InvalidFormat(_)));
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[tokio::test]
+    async fn excessive_collection_window_is_rejected_instead_of_overflowing_deadline() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            group_commit_delay_us: MAX_GROUP_COMMIT_DELAY_US + 1,
+            ..WalConfig::paranoid()
+        };
+        let error = match WriteAheadLog::new(directory.path(), config).await {
+            Ok(_) => panic!("excessive collection window unexpectedly opened a WAL"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, WalError::InvalidFormat(_)));
+        assert!(error.to_string().contains("must not exceed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_paranoid_callers_share_one_bounded_durability_barrier() {
+        const CALLERS: usize = 16;
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig::paranoid()
+            .with_group_commit_delay(std::time::Duration::from_millis(50))
+            .with_max_group_size(CALLERS);
+        let wal = Arc::new(WriteAheadLog::new(directory.path(), config).await.unwrap());
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut callers = Vec::with_capacity(CALLERS);
+        for index in 0..CALLERS {
+            let caller_wal = Arc::clone(&wal);
+            let caller_barrier = Arc::clone(&barrier);
+            callers.push(tokio::spawn(async move {
+                caller_barrier.wait().await;
+                caller_wal
+                    .append(format!("key-{index}").as_bytes(), b"value")
+                    .await
+            }));
+        }
+        barrier.wait().await;
+
+        let mut sequences = Vec::with_capacity(CALLERS);
+        for caller in callers {
+            sequences.push(caller.await.unwrap().unwrap());
+        }
+        sequences.sort_unstable();
+        assert_eq!(sequences, (0..CALLERS as u64).collect::<Vec<_>>());
+        assert_eq!(wal.group_commit_syncs_for_test(), 1);
+        assert_eq!(wal.largest_group_commit_for_test(), CALLERS as u64);
+        assert_eq!(wal.durable_sequence(), CALLERS as u64);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn maximum_group_size_counts_callers_and_zero_delay_is_supported() {
+        const CALLERS: usize = 10;
+        const MAXIMUM: usize = 3;
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig::paranoid()
+            .with_group_commit_delay(std::time::Duration::ZERO)
+            .with_max_group_size(MAXIMUM);
+        let wal = Arc::new(WriteAheadLog::new(directory.path(), config).await.unwrap());
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut callers = Vec::with_capacity(CALLERS);
+        for index in 0..CALLERS {
+            let caller_wal = Arc::clone(&wal);
+            let caller_barrier = Arc::clone(&barrier);
+            callers.push(tokio::spawn(async move {
+                caller_barrier.wait().await;
+                caller_wal
+                    .append(format!("zero-delay-{index}").as_bytes(), b"value")
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        for caller in callers {
+            caller.await.unwrap().unwrap();
+        }
+
+        assert!(wal.group_commit_syncs_for_test() >= CALLERS.div_ceil(MAXIMUM) as u64);
+        assert!(wal.largest_group_commit_for_test() <= MAXIMUM as u64);
+        assert_eq!(wal.durable_sequence(), CALLERS as u64);
+    }
+
+    #[tokio::test]
+    async fn one_large_atomic_batch_is_one_group_member_and_one_wal_envelope() {
+        const OPERATIONS: usize = 4_096;
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: WAL_HEADER_SIZE as u64 + 128,
+            ..WalConfig::paranoid().with_max_group_size(1)
+        };
+        let wal = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        let keys = (0..OPERATIONS)
+            .map(|index| format!("large-batch-{index:04}").into_bytes())
+            .collect::<Vec<_>>();
+        let entries = keys
+            .iter()
+            .map(|key| (key.as_slice(), Some(b"value".as_slice())))
+            .collect::<Vec<_>>();
+
+        let sequences = wal.append_batch(&entries).await.unwrap();
+        assert_eq!(sequences, (0..OPERATIONS as u64).collect::<Vec<_>>());
+        assert_eq!(wal.group_commit_syncs_for_test(), 1);
+        assert_eq!(wal.largest_group_commit_for_test(), 1);
+
+        let path = wal.current_file.read().path.clone();
+        let metadata = inspect_segment(&path, false).unwrap();
+        assert_eq!(metadata.entry_count, OPERATIONS as u64);
+        assert_eq!(metadata.batch_ranges, [(0, OPERATIONS as u64 - 1)]);
+        assert_eq!(wal_paths(directory.path()).len(), 1);
+        assert!(metadata.valid_end > WAL_HEADER_SIZE as u64 + 128);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commit_group_splits_small_records_across_bounded_segments() {
+        const CALLERS: usize = 5;
+        const MAX_FILE_SIZE: u64 = WAL_HEADER_SIZE as u64 + 72;
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: MAX_FILE_SIZE,
+            ..WalConfig::paranoid()
+                .with_group_commit_delay(std::time::Duration::from_millis(50))
+                .with_max_group_size(CALLERS)
+        };
+        let wal = Arc::new(WriteAheadLog::new(directory.path(), config).await.unwrap());
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut callers = Vec::with_capacity(CALLERS);
+        for index in 0..CALLERS {
+            let caller_wal = Arc::clone(&wal);
+            let caller_barrier = Arc::clone(&barrier);
+            callers.push(tokio::spawn(async move {
+                caller_barrier.wait().await;
+                caller_wal
+                    .append(format!("split-{index}").as_bytes(), b"0123456789abcdef")
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        for caller in callers {
+            caller.await.unwrap().unwrap();
+        }
+
+        assert_eq!(wal.group_commit_syncs_for_test(), 1);
+        assert_eq!(wal.largest_group_commit_for_test(), CALLERS as u64);
+        let paths = wal_paths(directory.path());
+        assert_eq!(paths.len(), CALLERS);
+        for path in paths {
+            assert!(inspect_segment(&path, false).unwrap().valid_end <= MAX_FILE_SIZE);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paranoid_caller_waits_until_its_group_is_durable() {
+        let directory = TempDir::new().unwrap();
+        let wal = Arc::new(
+            WriteAheadLog::new(directory.path(), WalConfig::paranoid())
+                .await
+                .unwrap(),
+        );
+        let (locked_tx, locked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_wal = Arc::clone(&wal);
+        let lock_holder = tokio::task::spawn_blocking(move || {
+            let file_guard = lock_wal.lock_current_file_for_test();
+            let _ = locked_tx.send(());
+            release_rx.recv().unwrap();
+            drop(file_guard);
+        });
+        locked_rx.await.unwrap();
+
+        let caller_wal = Arc::clone(&wal);
+        let caller = tokio::spawn(async move { caller_wal.append(b"key", b"value").await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while wal.group_commit_in_progress_for_test() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("commit group did not reach the WAL lock");
+        assert!(!caller.is_finished());
+        assert_eq!(wal.durable_sequence(), 0);
+
+        release_tx.send(()).unwrap();
+        lock_holder.await.unwrap();
+        assert_eq!(caller.await.unwrap().unwrap(), 0);
+        assert_eq!(wal.durable_sequence(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn data_sync_failure_fans_out_drains_queue_and_prevents_later_writes() {
+        const CALLERS: usize = 12;
+        const MAXIMUM: usize = 4;
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig::paranoid()
+            .with_group_commit_delay(std::time::Duration::from_millis(200))
+            .with_max_group_size(MAXIMUM);
+        let wal = Arc::new(
+            WriteAheadLog::new(directory.path(), config.clone())
+                .await
+                .unwrap(),
+        );
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::WalDataSync,
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut callers = Vec::with_capacity(CALLERS);
+        for index in 0..CALLERS {
+            let caller_wal = Arc::clone(&wal);
+            let caller_barrier = Arc::clone(&barrier);
+            callers.push(tokio::spawn(async move {
+                caller_barrier.wait().await;
+                caller_wal
+                    .append(format!("failed-{index}").as_bytes(), b"value")
+                    .await
+            }));
+        }
+        barrier.wait().await;
+
+        let mut messages = Vec::with_capacity(CALLERS);
+        for caller in callers {
+            messages.push(caller.await.unwrap().unwrap_err().to_string());
+        }
+        failure.assert_hit();
+        assert!(messages.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(messages[0].contains("WAL data sync"));
+        assert_eq!(wal.group_commit_syncs_for_test(), 1);
+        assert_eq!(wal.largest_group_commit_for_test(), MAXIMUM as u64);
+        assert_eq!(wal.current_sequence(), MAXIMUM as u64);
+        assert_eq!(wal.durable_sequence(), 0);
+
+        let later = wal.append(b"later", b"not-written").await.unwrap_err();
+        assert_eq!(later.to_string(), messages[0]);
+        assert_eq!(wal.flush().await.unwrap_err().to_string(), messages[0]);
+        assert_eq!(wal.current_sequence(), MAXIMUM as u64);
+        assert_eq!(wal.durable_sequence(), 0);
+        assert_eq!(wal.group_commit_syncs_for_test(), 1);
+
+        drop(wal);
+        let reopened = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        assert_eq!(reopened.durable_sequence(), MAXIMUM as u64);
+        assert_eq!(reopened.read_from(0).await.unwrap().len(), MAXIMUM);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn later_segment_failure_keeps_the_whole_group_frontier_indeterminate() {
+        const CALLERS: usize = 3;
+        const MAX_FILE_SIZE: u64 = WAL_HEADER_SIZE as u64 + 72;
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: MAX_FILE_SIZE,
+            ..WalConfig::paranoid()
+                .with_group_commit_delay(std::time::Duration::from_millis(50))
+                .with_max_group_size(CALLERS)
+        };
+        let wal = Arc::new(
+            WriteAheadLog::new(directory.path(), config.clone())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(wal.append(b"prior", b"durable").await.unwrap(), 0);
+        assert_eq!(wal.durable_sequence(), 1);
+
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::WalDataSync,
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut callers = Vec::with_capacity(CALLERS);
+        for index in 0..CALLERS {
+            let caller_wal = Arc::clone(&wal);
+            let caller_barrier = Arc::clone(&barrier);
+            callers.push(tokio::spawn(async move {
+                caller_barrier.wait().await;
+                caller_wal
+                    .append(format!("failed-segment-{index}").as_bytes(), b"value")
+                    .await
+            }));
+        }
+        barrier.wait().await;
+
+        let mut messages = Vec::with_capacity(CALLERS);
+        for caller in callers {
+            messages.push(caller.await.unwrap().unwrap_err().to_string());
+        }
+        failure.assert_hit();
+        assert!(messages.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(wal.group_commit_syncs_for_test(), 2);
+        assert_eq!(wal.largest_group_commit_for_test(), CALLERS as u64);
+        assert_eq!(wal.current_sequence(), 1 + CALLERS as u64);
+        assert_eq!(wal.durable_sequence(), 1);
+        assert_eq!(wal_paths(directory.path()).len(), 1 + CALLERS);
+
+        drop(wal);
+        let reopened = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        assert_eq!(reopened.durable_sequence(), 1 + CALLERS as u64);
+        assert_eq!(reopened.read_from(0).await.unwrap().len(), 1 + CALLERS);
+    }
+
+    #[tokio::test]
+    async fn rotation_directory_sync_failure_does_not_advance_durable_sequence() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: WAL_HEADER_SIZE as u64 + 40,
+            ..WalConfig::paranoid()
+        };
+        let wal = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        assert_eq!(wal.append(b"first", b"value").await.unwrap(), 0);
+        assert_eq!(wal.durable_sequence(), 1);
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::WalDirectorySync,
+        );
+
+        let error = wal.append(b"second", b"value").await.unwrap_err();
+        failure.assert_hit();
+        assert!(error.to_string().contains("WAL directory sync"));
+        assert_eq!(wal.durable_sequence(), 1);
+        assert_eq!(wal_paths(directory.path()).len(), 2);
+        assert_eq!(
+            wal.append(b"later", b"value")
+                .await
+                .unwrap_err()
+                .to_string(),
+            error.to_string()
         );
     }
 

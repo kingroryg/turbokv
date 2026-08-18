@@ -35,3 +35,30 @@ from a clean checkout, with stable power and thermal settings. Keep the JSON
 artifact with any claim derived from the measurements. This harness establishes
 the protocol; competitive tuning and README performance claims belong to later
 work.
+
+## Paranoid group commit
+
+`paranoid_group_commit` measures the acknowledgement boundary of paranoid
+`Engine::insert` calls. It compares a one-caller group (the one-sync-per-call
+control) with a maximum of 64 callers and a bounded 200 microsecond collection
+window. Both configurations use the same FIFO writer and durability path. Each
+row uses a fresh temporary database, disabled compression, a 16-byte value, and
+reports acknowledgement throughput plus p50, p95, p99, and maximum latency.
+
+The default run is intentionally bounded and covers both a single writer and
+eight concurrent writers:
+
+```console
+cargo bench --bench paranoid_group_commit
+```
+
+Workload sizes can be overridden without changing the durability settings:
+
+```console
+cargo bench --bench paranoid_group_commit -- \
+  --single-operations 256 --writers 8 --operations-per-writer 128
+```
+
+Results depend strongly on the filesystem, storage device, operating system,
+power policy, and background load. Record those alongside any result; do not
+generalize a local smoke-run number into a release performance claim.

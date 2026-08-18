@@ -158,6 +158,11 @@ name = "benchmarks"
 path = "benchmarks/main.rs"
 harness = false
 
+[[bench]]
+name = "paranoid_group_commit"
+path = "benchmarks/paranoid_group_commit.rs"
+harness = false
+
 [[test]]
 name = "benchmark_protocol"
 path = "benchmarks/protocol_tests.rs"

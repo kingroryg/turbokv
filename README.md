@@ -132,14 +132,21 @@ TurboKV provides three durability modes to balance speed and safety:
 |------|-----|-------|----------|
 | `fast()` | No | No | Flushed data survives; unflushed data lost |
 | `durable()` | Yes | Periodic | All data survives process crash |
-| `paranoid()` | Yes | Every write | All data survives power loss |
+| `paranoid()` | Yes | Every commit group | Acknowledged data survives power loss |
 
 **Recommended for most users:** `fast()` or `durable()` mode.
 
 - Use **`fast()`** when data can be regenerated or occasional loss is acceptable
 - Use **`durable()`** for production data that must survive process crashes
 
-The `paranoid()` mode is for specialized use cases where you need power-loss durability. It is expected to be significantly slower because every write is synchronized before acknowledgement.
+The `paranoid()` mode is for specialized use cases where you need power-loss
+durability. Concurrent mutations may share an ordered write and sync barrier;
+each call returns only after its containing group is durable.
+If a barrier fails, every affected caller receives the same causal error and
+the open handle rejects later writes. `status()` keeps the WAL failure visible
+in the flush-health lane until reopen. Because a complete failed-group record
+may be recovered after reopening, treat the failed mutation outcome as
+indeterminate before retrying a non-idempotent operation.
 
 ```rust
 use turbokv::{Db, DbOptions};
@@ -152,7 +159,7 @@ let db = Db::open_with_options("./data", DbOptions::fast()).await?;
 // Best for: most production workloads
 let db = Db::open_with_options("./data", DbOptions::durable()).await?;
 
-// Paranoid mode - fsync on every write
+// Paranoid mode - every acknowledgement follows a successful sync barrier
 // Best for: financial transactions, critical records, audit logs
 let db = Db::open_with_options("./data", DbOptions::paranoid()).await?;
 ```
@@ -164,7 +171,7 @@ use turbokv::{DbOptions, Compression};
 
 let options = DbOptions {
     wal_enabled: true,           // Write-ahead log for durability
-    sync_writes: false,          // Periodic sync (true = fsync every write)
+    sync_writes: false,          // Periodic sync (true = synced acknowledgements)
     memtable_size: 64 * 1024 * 1024,   // 64MB memtable
     block_cache_size: 64 * 1024 * 1024, // 64MB block cache
     compression: Compression::Lz4,      // Lz4, Snappy, Zstd, or None
@@ -200,7 +207,7 @@ the corresponding clean-tree JSON evidence artifact.
 | `write_batch(batch)` | Batch write operations |
 | `flush()` | Flush memtable to disk |
 | `compact()` | Drain the captured manual-compaction scope and report actual files, bytes, duration, reclaimed space, and remaining work |
-| `status()` | Get bounded maintenance health plus current write-backpressure causes and counters |
+| `status()` | Get bounded maintenance/WAL health plus current write-backpressure causes and counters |
 | `close_with_status()` | Close cleanly with a structured unresolved-maintenance error for production monitoring |
 | `logical_stats()` | Scan a coherent snapshot for exact unique live-key and logical-byte counts |
 | `physical_stats()` | Get cheap physical gauges and counters since open without scanning logical data |
