@@ -118,9 +118,13 @@ pub(crate) struct ArmedFailure {
 }
 
 impl ArmedFailure {
+    pub(crate) fn was_hit(&self) -> bool {
+        self.state.hit.load(Ordering::Acquire)
+    }
+
     pub(crate) fn assert_hit(&self) {
         assert!(
-            self.state.hit.load(Ordering::Acquire),
+            self.was_hit(),
             "persistence boundary was not reached: {}",
             self.target.boundary.name()
         );

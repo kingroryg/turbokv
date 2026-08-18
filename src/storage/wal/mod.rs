@@ -1280,18 +1280,27 @@ mod tests {
     use super::types::{LEGACY_ENTRY_EXTENSION_SIZE, WAL_FIRST_SEQUENCE_OFFSET};
     use super::*;
     use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+    use rand::rngs::StdRng;
+    use rand::{Rng, RngCore, SeedableRng};
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
     use tempfile::TempDir;
 
-    fn wal_paths(directory: &Path) -> Vec<PathBuf> {
-        let mut paths: Vec<_> = std::fs::read_dir(directory)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
+    use crate::storage::test_support::stress_context;
+
+    fn wal_paths_result(directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let mut paths = std::fs::read_dir(directory)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
             .filter(|path| path.extension().is_some_and(|extension| extension == "wal"))
-            .collect();
+            .collect::<Vec<_>>();
         paths.sort();
-        paths
+        Ok(paths)
+    }
+
+    fn wal_paths(directory: &Path) -> Vec<PathBuf> {
+        wal_paths_result(directory).unwrap()
     }
 
     fn header_bounds(path: &Path) -> (u64, u64, u64) {
@@ -1303,6 +1312,259 @@ mod tests {
             file.read_u64::<LittleEndian>().unwrap(),
             file.read_u64::<LittleEndian>().unwrap(),
         )
+    }
+
+    fn stress_wal_paths(seed: u64, sequence: u64, directory: &Path) -> Vec<PathBuf> {
+        let context = stress_context(seed, sequence, "unknown", directory.display());
+        wal_paths_result(directory)
+            .unwrap_or_else(|error| panic!("{context}: WAL directory scan failed: {error}"))
+    }
+
+    fn wal_case(seed: u64, sequence: u64, directory: &Path) -> String {
+        let files = stress_wal_paths(seed, sequence, directory)
+            .into_iter()
+            .filter_map(|path| path.file_name().map(|name| name.to_owned()))
+            .collect::<Vec<_>>();
+        stress_context(
+            seed,
+            sequence,
+            files.len().saturating_sub(1),
+            format!("{files:?}"),
+        )
+    }
+
+    async fn run_seeded_arbitrary_wal_model(seed: u64) {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: WAL_HEADER_SIZE as u64 + 144,
+            ..WalConfig::durable()
+        };
+        let mut rng = StdRng::seed_from_u64(seed);
+        let boundary_lengths = [0, 1, 31, 32, 33, 127, 128, 255, 1_024, 4_096];
+        let operations = (0..32)
+            .map(|index| {
+                let key_length = if index < boundary_lengths.len() {
+                    boundary_lengths[index]
+                } else {
+                    rng.gen_range(0..=256)
+                };
+                let value_length = if index < boundary_lengths.len() {
+                    boundary_lengths[boundary_lengths.len() - index - 1]
+                } else {
+                    rng.gen_range(0..=512)
+                };
+                let mut key = vec![0; key_length];
+                let mut value = vec![0; value_length];
+                rng.fill_bytes(&mut key);
+                rng.fill_bytes(&mut value);
+                (key, (rng.next_u32() % 4 != 0).then_some(value))
+            })
+            .collect::<Vec<_>>();
+
+        let wal = WriteAheadLog::new(directory.path(), config.clone())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}: open failed: {error}",
+                    wal_case(seed, 0, directory.path())
+                )
+            });
+        let mut expected = Vec::new();
+        let mut index = 0;
+        while index < operations.len() {
+            let context = wal_case(seed, expected.len() as u64, directory.path());
+            if index % 5 == 0 {
+                let end = (index + 3).min(operations.len());
+                let batch = operations[index..end]
+                    .iter()
+                    .map(|(key, value)| (key.as_slice(), value.as_deref()))
+                    .collect::<Vec<_>>();
+                let sequences = wal
+                    .append_batch(&batch)
+                    .await
+                    .unwrap_or_else(|error| panic!("{context}: batch append failed: {error}"));
+                let wanted = (expected.len() as u64..expected.len() as u64 + batch.len() as u64)
+                    .collect::<Vec<_>>();
+                assert_eq!(sequences, wanted, "{context}");
+                for (sequence, (key, value)) in sequences.into_iter().zip(&operations[index..end]) {
+                    expected.push((sequence, key.clone(), value.clone()));
+                }
+                index = end;
+            } else {
+                let (key, value) = &operations[index];
+                let sequence = match value {
+                    Some(value) => wal.append(key, value).await,
+                    None => wal.append_delete(key).await,
+                }
+                .unwrap_or_else(|error| panic!("{context}: single append failed: {error}"));
+                assert_eq!(sequence, expected.len() as u64, "{context}");
+                expected.push((sequence, key.clone(), value.clone()));
+                index += 1;
+            }
+        }
+        wal.flush().await.unwrap_or_else(|error| {
+            panic!(
+                "{}: flush failed: {error}",
+                wal_case(seed, expected.len() as u64, directory.path())
+            )
+        });
+        assert!(
+            stress_wal_paths(seed, expected.len() as u64, directory.path()).len() > 1,
+            "{}",
+            wal_case(seed, expected.len() as u64, directory.path())
+        );
+        let active_path = wal.current_file.read().path.clone();
+        let tail_context = wal_case(seed, expected.len() as u64, directory.path());
+        let valid_active_length = active_path
+            .metadata()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{tail_context} file={}: metadata failed: {error}",
+                    active_path.display()
+                )
+            })
+            .len();
+        drop(wal);
+
+        let mut active = OpenOptions::new()
+            .append(true)
+            .open(&active_path)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{tail_context} file={}: tail open failed: {error}",
+                    active_path.display()
+                )
+            });
+        active.write_all(&[7, 0, 0]).unwrap_or_else(|error| {
+            panic!(
+                "{tail_context} file={}: tail write failed: {error}",
+                active_path.display()
+            )
+        });
+        drop(active);
+        let repaired = WriteAheadLog::new(directory.path(), config.clone())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}: tail repair failed: {error}",
+                    wal_case(seed, expected.len() as u64, directory.path())
+                )
+            });
+        assert_eq!(
+            active_path
+                .metadata()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{tail_context} file={}: repaired metadata failed: {error}",
+                        active_path.display()
+                    )
+                })
+                .len(),
+            valid_active_length,
+            "{}",
+            wal_case(seed, expected.len() as u64, directory.path())
+        );
+        let replayed = repaired.read_from(0).await.unwrap_or_else(|error| {
+            panic!(
+                "{}: replay failed: {error}",
+                wal_case(seed, expected.len() as u64, directory.path())
+            )
+        });
+        assert_eq!(
+            replayed.len(),
+            expected.len(),
+            "{}",
+            wal_case(seed, expected.len() as u64, directory.path())
+        );
+        for (actual, (sequence, key, value)) in replayed.iter().zip(&expected) {
+            let context = wal_case(seed, *sequence, directory.path());
+            assert_eq!(actual.sequence, *sequence, "{context}");
+            assert_eq!(actual.decode_key(), Some(key.as_slice()), "{context}");
+            assert_eq!(actual.decode_value(), value.as_deref(), "{context}");
+        }
+        let marker_sequence = repaired
+            .append(&[0, 0xff, 0], &[0xff, 0, 0xff])
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}: post-repair append failed: {error}",
+                    wal_case(seed, expected.len() as u64, directory.path())
+                )
+            });
+        assert_eq!(
+            marker_sequence,
+            expected.len() as u64,
+            "{}",
+            wal_case(seed, marker_sequence, directory.path())
+        );
+        repaired.flush().await.unwrap_or_else(|error| {
+            panic!(
+                "{}: post-repair flush failed: {error}",
+                wal_case(seed, marker_sequence, directory.path())
+            )
+        });
+        drop(repaired);
+
+        let paths = stress_wal_paths(seed, marker_sequence, directory.path());
+        let corruption_context = wal_case(seed, marker_sequence, directory.path());
+        let corrupted_path = paths
+            .first()
+            .unwrap_or_else(|| panic!("{corruption_context}: no WAL file to corrupt"))
+            .clone();
+        let mut corrupted = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&corrupted_path)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{corruption_context} file={}: corruption open failed: {error}",
+                    corrupted_path.display()
+                )
+            });
+        let offset = (WAL_HEADER_SIZE + ENTRY_HEADER_SIZE + 1) as u64;
+        corrupted
+            .seek(SeekFrom::Start(offset))
+            .unwrap_or_else(|error| panic!("{corruption_context}: seek failed: {error}"));
+        let byte = corrupted
+            .read_u8()
+            .unwrap_or_else(|error| panic!("{corruption_context}: read failed: {error}"));
+        corrupted
+            .seek(SeekFrom::Start(offset))
+            .unwrap_or_else(|error| panic!("{corruption_context}: reseek failed: {error}"));
+        corrupted
+            .write_all(&[byte ^ 0x80])
+            .unwrap_or_else(|error| panic!("{corruption_context}: corrupt failed: {error}"));
+        corrupted
+            .sync_all()
+            .unwrap_or_else(|error| panic!("{corruption_context}: corrupt sync failed: {error}"));
+        drop(corrupted);
+
+        let error = match WriteAheadLog::new(directory.path(), config).await {
+            Ok(_) => panic!(
+                "{}: corrupted file {} reopened successfully",
+                wal_case(seed, marker_sequence, directory.path()),
+                corrupted_path.display()
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, WalError::CrcMismatch)
+                || error.to_string().contains("CRC mismatch: data corrupted"),
+            "{} file={}: unexpected checksum error: {error}",
+            wal_case(seed, marker_sequence, directory.path()),
+            corrupted_path.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn seeded_arbitrary_bytes_sizes_rotation_repair_batch_and_checksum_model() {
+        for seed in [
+            0x01d7_7f9b_4ac3_e281,
+            0x783c_92e1_05bf_a64d,
+            0xfe10_4b68_d927_3ca5,
+        ] {
+            run_seeded_arbitrary_wal_model(seed).await;
+        }
     }
 
     #[tokio::test]

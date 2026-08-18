@@ -505,7 +505,39 @@ impl Default for Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, RngCore, SeedableRng};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    use crate::storage::test_support::stress_context;
+
+    fn wait_for_manifest_reader(
+        reads: &AtomicU64,
+        previous_reads: u64,
+        failures: &Mutex<Vec<String>>,
+        context: &str,
+    ) -> u64 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let observed = reads.load(Ordering::Acquire);
+            if observed > previous_reads {
+                return observed;
+            }
+            let failures = failures.lock().unwrap();
+            assert!(
+                failures.is_empty(),
+                "{context}: reader failed: {failures:?}"
+            );
+            drop(failures);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{context}: reader did not observe a replacement"
+            );
+            std::thread::yield_now();
+        }
+    }
 
     #[test]
     fn test_manifest_save_load() {
@@ -625,6 +657,128 @@ mod tests {
                 .unwrap()
                 .wal_checkpoint,
             2
+        );
+    }
+
+    #[test]
+    fn seeded_atomic_replacement_and_checksum_model_never_exposes_a_partial_manifest() {
+        const SEED: u64 = 0x65a8_f2c1_904d_7be3;
+
+        let directory = TempDir::new().unwrap();
+        let manifest_path = directory.path().join("MANIFEST");
+        let initial_context = stress_context(SEED, 0, 0, manifest_path.display());
+        Manifest::new()
+            .save(directory.path())
+            .unwrap_or_else(|error| panic!("{initial_context}: initial save failed: {error}"));
+        let reading = Arc::new(AtomicBool::new(true));
+        let reads = Arc::new(AtomicU64::new(0));
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let reader_path = manifest_path.clone();
+        let reader_running = Arc::clone(&reading);
+        let reader_reads = Arc::clone(&reads);
+        let reader_failures = Arc::clone(&failures);
+        let reader = std::thread::spawn(move || {
+            while reader_running.load(Ordering::Acquire) {
+                match Manifest::load(&reader_path) {
+                    Ok(_) => {
+                        reader_reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        reader_failures.lock().unwrap().push(error.to_string());
+                        break;
+                    }
+                }
+                std::thread::yield_now();
+            }
+        });
+        let mut observed_reads = wait_for_manifest_reader(&reads, 0, &failures, &initial_context);
+
+        let mut rng = StdRng::seed_from_u64(SEED);
+        for generation in 0..64_u64 {
+            let mut min_key = vec![0; rng.gen_range(0..=128)];
+            let mut max_key = vec![0; rng.gen_range(0..=128)];
+            rng.fill_bytes(&mut min_key);
+            rng.fill_bytes(&mut max_key);
+            let file_identity = format!("sstables/L0/{generation:010}.sst");
+            let entry_count = rng.gen_range(0..=1_024);
+            let manifest = Manifest {
+                loaded_format_version: u64::from(MANIFEST_VERSION),
+                wal_checkpoint: generation.saturating_mul(3),
+                sstables: vec![SSTableManifestEntry {
+                    id: generation,
+                    level: (generation % 4) as u32,
+                    path: PathBuf::from(&file_identity),
+                    size: rng.next_u64(),
+                    entry_count,
+                    tombstone_count: rng.gen_range(0..=entry_count),
+                    min_key: min_key.clone(),
+                    max_key: max_key.clone(),
+                    min_sequence: generation.saturating_mul(3),
+                    max_sequence: generation.saturating_mul(3).saturating_add(2),
+                    creation_time: rng.next_u64(),
+                }],
+            };
+            let context = stress_context(SEED, manifest.wal_checkpoint, generation, &file_identity);
+            manifest
+                .save(directory.path())
+                .unwrap_or_else(|error| panic!("{context}: save failed: {error}"));
+            assert!(!directory.path().join("MANIFEST.tmp").exists(), "{context}");
+            observed_reads = wait_for_manifest_reader(&reads, observed_reads, &failures, &context);
+
+            let bytes = std::fs::read(&manifest_path)
+                .unwrap_or_else(|error| panic!("{context}: manifest read failed: {error}"));
+            assert!(
+                bytes.len() >= 4,
+                "{context}: manifest checksum is truncated"
+            );
+            let (payload, checksum) = bytes.split_at(bytes.len() - 4);
+            assert_eq!(
+                u32::from_le_bytes(
+                    checksum
+                        .try_into()
+                        .unwrap_or_else(|_| panic!("{context}: checksum was not four bytes")),
+                ),
+                crc32_checksum(payload),
+                "{context}"
+            );
+            let loaded = Manifest::load(&manifest_path)
+                .unwrap_or_else(|error| panic!("{context}: load failed: {error}"));
+            assert_eq!(loaded.wal_checkpoint, manifest.wal_checkpoint, "{context}");
+            assert_eq!(loaded.sstables.len(), 1, "{context}");
+            let loaded_entry = &loaded.sstables[0];
+            assert_eq!(loaded_entry.id, generation, "{context}");
+            assert_eq!(loaded_entry.path, PathBuf::from(file_identity), "{context}");
+            assert_eq!(loaded_entry.min_key, min_key, "{context}");
+            assert_eq!(loaded_entry.max_key, max_key, "{context}");
+        }
+
+        reading.store(false, Ordering::Release);
+        reader
+            .join()
+            .unwrap_or_else(|_| panic!("{initial_context}: manifest reader panicked"));
+        let failures = failures.lock().unwrap().clone();
+        assert!(
+            failures.is_empty(),
+            "{}: {:?}",
+            stress_context(SEED, 63 * 3, "concurrent", manifest_path.display()),
+            failures
+        );
+
+        let corrupt_path = directory.path().join("MANIFEST.corrupt");
+        let corrupt_context = stress_context(SEED, 63 * 3, 63, corrupt_path.display());
+        let mut corrupt = std::fs::read(&manifest_path)
+            .unwrap_or_else(|error| panic!("{corrupt_context}: source read failed: {error}"));
+        let payload_offset = corrupt.len() / 2;
+        corrupt[payload_offset] ^= 0x80;
+        std::fs::write(&corrupt_path, corrupt)
+            .unwrap_or_else(|error| panic!("{corrupt_context}: corrupt write failed: {error}"));
+        let error = match Manifest::load(&corrupt_path) {
+            Ok(_) => panic!("{corrupt_context}: corrupted manifest loaded successfully"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("Manifest checksum mismatch"),
+            "{corrupt_context}: {error}"
         );
     }
 }

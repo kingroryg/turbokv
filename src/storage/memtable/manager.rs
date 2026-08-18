@@ -688,7 +688,12 @@ impl Drop for MemTableManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::{RngCore, SeedableRng};
+    use std::collections::BTreeMap;
     use std::time::Duration;
+
+    use crate::storage::test_support::{stress_context, stress_key_value};
 
     fn test_config() -> MemTableConfig {
         MemTableConfig {
@@ -869,5 +874,191 @@ mod tests {
         let entry = manager.get_entry(b"buffered:key").unwrap();
         assert_eq!(entry.sequence, delete_sequence);
         assert!(entry.is_tombstone());
+    }
+
+    fn memtable_case(seed: u64, manager: &MemTableManager, sequence: u64) -> String {
+        stress_context(seed, sequence, manager.immutable_count(), "<memtable>")
+    }
+
+    fn assert_physical_accounting(seed: u64, manager: &MemTableManager) {
+        let mut tables = manager.immutable.read().clone();
+        tables.push(manager.active.read().clone());
+        for (generation, table) in tables.into_iter().enumerate() {
+            let entries = table.get_all_entries();
+            let expected_bytes = entries.iter().fold(0, |total, (key, entry)| {
+                total + estimated_memtable_entry_size(key, entry.value.as_deref())
+            });
+            let expected_tombstones = entries
+                .iter()
+                .filter(|(_, entry)| entry.is_tombstone())
+                .count();
+            let stats = table.stats();
+            let context =
+                stress_context(seed, manager.current_sequence(), generation, "<memtable>");
+            assert_eq!(stats.entry_count, entries.len(), "{context}");
+            assert_eq!(stats.tombstone_count, expected_tombstones, "{context}");
+            assert_eq!(stats.size_bytes, expected_bytes, "{context}");
+        }
+    }
+
+    fn assert_memtable_model(
+        seed: u64,
+        manager: &MemTableManager,
+        expected: &BTreeMap<Vec<u8>, (Option<Vec<u8>>, u64)>,
+    ) {
+        let context = memtable_case(seed, manager, manager.current_sequence());
+        for (key, (value, sequence)) in expected {
+            let actual = manager
+                .get_entry(key)
+                .unwrap_or_else(|| panic!("{context}: missing key {key:?}"));
+            assert_eq!(actual.sequence, *sequence, "{context}: key={key:?}");
+            assert_eq!(
+                actual.value.as_deref(),
+                value.as_deref(),
+                "{context}: key={key:?}"
+            );
+        }
+        let actual = manager
+            .scan_prefix_entries(b"stress:")
+            .into_iter()
+            .map(|(key, entry)| (key, (entry.value, entry.sequence)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(&actual, expected, "{context}");
+        assert_physical_accounting(seed, manager);
+    }
+
+    fn run_seeded_memtable_model(seed: u64) {
+        let config = MemTableConfig {
+            max_size: 2_048,
+            max_entries: 7,
+            max_age: Duration::from_secs(3_600),
+        };
+        let manager = Arc::new(MemTableManager::new(config));
+        let mut expected = BTreeMap::new();
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let writers = (0..8)
+            .map(|writer| {
+                let manager = Arc::clone(&manager);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let key = format!("stress:concurrent:{writer:02}").into_bytes();
+                    let value = format!("writer:{writer:02}").into_bytes();
+                    barrier.wait();
+                    let sequence = manager.insert(&key, &value).unwrap();
+                    (key, value, sequence)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for writer in writers {
+            let (key, value, sequence) = writer.join().unwrap_or_else(|_| {
+                panic!(
+                    "{}: concurrent writer panicked",
+                    memtable_case(seed, &manager, manager.current_sequence())
+                )
+            });
+            expected.insert(key, (Some(value), sequence));
+        }
+
+        for step in 0..192_u64 {
+            let (key_index, key, value) = stress_key_value(&mut rng, 96);
+            let context = memtable_case(seed, &manager, manager.current_sequence());
+            match step % 7 {
+                0 | 1 => {
+                    let sequence = manager
+                        .insert(&key, &value)
+                        .unwrap_or_else(|error| panic!("{context}: insert failed: {error}"));
+                    expected.insert(key, (Some(value), sequence));
+                }
+                2 => {
+                    let sequence = manager
+                        .delete(&key)
+                        .unwrap_or_else(|error| panic!("{context}: delete failed: {error}"));
+                    expected.insert(key, (None, sequence));
+                }
+                3 => {
+                    let second_key =
+                        format!("stress:key:{:02}", (key_index + 11) % 24).into_bytes();
+                    let second_value = rng.next_u64().to_le_bytes().to_vec();
+                    let entries = vec![
+                        (key.clone(), value.clone()),
+                        (second_key.clone(), second_value.clone()),
+                    ];
+                    let first_sequence = manager.current_sequence();
+                    manager
+                        .insert_many(&entries)
+                        .unwrap_or_else(|error| panic!("{context}: insert_many failed: {error}"));
+                    expected.insert(key, (Some(value), first_sequence));
+                    expected.insert(second_key, (Some(second_value), first_sequence + 1));
+                }
+                4 => manager
+                    .force_rotate()
+                    .unwrap_or_else(|error| panic!("{context}: force rotation failed: {error}")),
+                5 => {
+                    if let Some((_, current_sequence)) = expected.get(&key) {
+                        if *current_sequence > 0 {
+                            manager
+                                .insert_with_sequence(&key, b"stale", current_sequence - 1)
+                                .unwrap_or_else(|error| {
+                                    panic!("{context}: delayed insert failed: {error}")
+                                });
+                        }
+                    }
+                }
+                _ => assert_memtable_model(seed, &manager, &expected),
+            }
+            if step % 13 == 0 {
+                assert_memtable_model(seed, &manager, &expected);
+            }
+        }
+
+        let context = memtable_case(seed, &manager, manager.current_sequence());
+        manager
+            .force_rotate()
+            .unwrap_or_else(|error| panic!("{context}: final rotation failed: {error}"));
+        let failed_flush_generation = manager
+            .peek_immutable_for_flush()
+            .unwrap_or_else(|| panic!("{context}: no immutable generation after rotation"));
+        let flush_id = manager.reserve_flush_id(&failed_flush_generation, seed);
+        let before_failure = manager.scan_prefix_entries(b"stress:");
+        let retry_generation = manager
+            .peek_immutable_for_flush()
+            .unwrap_or_else(|| panic!("{context}: failed generation was not retained"));
+        let context = memtable_case(seed, &manager, manager.current_sequence());
+        assert!(
+            Arc::ptr_eq(&failed_flush_generation, &retry_generation),
+            "{context}"
+        );
+        assert_eq!(
+            manager.reserve_flush_id(&retry_generation, seed.wrapping_add(1)),
+            flush_id,
+            "{context}"
+        );
+        assert_eq!(
+            manager
+                .scan_prefix_entries(b"stress:")
+                .into_iter()
+                .map(|(key, entry)| (key, entry.value, entry.sequence))
+                .collect::<Vec<_>>(),
+            before_failure
+                .into_iter()
+                .map(|(key, entry)| (key, entry.value, entry.sequence))
+                .collect::<Vec<_>>(),
+            "{context}"
+        );
+        assert_memtable_model(seed, &manager, &expected);
+    }
+
+    #[test]
+    fn seeded_overwrite_delete_accounting_concurrency_rotation_and_retry_model() {
+        for seed in [
+            0x0b7e_35a9_c461_82fd,
+            0x619c_f024_8ad3_57e1,
+            0xd8a4_13f7_6c09_be52,
+        ] {
+            run_seeded_memtable_model(seed);
+        }
     }
 }

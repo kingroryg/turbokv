@@ -2424,10 +2424,15 @@ fn wal_data_entry_size(key: &[u8], value: &[u8]) -> u64 {
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::atomic::AtomicBool;
 
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::{RngCore, SeedableRng};
     use tempfile::TempDir;
+
+    use crate::storage::test_support::{stress_context, stress_key_value};
 
     type VersionedTableEntry<'a> = (&'a [u8], Option<&'a [u8]>, u64);
 
@@ -2438,6 +2443,445 @@ mod tests {
             background_tasks_enabled: false,
             ..Default::default()
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum StressMode {
+        Fast,
+        Durable,
+        Paranoid,
+    }
+
+    impl StressMode {
+        fn config(self, path: &std::path::Path) -> StorageConfig {
+            let mut config = match self {
+                Self::Fast => StorageConfig::fast(path.to_path_buf()),
+                Self::Durable => StorageConfig::durable(path.to_path_buf()),
+                Self::Paranoid => StorageConfig::paranoid(path.to_path_buf()),
+            };
+            config.background_tasks_enabled = false;
+            config.memtable_config = MemTableConfig {
+                max_size: 2_048,
+                max_entries: 5,
+                max_age: Duration::from_secs(3_600),
+            };
+            config.wal_config.max_file_size = 64 + 160;
+            config.sstable_config = SSTableConfig {
+                block_size: 256,
+                compression: super::super::sstable::CompressionType::None,
+                ..SSTableConfig::default()
+            };
+            config.compaction_config.l0_compaction_trigger = usize::MAX;
+            config.max_l0_files_before_stall = u64::MAX;
+            config
+        }
+
+        fn wal_enabled(self) -> bool {
+            !matches!(self, Self::Fast)
+        }
+
+        fn failure_boundaries(self) -> &'static [super::super::failpoints::PersistenceBoundary] {
+            use super::super::failpoints::PersistenceBoundary;
+
+            const FAST: &[PersistenceBoundary] = &[
+                PersistenceBoundary::MemtableFreeze,
+                PersistenceBoundary::SstablePublication,
+                PersistenceBoundary::ManifestInstallation,
+                PersistenceBoundary::ManifestDirectorySync,
+                PersistenceBoundary::Checkpoint,
+            ];
+            const WAL: &[PersistenceBoundary] = &[
+                PersistenceBoundary::MemtableFreeze,
+                PersistenceBoundary::SstablePublication,
+                PersistenceBoundary::ManifestInstallation,
+                PersistenceBoundary::ManifestDirectorySync,
+                PersistenceBoundary::Checkpoint,
+                PersistenceBoundary::WalFlush,
+                PersistenceBoundary::WalTruncation,
+            ];
+            if self.wal_enabled() {
+                WAL
+            } else {
+                FAST
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct StressProgress {
+        mode: StressMode,
+        seed: u64,
+        step: u64,
+        sequence: u64,
+    }
+
+    fn storage_stress_context(
+        path: &std::path::Path,
+        progress: StressProgress,
+        generation: u64,
+    ) -> String {
+        let manifest_files = Manifest::load_or_create(path).map_or_else(
+            |error| vec![format!("MANIFEST({error})")],
+            |manifest| {
+                manifest
+                    .sstables
+                    .into_iter()
+                    .map(|table| format!("{}:{}", table.id, table.path.display()))
+                    .collect()
+            },
+        );
+        let wal_files = std::fs::read_dir(path.join("wal")).map_or_else(
+            |_| Vec::new(),
+            |entries| {
+                let mut files = entries
+                    .filter_map(std::result::Result::ok)
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .filter(|name| name.ends_with(".wal"))
+                    .collect::<Vec<_>>();
+                files.sort();
+                files
+            },
+        );
+        let identity = stress_context(progress.seed, progress.sequence, generation, "MANIFEST");
+        format!(
+            "mode={:?} step={} {identity} manifest_files={manifest_files:?} wal_files={wal_files:?}",
+            progress.mode, progress.step
+        )
+    }
+
+    async fn assert_storage_stress_model(
+        engine: &Engine,
+        expected: &BTreeMap<Vec<u8>, Vec<u8>>,
+        progress: StressProgress,
+    ) {
+        let generation = engine.next_sstable_id.load(Ordering::Acquire);
+        let context = storage_stress_context(&engine.config.data_dir, progress, generation);
+        assert_eq!(
+            engine.memtable_manager.current_sequence(),
+            progress.sequence,
+            "{context}"
+        );
+        for key_index in 0..24 {
+            let key = format!("stress:key:{key_index:02}").into_bytes();
+            let actual = engine
+                .get(&key)
+                .await
+                .unwrap_or_else(|error| panic!("{context}: point read failed: {error}"));
+            assert_eq!(
+                actual.as_ref(),
+                expected.get(&key),
+                "{context}: key={key:?}"
+            );
+        }
+        let actual = engine
+            .scan_prefix(b"stress:key:")
+            .await
+            .unwrap_or_else(|error| panic!("{context}: scan failed: {error}"));
+        assert_eq!(
+            actual,
+            expected.clone().into_iter().collect::<Vec<_>>(),
+            "{context}"
+        );
+    }
+
+    async fn reopen_storage_stress(
+        engine: Engine,
+        config: &StorageConfig,
+        expected: &BTreeMap<Vec<u8>, Vec<u8>>,
+        progress: StressProgress,
+    ) -> Engine {
+        if !progress.mode.wal_enabled() {
+            let context = storage_stress_context(
+                &config.data_dir,
+                progress,
+                engine.next_sstable_id.load(Ordering::Acquire),
+            );
+            engine
+                .flush()
+                .await
+                .unwrap_or_else(|error| panic!("{context}: pre-reopen flush failed: {error}"));
+        }
+        drop(engine);
+        let reopened = Engine::open(config.clone()).await.unwrap_or_else(|error| {
+            panic!(
+                "{}: reopen failed: {error}",
+                storage_stress_context(&config.data_dir, progress, 0)
+            )
+        });
+        assert_storage_stress_model(&reopened, expected, progress).await;
+        reopened
+    }
+
+    async fn run_seeded_storage_stress(mode: StressMode, seed: u64, steps: u64) {
+        let directory = TempDir::new().unwrap();
+        let config = mode.config(directory.path());
+        let initial_progress = StressProgress {
+            mode,
+            seed,
+            step: 0,
+            sequence: 0,
+        };
+        let mut engine = Engine::open(config.clone()).await.unwrap_or_else(|error| {
+            panic!(
+                "{}: initial open failed: {error}",
+                storage_stress_context(directory.path(), initial_progress, 0)
+            )
+        });
+        let mut expected = BTreeMap::new();
+        let mut expected_sequence = 0_u64;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut failure_index = 0_usize;
+
+        for step in 0..steps {
+            let (key_index, key, value) = stress_key_value(&mut rng, 192);
+            let progress = StressProgress {
+                mode,
+                seed,
+                step,
+                sequence: expected_sequence,
+            };
+            let context = storage_stress_context(
+                directory.path(),
+                progress,
+                engine.next_sstable_id.load(Ordering::Acquire),
+            );
+
+            if step >= 8 && (step - 8) % 13 == 0 {
+                let marker_key = format!("stress:key:{:02}", (step as usize + 7) % 24).into_bytes();
+                let marker_value = format!("failure:{failure_index}:{seed:016x}").into_bytes();
+                engine
+                    .insert(&marker_key, &marker_value)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{context}: failure marker insert failed: {error}")
+                    });
+                expected.insert(marker_key, marker_value);
+                expected_sequence += 1;
+                let failure_progress = StressProgress {
+                    sequence: expected_sequence,
+                    ..progress
+                };
+                let failure_context = storage_stress_context(
+                    directory.path(),
+                    failure_progress,
+                    engine.next_sstable_id.load(Ordering::Acquire),
+                );
+
+                let boundaries = mode.failure_boundaries();
+                let boundary = boundaries[failure_index % boundaries.len()];
+                failure_index += 1;
+                let failure = super::super::failpoints::arm(directory.path(), boundary);
+                let result = engine.flush().await;
+                assert!(
+                    failure.was_hit(),
+                    "{failure_context}: {boundary:?} was not reached"
+                );
+                assert!(
+                    result.is_err(),
+                    "{failure_context}: {boundary:?} did not fail"
+                );
+                assert_storage_stress_model(&engine, &expected, failure_progress).await;
+
+                if !mode.wal_enabled() {
+                    engine.flush().await.unwrap_or_else(|error| {
+                        panic!("{failure_context}: retry after {boundary:?} failed: {error}")
+                    });
+                }
+                engine = reopen_storage_stress(engine, &config, &expected, failure_progress).await;
+                continue;
+            }
+
+            match step % 8 {
+                0 | 7 => {
+                    engine
+                        .insert(&key, &value)
+                        .await
+                        .unwrap_or_else(|error| panic!("{context}: insert failed: {error}"));
+                    expected.insert(key, value);
+                    expected_sequence += 1;
+                }
+                1 => {
+                    engine
+                        .delete(&key)
+                        .await
+                        .unwrap_or_else(|error| panic!("{context}: delete failed: {error}"));
+                    expected.remove(&key);
+                    expected_sequence += 1;
+                }
+                2 => {
+                    let second_key = format!("stress:key:{:02}", (key_index + 9) % 24).into_bytes();
+                    let second_value = rng.next_u64().to_le_bytes().to_vec();
+                    let entries = vec![
+                        (key.clone(), value.clone()),
+                        (second_key.clone(), second_value.clone()),
+                    ];
+                    engine
+                        .insert_many(&entries)
+                        .await
+                        .unwrap_or_else(|error| panic!("{context}: insert_many failed: {error}"));
+                    expected.insert(key, value);
+                    expected.insert(second_key, second_value);
+                    expected_sequence += 2;
+                }
+                3 => {
+                    let deleted_key =
+                        format!("stress:key:{:02}", (key_index + 5) % 24).into_bytes();
+                    let mut batch = WriteBatch::new();
+                    batch.put(&key, b"batch-prefix");
+                    batch.delete(&key);
+                    batch.put(&key, &value);
+                    batch.delete(&deleted_key);
+                    engine
+                        .write_batch(&batch)
+                        .await
+                        .unwrap_or_else(|error| panic!("{context}: write_batch failed: {error}"));
+                    expected.insert(key, value);
+                    expected.remove(&deleted_key);
+                    expected_sequence += 4;
+                }
+                4 => {
+                    assert_storage_stress_model(&engine, &expected, progress).await;
+                }
+                5 => engine
+                    .flush()
+                    .await
+                    .unwrap_or_else(|error| panic!("{context}: flush failed: {error}")),
+                _ => {
+                    engine = reopen_storage_stress(engine, &config, &expected, progress).await;
+                }
+            }
+        }
+
+        let final_progress = StressProgress {
+            mode,
+            seed,
+            step: steps,
+            sequence: expected_sequence,
+        };
+        let final_context = storage_stress_context(
+            directory.path(),
+            final_progress,
+            engine.next_sstable_id.load(Ordering::Acquire),
+        );
+        engine
+            .flush()
+            .await
+            .unwrap_or_else(|error| panic!("{final_context}: final flush failed: {error}"));
+        assert_storage_stress_model(&engine, &expected, final_progress).await;
+        let manifest = Manifest::load_or_create(directory.path())
+            .unwrap_or_else(|error| panic!("{final_context}: manifest load failed: {error}"));
+        let referenced = manifest
+            .sstables
+            .iter()
+            .map(|table| {
+                std::fs::canonicalize(&table.path).unwrap_or_else(|error| {
+                    panic!(
+                        "{final_context}: referenced file {} is unavailable: {error}",
+                        table.path.display()
+                    )
+                })
+            })
+            .collect::<HashSet<_>>();
+        assert!(
+            referenced.iter().all(|path| path.is_file()),
+            "{final_context}"
+        );
+        let discovered = discover_sstable_files(&directory.path().join("sstables"))
+            .unwrap_or_else(|error| panic!("{final_context}: SSTable scan failed: {error}"))
+            .into_iter()
+            .map(|path| {
+                std::fs::canonicalize(&path).unwrap_or_else(|error| {
+                    panic!(
+                        "{final_context}: discovered file {} is unavailable: {error}",
+                        path.display()
+                    )
+                })
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            discovered,
+            referenced,
+            "{}",
+            storage_stress_context(
+                directory.path(),
+                final_progress,
+                engine.next_sstable_id.load(Ordering::Acquire),
+            )
+        );
+        engine
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("{final_context}: shutdown failed: {error}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seeded_mutation_rotation_flush_failure_and_reopen_model_covers_every_mode() {
+        for (mode, seed) in [
+            (StressMode::Fast, 0x29e1_7b84_c605_f3ad),
+            (StressMode::Durable, 0x740c_a3d9_165e_82bf),
+            (StressMode::Paranoid, 0xc5b8_4f20_e973_1da6),
+        ] {
+            run_seeded_storage_stress(mode, seed, 96).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "explicit storage stress repetitions"]
+    async fn repeated_seeded_storage_stress() {
+        for seed in [
+            0x172d_90b4_e56a_c83f,
+            0x4f8a_31e7_b2c6_950d,
+            0xa630_d5f9_18be_274c,
+        ] {
+            for mode in [StressMode::Fast, StressMode::Durable, StressMode::Paranoid] {
+                run_seeded_storage_stress(mode, seed, 192).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_manifest_reference_reports_file_identity_without_cleanup_side_effects() {
+        let directory = TempDir::new().unwrap();
+        let config = StressMode::Durable.config(directory.path());
+        let engine = Engine::open(config.clone()).await.unwrap();
+        engine.insert(b"missing:key", b"value").await.unwrap();
+        engine.flush().await.unwrap();
+        engine.shutdown().await.unwrap();
+        drop(engine);
+
+        let manifest_path = directory.path().join("MANIFEST");
+        let manifest_bytes = std::fs::read(&manifest_path).unwrap();
+        let manifest = Manifest::load(&manifest_path).unwrap();
+        let referenced = manifest.sstables[0].path.clone();
+        let displaced = referenced.with_extension("sst.missing");
+        std::fs::rename(&referenced, &displaced).unwrap();
+        let context = format!(
+            "seed=none sequence={} generation={} file={}",
+            manifest.wal_checkpoint,
+            manifest.sstables[0].id,
+            referenced.display()
+        );
+
+        let error = match Engine::open(config.clone()).await {
+            Ok(_) => panic!("{context}: missing manifest reference opened"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains(&referenced.display().to_string()),
+            "{context}: {error}"
+        );
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest_bytes);
+        assert!(displaced.is_file());
+
+        std::fs::rename(&displaced, &referenced).unwrap();
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(
+            reopened.get(b"missing:key").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+        reopened.shutdown().await.unwrap();
     }
 
     fn write_valid_orphan(path: &std::path::Path) {
