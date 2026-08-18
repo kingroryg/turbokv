@@ -1,10 +1,13 @@
 use bytes::Bytes;
+use std::time::Duration;
 use thiserror::Error;
 
 pub const WAL_MAGIC: &[u8; 8] = b"TURBOKV\0";
 pub const WAL_VERSION: u32 = 4;
 pub const WAL_HEADER_SIZE: usize = 64;
 pub const ENTRY_HEADER_SIZE: usize = 32;
+/// Largest supported paranoid group-commit collection window.
+pub const MAX_GROUP_COMMIT_DELAY_US: u64 = 60_000_000;
 pub(crate) const LEGACY_ENTRY_EXTENSION_SIZE: usize = 96;
 pub(crate) const WAL_FIRST_SEQUENCE_OFFSET: u64 = 20;
 pub(crate) const ENTRY_TYPE_OFFSET: usize = 20;
@@ -215,9 +218,17 @@ pub struct WalConfig {
     pub compression: bool,
     /// Write buffer size
     pub buffer_size: usize,
-    /// Group commit delay in microseconds
+    /// Maximum time the paranoid writer waits to collect a commit group.
+    ///
+    /// Zero disables the intentional wait while still grouping requests that
+    /// are already queued together.
     pub group_commit_delay_us: u64,
-    /// Maximum batch size for group commit
+    /// Maximum number of callers in one paranoid commit group.
+    ///
+    /// This must be greater than zero. One caller may still contain an atomic
+    /// [`WriteBatch`](crate::core::WriteBatch) with multiple logical mutations.
+    /// The legacy field name is retained for source compatibility; use
+    /// [`WalConfig::with_max_group_size`] when constructing new configurations.
     pub max_batch_size: usize,
 }
 
@@ -264,6 +275,26 @@ impl WalConfig {
             group_commit_delay_us: 0, // No delay - fsync latency itself batches concurrent writes
             ..Default::default()
         }
+    }
+
+    /// Set the bounded collection window for paranoid group commit.
+    ///
+    /// Durations larger than [`u64::MAX`] microseconds are saturated and values
+    /// above 60 seconds are rejected when the WAL is opened. A zero duration
+    /// performs no intentional wait but still drains requests already queued
+    /// behind the current writer.
+    pub fn with_group_commit_delay(mut self, delay: Duration) -> Self {
+        self.group_commit_delay_us = u64::try_from(delay.as_micros()).unwrap_or(u64::MAX);
+        self
+    }
+
+    /// Set the maximum number of callers sharing one paranoid durability
+    /// barrier.
+    ///
+    /// A value of zero is rejected when the WAL is opened.
+    pub fn with_max_group_size(mut self, maximum: usize) -> Self {
+        self.max_batch_size = maximum;
+        self
     }
 }
 

@@ -143,6 +143,25 @@ impl MaintenanceHealth {
         }
     }
 
+    pub(super) fn status_with_wal_failure(&self, wal_failure: Option<&str>) -> MaintenanceStatus {
+        let mut status = self.status();
+        if let Some(error) = wal_failure {
+            let sequence_since_open = status.flush.failures_since_open.saturating_add(1);
+            status.flush.retry_pending = true;
+            status.flush.failures_since_open = sequence_since_open;
+            if status.flush.unresolved_failure.is_none() {
+                let (message, message_truncated) = bounded_message(&error);
+                status.flush.unresolved_failure = Some(MaintenanceFailure {
+                    sequence_since_open,
+                    origin: MaintenanceOrigin::Foreground,
+                    message,
+                    message_truncated,
+                });
+            }
+        }
+        status
+    }
+
     pub(super) fn retry_pending(&self, operation: MaintenanceOperation) -> bool {
         self.operation(operation)
             .unresolved_failure
@@ -252,10 +271,34 @@ mod tests {
         );
 
         let status = health.status();
-        let failure = status.flush.unresolved_failure.unwrap();
+        let failure = status.flush.unresolved_failure.as_ref().unwrap();
         assert_eq!(failure.message.len(), MAX_FAILURE_MESSAGE_BYTES);
         assert!(failure.message.is_char_boundary(failure.message.len()));
         assert!(failure.message_truncated);
+    }
+
+    #[test]
+    fn wal_poison_counts_without_replacing_the_first_flush_failure() {
+        let health = MaintenanceHealth::default();
+        health.record_failure(
+            MaintenanceOperation::Flush,
+            MaintenanceOrigin::Background,
+            &"first background flush failure",
+        );
+
+        let status = health.status_with_wal_failure(Some("later WAL data sync failure"));
+        assert!(status.flush.retry_pending);
+        assert_eq!(status.flush.failures_since_open, 2);
+        assert_eq!(status.flush.background_failures_since_open, 1);
+        let failure = status.flush.unresolved_failure.as_ref().unwrap();
+        assert_eq!(failure.sequence_since_open, 1);
+        assert_eq!(failure.origin, MaintenanceOrigin::Background);
+        assert_eq!(failure.message, "first background flush failure");
+
+        assert_eq!(
+            health.status_with_wal_failure(Some("later WAL data sync failure")),
+            status
+        );
     }
 
     #[test]

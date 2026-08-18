@@ -13,6 +13,8 @@ use super::engine::{Result, StorageError};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PersistenceBoundary {
     Wal,
+    WalDataSync,
+    WalDirectorySync,
     WalFlush,
     WalTruncation,
     MemtableFreeze,
@@ -31,6 +33,8 @@ impl PersistenceBoundary {
     fn name(self) -> &'static str {
         match self {
             Self::Wal => "WAL",
+            Self::WalDataSync => "WAL data sync",
+            Self::WalDirectorySync => "WAL directory sync",
             Self::WalFlush => "WAL flush",
             Self::WalTruncation => "WAL truncation",
             Self::MemtableFreeze => "memtable freeze",

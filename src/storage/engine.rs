@@ -185,12 +185,14 @@ impl Default for StorageConfig {
 impl StorageConfig {
     /// Create config from DbConfig
     pub fn from_db_config(db_config: &DbConfig, data_dir: PathBuf) -> Self {
+        let wal_config = if db_config.sync_writes {
+            WalConfig::paranoid()
+        } else {
+            WalConfig::durable()
+        };
         Self {
             data_dir,
-            wal_config: WalConfig {
-                sync_on_write: db_config.sync_writes,
-                ..Default::default()
-            },
+            wal_config,
             memtable_config: MemTableConfig {
                 max_size: db_config.memtable_size,
                 ..Default::default()
@@ -1112,7 +1114,9 @@ impl Engine {
     /// draining the immutable FIFO and completing registered WAL post-work;
     /// compaction retries require an exact final selection with no publication
     /// reconciliation, startup scan failure, or deferred cleanup remaining.
-    /// Counters reset after reopen.
+    /// A poisoned paranoid WAL also marks the flush lane unhealthy and requires
+    /// reopen because its failed commit outcome may be indeterminate. Counters
+    /// reset after reopen.
     pub fn status(&self) -> DatabaseStatus {
         let immutable_current =
             u64::try_from(self.memtable_manager.immutable_count()).unwrap_or(u64::MAX);
@@ -1125,7 +1129,7 @@ impl Engine {
         let stall_counters = self.write_stalls.snapshot();
 
         DatabaseStatus {
-            maintenance: self.maintenance_health.status(),
+            maintenance: self.maintenance_status(),
             write_backpressure: WriteBackpressureStatus {
                 active: immutable_active || level_zero_active,
                 stalls_since_open: stall_counters.count,
@@ -1146,6 +1150,16 @@ impl Engine {
                 },
             },
         }
+    }
+
+    fn maintenance_status(&self) -> MaintenanceStatus {
+        let wal_failure = self
+            .wal
+            .as_ref()
+            .and_then(|wal| wal.group_commit_failure_for_status())
+            .map(|failure| format!("WAL error: {failure}"));
+        self.maintenance_health
+            .status_with_wal_failure(wal_failure.as_deref())
     }
 
     /// Get cheap physical gauges and process-lifetime cumulative counters.
@@ -1295,7 +1309,7 @@ impl Engine {
 
         // Flush pending writes
         let flush_result = self.flush_with_origin(MaintenanceOrigin::Shutdown).await;
-        let status = self.maintenance_health.status();
+        let status = self.maintenance_status();
 
         if !status.is_healthy() {
             return Err(MaintenanceShutdownError::UnresolvedMaintenance(Box::new(
@@ -4620,6 +4634,211 @@ mod tests {
             engine.get(b"blocked:key").await.unwrap(),
             Some(b"new".to_vec())
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_paranoid_mutation_entrypoint_shares_the_ordered_group_writer() {
+        const CALLERS: usize = 4;
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), true);
+        config.wal_config = WalConfig::paranoid()
+            .with_group_commit_delay(Duration::from_millis(50))
+            .with_max_group_size(CALLERS);
+        let engine = Arc::new(Engine::open(config).await.unwrap());
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+
+        let insert = {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                engine.insert(b"mixed:insert", b"value").await
+            })
+        };
+        let delete = {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                engine.delete(b"mixed:delete").await
+            })
+        };
+        let insert_many = {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                engine
+                    .insert_many(&[
+                        (b"mixed:many-a".to_vec(), b"a".to_vec()),
+                        (b"mixed:many-b".to_vec(), b"b".to_vec()),
+                    ])
+                    .await
+            })
+        };
+        let write_batch = {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                let mut batch = WriteBatch::new();
+                batch.put(b"mixed:batch-put", b"value");
+                batch.delete(b"mixed:batch-delete");
+                barrier.wait().await;
+                engine.write_batch(&batch).await
+            })
+        };
+
+        barrier.wait().await;
+        for result in [insert, delete, insert_many, write_batch] {
+            result.await.unwrap().unwrap();
+        }
+        let wal = engine.wal.as_ref().unwrap();
+        assert_eq!(wal.group_commit_syncs_for_test(), 1);
+        assert_eq!(wal.largest_group_commit_for_test(), CALLERS as u64);
+        assert_eq!(wal.current_sequence(), 6);
+        assert_eq!(wal.durable_sequence(), 6);
+        assert_eq!(wal.read_from(0).await.unwrap().len(), 6);
+        assert_eq!(
+            engine.get(b"mixed:insert").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(
+            engine.get(b"mixed:many-a").await.unwrap(),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(
+            engine.get(b"mixed:many-b").await.unwrap(),
+            Some(b"b".to_vec())
+        );
+        assert_eq!(
+            engine.get(b"mixed:batch-put").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_flush_barrier_drains_a_cancelled_collected_append() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), true);
+        config.wal_config = WalConfig::paranoid()
+            .with_group_commit_delay(Duration::from_secs(30))
+            .with_max_group_size(8);
+        let engine = Arc::new(Engine::open(config.clone()).await.unwrap());
+        let wal = engine.wal.as_ref().unwrap();
+
+        let inserting_engine = Arc::clone(&engine);
+        let insertion = tokio::spawn(async move {
+            inserting_engine
+                .insert(b"cancelled-before-shutdown", b"recover-me")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while wal.group_commit_in_progress_for_test() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("group writer did not collect the append");
+        insertion.abort();
+        assert!(insertion.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(Duration::from_secs(1), engine.shutdown())
+            .await
+            .expect("shutdown waited for the full collection window")
+            .unwrap();
+        assert_eq!(wal.current_sequence(), 1);
+        assert_eq!(wal.durable_sequence(), 1);
+
+        drop(engine);
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(
+            reopened.get(b"cancelled-before-shutdown").await.unwrap(),
+            Some(b"recover-me".to_vec())
+        );
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn poisoned_paranoid_wal_is_visible_in_health_and_shutdown() {
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), true);
+        config.wal_config = WalConfig::paranoid()
+            .with_group_commit_delay(Duration::from_millis(50))
+            .with_max_group_size(8);
+        let engine = Arc::new(Engine::open(config.clone()).await.unwrap());
+        let wal = engine.wal.as_ref().unwrap();
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::WalDataSync,
+        );
+
+        let inserting_engine = Arc::clone(&engine);
+        let insertion = tokio::spawn(async move {
+            inserting_engine
+                .insert(b"poisoned-health", b"recover-me")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while wal.group_commit_in_progress_for_test() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("group writer did not collect the poisoned append");
+        insertion.abort();
+        assert!(insertion.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while wal.group_commit_in_progress_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("group writer did not publish its failure");
+        failure.assert_hit();
+        let status = engine.status();
+        assert!(status.maintenance.flush.retry_pending);
+        let reported_failure = status
+            .maintenance
+            .flush
+            .unresolved_failure
+            .as_ref()
+            .expect("poisoned WAL failure was not retained");
+        assert!(reported_failure.message.contains("WAL data sync"));
+        assert_eq!(reported_failure.origin, MaintenanceOrigin::Foreground);
+        assert_eq!(status.maintenance.flush.failures_since_open, 1);
+
+        let empty_flush_error = engine.flush().await.unwrap_err();
+        assert!(empty_flush_error.to_string().contains("WAL data sync"));
+        let after_empty_flush = engine.status().maintenance.flush;
+        assert_eq!(after_empty_flush.failures_since_open, 2);
+        assert_eq!(
+            after_empty_flush.unresolved_failure,
+            status.maintenance.flush.unresolved_failure
+        );
+
+        let shutdown = engine.shutdown_with_status().await.unwrap_err();
+        let shutdown_status = match shutdown {
+            MaintenanceShutdownError::UnresolvedMaintenance(status) => status,
+            MaintenanceShutdownError::Storage(error) => {
+                panic!("expected retained health, got storage error: {error}")
+            }
+        };
+        assert_eq!(shutdown_status.flush.failures_since_open, 3);
+        assert_eq!(shutdown_status.flush.successful_retries_since_open, 0);
+        assert_eq!(
+            shutdown_status.flush.unresolved_failure,
+            status.maintenance.flush.unresolved_failure
+        );
+        assert_eq!(engine.status().maintenance.flush, shutdown_status.flush);
+
+        drop(engine);
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(
+            reopened.get(b"poisoned-health").await.unwrap(),
+            Some(b"recover-me".to_vec())
+        );
+        assert!(reopened.status().maintenance.is_healthy());
+        reopened.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
