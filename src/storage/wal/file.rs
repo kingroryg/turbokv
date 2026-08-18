@@ -42,8 +42,8 @@ pub(crate) enum WalFormat {
 impl WalFormat {
     fn from_version(version: u32) -> Result<Self> {
         match version {
-            1 | 2 => Ok(Self::Legacy),
-            3 => Ok(Self::V3),
+            WAL_VERSION_V1 | WAL_VERSION_V2 => Ok(Self::Legacy),
+            WAL_VERSION_V3 => Ok(Self::V3),
             WAL_VERSION => Ok(Self::Current),
             _ => Err(WalError::InvalidFormat(format!(
                 "Unsupported WAL version: {version}"
@@ -212,6 +212,9 @@ pub(crate) fn open_recovered_file(
     metadata: &SegmentMetadata,
 ) -> Result<(WalFile, u64)> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    if file.metadata()?.len() != metadata.valid_end {
+        file.set_len(metadata.valid_end)?;
+    }
     rewrite_header(&mut file, metadata)?;
     file.sync_all()?;
     file.seek(SeekFrom::Start(metadata.valid_end))?;
@@ -237,9 +240,35 @@ pub(crate) fn open_recovered_file(
 /// segment. A bad record with bytes after its declared end, or with a later
 /// independently valid record, is interior corruption and is never skipped.
 pub(crate) fn inspect_segment(path: &Path, repair_tail: bool) -> Result<SegmentMetadata> {
+    inspect_segment_with_tail_policy(
+        path,
+        if repair_tail {
+            TailPolicy::Repair
+        } else {
+            TailPolicy::Reject
+        },
+    )
+}
+
+/// Perform the same tail classification as recovery without changing bytes.
+pub(crate) fn preflight_active_segment(path: &Path) -> Result<SegmentMetadata> {
+    inspect_segment_with_tail_policy(path, TailPolicy::AllowRecoverable)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TailPolicy {
+    Reject,
+    AllowRecoverable,
+    Repair,
+}
+
+fn inspect_segment_with_tail_policy(
+    path: &Path,
+    tail_policy: TailPolicy,
+) -> Result<SegmentMetadata> {
     let mut file = OpenOptions::new()
         .read(true)
-        .write(repair_tail)
+        .write(tail_policy == TailPolicy::Repair)
         .open(path)?;
     let file_len = file.metadata()?.len();
     let (format, _header_first_sequence) = read_and_validate_header(&mut file)?;
@@ -298,7 +327,7 @@ pub(crate) fn inspect_segment(path: &Path, repair_tail: bool) -> Result<SegmentM
                     )?
                 };
 
-                if suffix != SuffixScan::Exhausted || !repair_tail {
+                if suffix != SuffixScan::Exhausted || tail_policy == TailPolicy::Reject {
                     let ambiguity = if suffix == SuffixScan::Ambiguous {
                         "; plausible-suffix search exceeded its recovery budget"
                     } else {
@@ -311,6 +340,10 @@ pub(crate) fn inspect_segment(path: &Path, repair_tail: bool) -> Result<SegmentM
                         path.display(),
                         ambiguity
                     )));
+                }
+
+                if tail_policy == TailPolicy::AllowRecoverable {
+                    return Ok(metadata);
                 }
 
                 file.set_len(metadata.valid_end)?;
@@ -463,23 +496,43 @@ fn plausible_record_size(
 pub(crate) fn read_and_validate_header(
     reader: &mut (impl Read + Seek),
 ) -> Result<(WalFormat, u64)> {
+    // Released WAL headers carry a zero checksum placeholder. Treat their
+    // sequence/count fields as repairable metadata: record checksums and
+    // payload structure are authoritative, and headers are rewritten only
+    // after the complete database has passed read-only preflight.
     reader.seek(SeekFrom::Start(0))?;
+    let mut header = [0_u8; WAL_HEADER_SIZE];
+    if let Err(error) = reader.read_exact(&mut header) {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Err(WalError::InvalidFormat(format!(
+                "WAL header is truncated: expected {WAL_HEADER_SIZE} bytes"
+            )));
+        }
+        return Err(error.into());
+    }
+    let mut header = &header[..];
     let mut magic = [0_u8; 8];
-    reader.read_exact(&mut magic)?;
+    header.read_exact(&mut magic)?;
     if &magic != WAL_MAGIC && &magic != b"HANSHIRO" {
         return Err(WalError::InvalidFormat(
             "Invalid WAL file magic number".to_string(),
         ));
     }
 
-    let version = reader.read_u32::<LittleEndian>()?;
+    let version = header.read_u32::<LittleEndian>()?;
     let format = WalFormat::from_version(version)?;
-    let _creation_time = reader.read_u64::<LittleEndian>()?;
-    let first_sequence = reader.read_u64::<LittleEndian>()?;
-    let _last_sequence = reader.read_u64::<LittleEndian>()?;
-    let _entry_count = reader.read_u64::<LittleEndian>()?;
-    let _checksum = reader.read_u32::<LittleEndian>()?;
-    reader.read_exact(&mut [0_u8; 16])?;
+    let _creation_time = header.read_u64::<LittleEndian>()?;
+    let first_sequence = header.read_u64::<LittleEndian>()?;
+    let _last_sequence = header.read_u64::<LittleEndian>()?;
+    let _entry_count = header.read_u64::<LittleEndian>()?;
+    let _checksum = header.read_u32::<LittleEndian>()?;
+    let mut reserved = [0_u8; 16];
+    header.read_exact(&mut reserved)?;
+    if reserved != [0_u8; 16] {
+        return Err(WalError::InvalidFormat(
+            "nonzero reserved WAL header bytes".to_string(),
+        ));
+    }
     Ok((format, first_sequence))
 }
 

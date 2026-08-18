@@ -129,7 +129,9 @@ pub(crate) fn decode_entry_ref(
         if value_end != entry_end {
             return Err(invalid_block("entry has trailing bytes after its value"));
         }
-        let value_range = (value_len != 0).then_some(position..value_end);
+        // Version 1 predates tombstones. A zero-length value is therefore an
+        // empty stored value, not a deletion.
+        let value_range = Some(position..value_end);
         return Ok((
             key,
             SSTableEntryRef {

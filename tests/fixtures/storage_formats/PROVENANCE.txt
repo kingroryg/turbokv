@@ -1,0 +1,34 @@
+TurboKV immutable storage-format fixtures
+
+Generator: tests/fixtures/storage_formats/generate.py
+Byte order: little endian. Compression: none.
+
+Released format provenance:
+- v0.2.0 (tag commit b577353a43c245e5830b3b16e06be1566763a3bc):
+  manifest v1 with zero checksum placeholder,
+  WAL v3, SSTable v1 with zero footer checksum placeholder.
+- v0.2.1 (tag commit ee9bf5021fafa38fb238c62db796c01a529bf118):
+  same stable identifiers and placeholder behavior as v0.2.0.
+- v0.5.0 (tag commit bbc82a9270767a9767027de7dc373668b277f838):
+  manifest v1 with CRC32, WAL v3, SSTable v2 with CRC32.
+
+The historical layouts were transcribed from src/storage/manifest.rs,
+src/storage/wal/{file,types}.rs, and src/storage/sstable/{writer,types}.rs at
+those tag commits. Release-directory manifests use a relative SSTable path so
+the immutable fixtures remain portable; database open resolves it against the
+locked database directory before validation and migration.
+
+Supported migration fixtures:
+- manifest v1 placeholder + v1 CRC32, v2, and current v3;
+- WAL v1 and v2 legacy 96-byte extensions, v3, and current v4 batches;
+- SSTable v1 placeholder + v1 CRC32, v2, and current v3.
+
+The fixtures contain 0x00/0xff keys and values, an empty value, tombstones in
+formats that can represent them, a v4 atomic batch, exact 64-byte uncompressed
+SSTable block data, and exact 256/512-byte legacy WAL segment boundaries. Tests
+exercise all 4 manifest x 4 WAL x 4 SSTable combinations through Db, configure
+the writer's block maximum to that 64-byte spelling, and configure the WAL
+maximum to the exact v4 fixture length before proving the next append rotates.
+
+Normal tests never regenerate these files. Run `python3
+tests/fixtures/storage_formats/generate.py --verify` to verify bytes and hashes.

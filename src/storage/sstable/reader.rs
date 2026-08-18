@@ -3,7 +3,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -25,6 +25,7 @@ pub struct SSTableReader {
     file_id: u64,
     mmap: Mmap,
     format_version: u32,
+    metadata_offset: u64,
     index: SSTableIndex,
     bloom_filter: Option<BloomFilter>,
     cache: Option<Arc<BlockCache>>,
@@ -78,6 +79,10 @@ impl SSTableReader {
         let file = File::open(&path)?;
         let file_size = file.metadata()?.len();
 
+        if file_size < FOOTER_SIZE as u64 {
+            return Err(sstable_corruption("file is shorter than its footer"));
+        }
+
         // Memory-map the file
         let mmap = unsafe {
             MmapOptions::new().map(&file).map_err(|e| Error::Io {
@@ -87,15 +92,10 @@ impl SSTableReader {
         };
 
         // Read footer
-        if file_size < FOOTER_SIZE as u64 {
-            return Err(Error::SSTable {
-                message: "SSTable file too small".to_string(),
-                source: None,
-            });
-        }
-
         let footer_offset = file_size - FOOTER_SIZE as u64;
-        let mut cursor = Cursor::new(&mmap[footer_offset as usize..]);
+        let footer_start = usize::try_from(footer_offset)
+            .map_err(|_| sstable_corruption("footer offset cannot be represented in memory"))?;
+        let mut cursor = Cursor::new(&mmap[footer_start..]);
 
         let index_offset = cursor.read_u64::<LittleEndian>()?;
         let index_size = cursor.read_u32::<LittleEndian>()?;
@@ -132,7 +132,13 @@ impl SSTableReader {
         footer_hasher.update(&magic);
         footer_hasher.update(&version.to_le_bytes());
         let computed_checksum = footer_hasher.finalize();
-        if stored_checksum != computed_checksum {
+        // v0.2.0 and v0.2.1 wrote a zero footer-checksum placeholder under
+        // the v1 identifier. Later v1 files and every newer format require the
+        // checksum to match. Version 1 data-block checksums remain mandatory;
+        // database preflight also cross-checks its footer/index/bloom metadata
+        // against every decoded block.
+        let released_v1_placeholder = version == SSTABLE_VERSION_V1 && stored_checksum == 0;
+        if !released_v1_placeholder && stored_checksum != computed_checksum {
             return Err(Error::SSTable {
                 message: format!(
                     "Footer checksum mismatch: stored={:#010x}, computed={:#010x}",
@@ -143,36 +149,38 @@ impl SSTableReader {
         }
 
         // Load index
-        let index_end = (index_offset + index_size as u64) as usize;
-        if index_end > mmap.len() {
-            return Err(Error::SSTable {
-                message: format!(
-                    "Index offset/size exceeds file: end={}, file_len={}",
-                    index_end,
-                    mmap.len()
-                ),
-                source: None,
-            });
+        let index_range =
+            component_range("index", index_offset, u64::from(index_size), footer_offset)?;
+        if index_size < 4 {
+            return Err(sstable_corruption("index is missing its entry count"));
         }
-        let index_data = &mmap[index_offset as usize..index_end];
+        let index_data = &mmap[index_range];
         let index = SSTableIndex::load(index_data)?;
+        let index_end = index_offset
+            .checked_add(u64::from(index_size))
+            .ok_or_else(|| sstable_corruption("index range overflows"))?;
 
         // Load bloom filter
         let bloom_filter = if bloom_size > 0 {
-            let bloom_end = (bloom_offset + bloom_size as u64) as usize;
-            if bloom_end > mmap.len() {
-                return Err(Error::SSTable {
-                    message: format!(
-                        "Bloom filter offset/size exceeds file: end={}, file_len={}",
-                        bloom_end,
-                        mmap.len()
-                    ),
-                    source: None,
-                });
+            let bloom_range = component_range(
+                "bloom filter",
+                bloom_offset,
+                u64::from(bloom_size),
+                footer_offset,
+            )?;
+            if bloom_offset != index_end {
+                return Err(sstable_corruption(
+                    "bloom filter does not immediately follow the index",
+                ));
             }
-            let bloom_data = &mmap[bloom_offset as usize..bloom_end];
+            let bloom_data = &mmap[bloom_range];
             Some(Self::deserialize_bloom_filter(bloom_data)?)
         } else {
+            if bloom_offset != footer_offset || index_end != footer_offset {
+                return Err(sstable_corruption(
+                    "empty bloom filter does not immediately follow the index",
+                ));
+            }
             None
         };
 
@@ -185,10 +193,18 @@ impl SSTableReader {
             file_id,
             mmap,
             format_version: version,
+            metadata_offset: index_offset,
             index,
             bloom_filter,
             cache: None,
         })
+    }
+
+    /// Open and eagerly validate every data block and acceleration structure.
+    pub(crate) fn open_validated(path: impl AsRef<Path>) -> Result<Self> {
+        let reader = Self::open(path)?;
+        reader.validate_contents()?;
+        Ok(reader)
     }
 
     /// Open with block cache
@@ -308,6 +324,79 @@ impl SSTableReader {
         Ok(decompressed)
     }
 
+    /// Validate every checksummed block and cross-check the unchecksummed index
+    /// and bloom-filter acceleration data against the authoritative entries.
+    fn validate_contents(&self) -> Result<()> {
+        let mut expected_block_offset = 0_u64;
+        let mut previous_key: Option<Bytes> = None;
+
+        for index_entry in self.index.entries() {
+            if index_entry.block_offset != expected_block_offset {
+                return Err(sstable_corruption(
+                    "data blocks are not contiguous from the start of the file",
+                ));
+            }
+            let block_end = index_entry
+                .block_offset
+                .checked_add(u64::from(index_entry.block_size))
+                .ok_or_else(|| sstable_corruption("data block range overflows"))?;
+            if block_end > self.metadata_offset {
+                return Err(sstable_corruption("data block overlaps the index"));
+            }
+
+            let block = self.read_block_shared(index_entry.block_offset, index_entry.block_size)?;
+            let offsets = parse_block_offsets(&block)?;
+            if offsets.is_empty() {
+                return Err(sstable_corruption("index references an empty data block"));
+            }
+            let entries_end = data_end(block.len(), offsets.len())?;
+            let mut block_last_key = None;
+            for (entry_index, entry_offset) in offsets.iter().enumerate() {
+                let entry_end = offsets
+                    .get(entry_index + 1)
+                    .map_or(entries_end, |offset| *offset as usize);
+                let (key, _) = decode_entry_ref(
+                    self.format_version,
+                    block.clone(),
+                    *entry_offset as usize,
+                    entry_end,
+                )?;
+                if previous_key
+                    .as_ref()
+                    .is_some_and(|previous| previous.as_ref() >= key.as_ref())
+                {
+                    return Err(sstable_corruption(
+                        "keys are not strictly increasing across data blocks",
+                    ));
+                }
+                if self
+                    .bloom_filter
+                    .as_ref()
+                    .is_some_and(|filter| !filter.contains(&key))
+                {
+                    return Err(sstable_corruption(
+                        "bloom filter excludes a key stored in the table",
+                    ));
+                }
+                previous_key = Some(key.clone());
+                block_last_key = Some(key);
+            }
+            if block_last_key.as_deref() != Some(index_entry.last_key.as_ref()) {
+                return Err(sstable_corruption(
+                    "index key does not match its data block's final key",
+                ));
+            }
+            expected_block_offset = block_end;
+        }
+
+        if expected_block_offset != self.metadata_offset {
+            return Err(sstable_corruption(
+                "data blocks do not end at the index offset",
+            ));
+        }
+        Ok(())
+    }
+
     /// Search for key within a block
     fn search_block_entry(
         &self,
@@ -362,50 +451,93 @@ impl SSTableReader {
     /// Deserialize bloom filter from raw data
     fn deserialize_bloom_filter(data: &[u8]) -> Result<BloomFilter> {
         if data.len() < 12 {
-            return Err(Error::SSTable {
-                message: "Invalid bloom filter data".to_string(),
-                source: None,
-            });
+            return Err(sstable_corruption("bloom filter metadata is truncated"));
         }
 
         let mut cursor = Cursor::new(&data[data.len() - 12..]);
-        let _num_hash_functions = cursor.read_u32::<LittleEndian>()? as usize;
-        let _num_bits = cursor.read_u32::<LittleEndian>()? as usize;
-        let bits_per_key = cursor.read_u32::<LittleEndian>()? as usize;
+        let num_hash_functions = cursor.read_u32::<LittleEndian>()? as usize;
+        let num_bits = cursor.read_u32::<LittleEndian>()? as usize;
+        let _bits_per_key = cursor.read_u32::<LittleEndian>()? as usize;
 
         let bits_data = data[..data.len() - 12].to_vec();
-        Ok(BloomFilter::from_bytes(bits_data, bits_per_key))
+        if bits_data.is_empty() {
+            return Err(sstable_corruption("bloom filter bit payload is empty"));
+        }
+        let capacity = bits_data
+            .len()
+            .checked_mul(8)
+            .ok_or_else(|| sstable_corruption("bloom filter bit capacity overflows"))?;
+        if num_bits == 0 || num_bits > capacity || capacity - num_bits >= 8 {
+            return Err(sstable_corruption(
+                "bloom filter bit count does not match its byte payload",
+            ));
+        }
+        if num_hash_functions == 0 || num_hash_functions > 64 {
+            return Err(sstable_corruption("bloom filter hash count is invalid"));
+        }
+        Ok(BloomFilter::from_serialized_parts(
+            bits_data,
+            num_bits,
+            num_hash_functions,
+        ))
     }
 }
 
 impl SSTableIndex {
     /// Load index from raw data
     pub(crate) fn load(data: &[u8]) -> Result<Self> {
-        let mut cursor = Cursor::new(data);
-        let mut entries = Vec::new();
-
-        // Read number of entries from the end
-        cursor.seek(SeekFrom::End(-4))?;
-        let entry_count = cursor.read_u32::<LittleEndian>()? as usize;
-
-        // Reset to beginning
-        cursor.seek(SeekFrom::Start(0))?;
+        if data.len() < 4 {
+            return Err(sstable_corruption("index is missing its entry count"));
+        }
+        let entries_end = data.len() - 4;
+        let entry_count = u32::from_le_bytes(
+            data[entries_end..]
+                .try_into()
+                .expect("four-byte index count"),
+        ) as usize;
+        if entry_count > entries_end / 16 {
+            return Err(sstable_corruption(
+                "index entry count exceeds its encoded payload",
+            ));
+        }
+        let mut cursor = Cursor::new(&data[..entries_end]);
+        let mut entries = Vec::with_capacity(entry_count);
 
         for _ in 0..entry_count {
             // Read key length and key
-            let key_len = cursor.read_u32::<LittleEndian>()? as usize;
+            let key_len = read_index_u32(&mut cursor, "key length")? as usize;
+            if key_len > remaining_index_bytes(&cursor) {
+                return Err(sstable_corruption(
+                    "index key length exceeds its encoded payload",
+                ));
+            }
             let mut key = vec![0u8; key_len];
-            cursor.read_exact(&mut key)?;
+            cursor
+                .read_exact(&mut key)
+                .map_err(|_| sstable_corruption("index key is truncated"))?;
 
             // Read offset and size
-            let block_offset = cursor.read_u64::<LittleEndian>()?;
-            let block_size = cursor.read_u32::<LittleEndian>()?;
+            let block_offset = read_index_u64(&mut cursor, "block offset")?;
+            let block_size = read_index_u32(&mut cursor, "block size")?;
+
+            if entries
+                .last()
+                .is_some_and(|previous: &IndexEntry| previous.last_key.as_ref() >= key.as_slice())
+            {
+                return Err(sstable_corruption("index keys are not strictly increasing"));
+            }
 
             entries.push(IndexEntry {
                 last_key: Bytes::from(key),
                 block_offset,
                 block_size,
             });
+        }
+
+        if remaining_index_bytes(&cursor) != 0 {
+            return Err(sstable_corruption(
+                "index contains trailing bytes before its entry count",
+            ));
         }
 
         Ok(Self { entries })
@@ -437,6 +569,63 @@ impl SSTableIndex {
     pub(crate) fn entries(&self) -> &[IndexEntry] {
         &self.entries
     }
+}
+
+fn component_range(
+    component: &str,
+    offset: u64,
+    size: u64,
+    footer_offset: u64,
+) -> Result<std::ops::Range<usize>> {
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| sstable_corruption(&format!("{component} range overflows")))?;
+    if end > footer_offset {
+        return Err(sstable_corruption(&format!(
+            "{component} range exceeds the data area"
+        )));
+    }
+    let start = usize::try_from(offset).map_err(|_| {
+        sstable_corruption(&format!(
+            "{component} offset cannot be represented in memory"
+        ))
+    })?;
+    let end = usize::try_from(end).map_err(|_| {
+        sstable_corruption(&format!("{component} end cannot be represented in memory"))
+    })?;
+    Ok(start..end)
+}
+
+fn sstable_corruption(message: &str) -> Error {
+    Error::SSTable {
+        message: format!("SSTable corruption: {message}"),
+        source: None,
+    }
+}
+
+fn remaining_index_bytes(reader: &Cursor<&[u8]>) -> usize {
+    reader
+        .get_ref()
+        .len()
+        .saturating_sub(reader.position() as usize)
+}
+
+fn read_index_u32(reader: &mut Cursor<&[u8]>, field: &str) -> Result<u32> {
+    if remaining_index_bytes(reader) < std::mem::size_of::<u32>() {
+        return Err(sstable_corruption(&format!("index {field} is truncated")));
+    }
+    reader
+        .read_u32::<LittleEndian>()
+        .map_err(|_| sstable_corruption(&format!("index {field} is truncated")))
+}
+
+fn read_index_u64(reader: &mut Cursor<&[u8]>, field: &str) -> Result<u64> {
+    if remaining_index_bytes(reader) < std::mem::size_of::<u64>() {
+        return Err(sstable_corruption(&format!("index {field} is truncated")));
+    }
+    reader
+        .read_u64::<LittleEndian>()
+        .map_err(|_| sstable_corruption(&format!("index {field} is truncated")))
 }
 
 #[cfg(test)]

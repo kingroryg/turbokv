@@ -27,12 +27,19 @@ use crate::core::crypto::crc32_checksum;
 use crate::core::error::{Error, Result};
 
 const MANIFEST_MAGIC: &[u8; 8] = b"HNSHMNFT";
-/// Format v3 persists per-SSTable tombstone counts for cheap physical gauges.
-/// Readers still accept v1 and v2 so existing databases can be upgraded in
-/// place after their tables are inspected once at open.
-pub(crate) const MANIFEST_VERSION: u32 = 3;
-const MANIFEST_VERSION_WITHOUT_TOMBSTONE_COUNTS: u32 = 2;
-const LEGACY_MANIFEST_VERSION: u32 = 1;
+/// Stable identifier for the released manifest layout with a checkpoint
+/// extension and without per-table tombstone counts.
+pub const MANIFEST_VERSION_V1: u32 = 1;
+/// Stable identifier for the manifest layout that removed the checkpoint
+/// extension.
+pub const MANIFEST_VERSION_V2: u32 = 2;
+/// Stable identifier written by this release.
+///
+/// Readers accept versions 1 through 3. A validated v1/v2 manifest is migrated
+/// atomically to v3 only after every referenced SSTable and retained WAL
+/// segment has passed a read-only startup preflight. SSTables remain readable
+/// in place and WAL migration starts a new current-format segment.
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// Database manifest - tracks persistent state
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,10 +102,29 @@ impl Manifest {
         let mut file_data = Vec::new();
         reader.read_to_end(&mut file_data)?;
 
-        if file_data.len() < 4 {
+        if file_data.len() < 12 {
+            return Err(manifest_corruption("file is shorter than its header"));
+        }
+
+        if &file_data[..8] != MANIFEST_MAGIC {
+            return Err(manifest_corruption("invalid magic number"));
+        }
+        let version = u32::from_le_bytes(
+            file_data[8..12]
+                .try_into()
+                .expect("manifest version slice is exactly four bytes"),
+        );
+        if !matches!(
+            version,
+            MANIFEST_VERSION_V1 | MANIFEST_VERSION_V2 | MANIFEST_VERSION
+        ) {
             return Err(Error::Internal {
-                message: "Manifest file too small".to_string(),
+                message: format!("Unsupported manifest version: {version}"),
             });
+        }
+
+        if file_data.len() < 16 {
+            return Err(manifest_corruption("file is missing its checksum"));
         }
 
         // Verify checksum: last 4 bytes are the CRC32, rest is the payload
@@ -109,7 +135,13 @@ impl Manifest {
                 .expect("checksum slice is exactly 4 bytes"),
         );
         let computed_checksum = crc32_checksum(payload);
-        if stored_checksum != computed_checksum {
+        // v0.2.0 and v0.2.1 wrote a zero placeholder without changing the v1
+        // identifier. That exact legacy spelling remains readable; all other
+        // manifests, including later v1 files, require the checksum to match.
+        // A placeholder manifest has no payload authentication; its magic,
+        // lengths, count, UTF-8 path encoding, and exact end are still checked.
+        let released_v1_placeholder = version == MANIFEST_VERSION_V1 && stored_checksum == 0;
+        if !released_v1_placeholder && stored_checksum != computed_checksum {
             return Err(Error::Internal {
                 message: format!(
                     "Manifest checksum mismatch: stored={:#010x}, computed={:#010x}",
@@ -121,43 +153,39 @@ impl Manifest {
         // Now parse the payload
         let mut reader = std::io::Cursor::new(payload);
 
-        // Read and verify magic
-        let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic)?;
-        if &magic != MANIFEST_MAGIC {
-            return Err(Error::Internal {
-                message: "Invalid manifest magic number".to_string(),
-            });
-        }
-
-        // Read version
-        let version = reader.read_u32::<LittleEndian>()?;
-        if version != MANIFEST_VERSION
-            && version != MANIFEST_VERSION_WITHOUT_TOMBSTONE_COUNTS
-            && version != LEGACY_MANIFEST_VERSION
-        {
-            return Err(Error::Internal {
-                message: format!("Unsupported manifest version: {}", version),
-            });
-        }
+        // The fixed header was checked before the checksum so a future format
+        // is classified as unsupported even though its checksum scheme is not
+        // known to this reader.
+        reader.set_position(12);
 
         // Read WAL checkpoint
-        let wal_checkpoint = reader.read_u64::<LittleEndian>()?;
+        let wal_checkpoint = read_manifest_u64(&mut reader, "WAL checkpoint")?;
 
-        if version == LEGACY_MANIFEST_VERSION {
-            let extension_len = reader.read_u32::<LittleEndian>()? as usize;
-            let mut extension = vec![0u8; extension_len];
-            reader.read_exact(&mut extension)?;
+        if version == MANIFEST_VERSION_V1 {
+            let extension_len = read_manifest_u32(&mut reader, "checkpoint extension length")?;
+            skip_manifest_bytes(&mut reader, extension_len as usize, "checkpoint extension")?;
         }
 
         // Read SSTable count
-        let sstable_count = reader.read_u32::<LittleEndian>()? as usize;
+        let sstable_count = read_manifest_u32(&mut reader, "SSTable count")? as usize;
+        let minimum_entry_size = if version == MANIFEST_VERSION { 72 } else { 64 };
+        if sstable_count > remaining_manifest_bytes(&reader) / minimum_entry_size {
+            return Err(manifest_corruption(
+                "SSTable count exceeds the remaining manifest payload",
+            ));
+        }
 
         // Read SSTable entries
         let mut sstables = Vec::with_capacity(sstable_count);
         for _ in 0..sstable_count {
             let entry = Self::read_sstable_entry(&mut reader, version)?;
             sstables.push(entry);
+        }
+
+        if reader.position() as usize != payload.len() {
+            return Err(manifest_corruption(
+                "trailing bytes remain after the declared SSTable entries",
+            ));
         }
 
         info!(
@@ -260,37 +288,37 @@ impl Manifest {
         self.sstables.retain(|e| !ids.contains(&e.id));
     }
 
-    fn read_sstable_entry(reader: &mut impl Read, version: u32) -> Result<SSTableManifestEntry> {
-        let id = reader.read_u64::<LittleEndian>()?;
-        let level = reader.read_u32::<LittleEndian>()?;
+    fn read_sstable_entry(
+        reader: &mut std::io::Cursor<&[u8]>,
+        version: u32,
+    ) -> Result<SSTableManifestEntry> {
+        let id = read_manifest_u64(reader, "SSTable id")?;
+        let level = read_manifest_u32(reader, "SSTable level")?;
 
         // Read path
-        let path_len = reader.read_u32::<LittleEndian>()? as usize;
-        let mut path_bytes = vec![0u8; path_len];
-        reader.read_exact(&mut path_bytes)?;
-        let path = PathBuf::from(String::from_utf8_lossy(&path_bytes).to_string());
+        let path_bytes = read_manifest_bytes(reader, "SSTable path")?;
+        let path = PathBuf::from(
+            String::from_utf8(path_bytes)
+                .map_err(|_| manifest_corruption("SSTable path is not valid UTF-8"))?,
+        );
 
-        let size = reader.read_u64::<LittleEndian>()?;
-        let entry_count = reader.read_u64::<LittleEndian>()?;
+        let size = read_manifest_u64(reader, "SSTable size")?;
+        let entry_count = read_manifest_u64(reader, "SSTable entry count")?;
         let tombstone_count = if version >= MANIFEST_VERSION {
-            reader.read_u64::<LittleEndian>()?
+            read_manifest_u64(reader, "SSTable tombstone count")?
         } else {
             0
         };
 
         // Read min_key
-        let min_key_len = reader.read_u32::<LittleEndian>()? as usize;
-        let mut min_key = vec![0u8; min_key_len];
-        reader.read_exact(&mut min_key)?;
+        let min_key = read_manifest_bytes(reader, "minimum key")?;
 
         // Read max_key
-        let max_key_len = reader.read_u32::<LittleEndian>()? as usize;
-        let mut max_key = vec![0u8; max_key_len];
-        reader.read_exact(&mut max_key)?;
+        let max_key = read_manifest_bytes(reader, "maximum key")?;
 
-        let min_sequence = reader.read_u64::<LittleEndian>()?;
-        let max_sequence = reader.read_u64::<LittleEndian>()?;
-        let creation_time = reader.read_u64::<LittleEndian>()?;
+        let min_sequence = read_manifest_u64(reader, "minimum sequence")?;
+        let max_sequence = read_manifest_u64(reader, "maximum sequence")?;
+        let creation_time = read_manifest_u64(reader, "creation time")?;
 
         Ok(SSTableManifestEntry {
             id,
@@ -343,15 +371,12 @@ impl Manifest {
 
     #[cfg(test)]
     pub(crate) fn save_legacy_for_test(&self, data_dir: &Path, version: u32) -> Result<()> {
-        assert!(
-            version == LEGACY_MANIFEST_VERSION
-                || version == MANIFEST_VERSION_WITHOUT_TOMBSTONE_COUNTS
-        );
+        assert!(version == MANIFEST_VERSION_V1 || version == MANIFEST_VERSION_V2);
         let mut buffer = Vec::new();
         buffer.write_all(MANIFEST_MAGIC)?;
         buffer.write_u32::<LittleEndian>(version)?;
         buffer.write_u64::<LittleEndian>(self.wal_checkpoint)?;
-        if version == LEGACY_MANIFEST_VERSION {
+        if version == MANIFEST_VERSION_V1 {
             buffer.write_u32::<LittleEndian>(0)?;
         }
         buffer.write_u32::<LittleEndian>(self.sstables.len() as u32)?;
@@ -363,6 +388,64 @@ impl Manifest {
         std::fs::write(data_dir.join("MANIFEST"), buffer)?;
         Ok(())
     }
+}
+
+fn manifest_corruption(message: &str) -> Error {
+    Error::Internal {
+        message: format!("Manifest corruption: {message}"),
+    }
+}
+
+fn remaining_manifest_bytes(reader: &std::io::Cursor<&[u8]>) -> usize {
+    reader
+        .get_ref()
+        .len()
+        .saturating_sub(reader.position() as usize)
+}
+
+fn read_manifest_u32(reader: &mut std::io::Cursor<&[u8]>, field: &str) -> Result<u32> {
+    if remaining_manifest_bytes(reader) < std::mem::size_of::<u32>() {
+        return Err(manifest_corruption(&format!("truncated {field}")));
+    }
+    reader
+        .read_u32::<LittleEndian>()
+        .map_err(|_| manifest_corruption(&format!("truncated {field}")))
+}
+
+fn read_manifest_u64(reader: &mut std::io::Cursor<&[u8]>, field: &str) -> Result<u64> {
+    if remaining_manifest_bytes(reader) < std::mem::size_of::<u64>() {
+        return Err(manifest_corruption(&format!("truncated {field}")));
+    }
+    reader
+        .read_u64::<LittleEndian>()
+        .map_err(|_| manifest_corruption(&format!("truncated {field}")))
+}
+
+fn read_manifest_bytes(reader: &mut std::io::Cursor<&[u8]>, field: &str) -> Result<Vec<u8>> {
+    let length = read_manifest_u32(reader, &format!("{field} length"))? as usize;
+    if length > remaining_manifest_bytes(reader) {
+        return Err(manifest_corruption(&format!(
+            "{field} length exceeds the remaining payload"
+        )));
+    }
+    let start = reader.position() as usize;
+    let end = start + length;
+    reader.set_position(end as u64);
+    Ok(reader.get_ref()[start..end].to_vec())
+}
+
+fn skip_manifest_bytes(
+    reader: &mut std::io::Cursor<&[u8]>,
+    length: usize,
+    field: &str,
+) -> Result<()> {
+    if length > remaining_manifest_bytes(reader) {
+        return Err(manifest_corruption(&format!(
+            "{field} length exceeds the remaining payload"
+        )));
+    }
+    reader.set_position(reader.position() + length as u64);
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -484,7 +567,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MANIFEST_MAGIC);
         bytes
-            .write_u32::<LittleEndian>(LEGACY_MANIFEST_VERSION)
+            .write_u32::<LittleEndian>(MANIFEST_VERSION_V1)
             .unwrap();
         bytes.write_u64::<LittleEndian>(42).unwrap();
         bytes.write_u32::<LittleEndian>(6).unwrap();
@@ -517,7 +600,7 @@ mod tests {
             creation_time: 99,
         });
         manifest
-            .save_legacy_for_test(temp_dir.path(), MANIFEST_VERSION_WITHOUT_TOMBSTONE_COUNTS)
+            .save_legacy_for_test(temp_dir.path(), MANIFEST_VERSION_V2)
             .unwrap();
 
         let loaded = Manifest::load_or_create(temp_dir.path()).unwrap();
