@@ -32,7 +32,7 @@
 //! ```
 
 use std::collections::{BTreeSet, HashSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -523,18 +523,49 @@ impl Engine {
         config.data_dir = directory_lock.path().to_path_buf();
         let wal_dir = config.data_dir.join("wal");
         let sstable_dir = config.data_dir.join("sstables");
+
+        // Existing bytes are inspected before directory creation, manifest
+        // migration, orphan cleanup, WAL header synchronization, or tail
+        // repair. Acquiring the advisory lock above may create the persistent
+        // empty lock file; it is the only failed-open filesystem exception.
+        let mut manifest = Manifest::load_or_create(&config.data_dir)
+            .map_err(|e| StorageError::Manifest(e.to_string()))?;
+        // Relative paths make checked-in directory fixtures portable. Released
+        // databases used absolute paths; both spellings resolve to the same
+        // in-memory identity and the next manifest migration persists the
+        // canonical database-root spelling.
+        for entry in &mut manifest.sstables {
+            entry.path = resolve_sstable_path(&config.data_dir, &entry.path)
+                .map_err(StorageError::Manifest)?;
+        }
+        let mut validated_sstables = HashSet::new();
+        for entry in &manifest.sstables {
+            SSTableReader::open_validated(&entry.path)
+                .map_err(|error| StorageError::SSTable(error.to_string()))?;
+            validated_sstables.insert(entry.path.clone());
+        }
+        // Published-looking but unreferenced tables are validated as well.
+        // Valid orphans can be removed after preflight; corrupt or future
+        // formats must fail without cleanup deleting evidence.
+        for stored_path in discover_sstable_files(&sstable_dir)? {
+            let path = resolve_sstable_path(&config.data_dir, &stored_path)
+                .map_err(StorageError::SSTable)?;
+            if validated_sstables.insert(path.clone()) {
+                SSTableReader::open_validated(&path)
+                    .map_err(|error| StorageError::SSTable(error.to_string()))?;
+            }
+        }
+        let wal_preflight = super::wal::preflight_directory(&wal_dir).await?;
+
         tokio::fs::create_dir_all(&wal_dir).await?;
         tokio::fs::create_dir_all(&sstable_dir).await?;
 
-        // Pre-create level directories
+        // Pre-create level directories only after the read-only preflight.
         for level in 0..config.compaction_config.max_levels {
             let level_dir = sstable_dir.join(format!("L{}", level));
             tokio::fs::create_dir_all(&level_dir).await?;
         }
 
-        // Load manifest
-        let mut manifest = Manifest::load_or_create(&config.data_dir)
-            .map_err(|e| StorageError::Manifest(e.to_string()))?;
         if manifest.loaded_format_version < u64::from(MANIFEST_VERSION) {
             for entry in &mut manifest.sstables {
                 entry.tombstone_count = count_sstable_tombstones(&entry.path)?;
@@ -579,10 +610,11 @@ impl Engine {
         // Create WAL if enabled
         let wal = if config.wal_enabled {
             let wal = Arc::new(
-                WriteAheadLog::new_with_directory_lock(
+                WriteAheadLog::new_preflighted_with_directory_lock(
                     &wal_dir,
                     config.wal_config.clone(),
                     Arc::downgrade(&directory_lock),
+                    wal_preflight,
                 )
                 .await?,
             );
@@ -2310,6 +2342,79 @@ fn cleanup_unreferenced_sstables(
     cleanup
 }
 
+fn discover_sstable_files(sstable_directory: &std::path::Path) -> Result<Vec<PathBuf>> {
+    if !sstable_directory.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut directories = vec![sstable_directory.to_path_buf()];
+    let mut root_entries =
+        std::fs::read_dir(sstable_directory)?.collect::<std::io::Result<Vec<_>>>()?;
+    root_entries.sort_by_key(std::fs::DirEntry::path);
+    for entry in root_entries {
+        if entry.file_type()?.is_dir() {
+            directories.push(entry.path());
+        }
+    }
+    directories.sort();
+
+    let mut files = Vec::new();
+    for directory in directories {
+        let mut entries = std::fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(std::fs::DirEntry::path);
+        files.extend(
+            entries
+                .into_iter()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "sst")),
+        );
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn resolve_sstable_path(
+    data_directory: &Path,
+    stored_path: &Path,
+) -> std::result::Result<PathBuf, String> {
+    if stored_path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(format!(
+            "SSTable path contains parent traversal: {}",
+            stored_path.display()
+        ));
+    }
+    let candidate = if stored_path.is_relative() {
+        data_directory.join(stored_path)
+    } else {
+        stored_path.to_path_buf()
+    };
+    let canonical = std::fs::canonicalize(&candidate).map_err(|error| {
+        format!(
+            "SSTable path cannot be resolved {}: {error}",
+            stored_path.display()
+        )
+    })?;
+    // A pre-existing symlink of the entire `sstables` directory is a supported
+    // storage layout. Treat that directory's canonical target as a second
+    // trusted root, while still rejecting a file-level symlink that escapes it.
+    let canonical_sstable_directory = std::fs::canonicalize(data_directory.join("sstables")).ok();
+    let within_storage_root = canonical.starts_with(data_directory)
+        || canonical_sstable_directory
+            .as_ref()
+            .is_some_and(|root| canonical.starts_with(root));
+    if !within_storage_root {
+        return Err(format!(
+            "SSTable path escapes database directory storage roots: {}",
+            stored_path.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 #[cfg(test)]
 fn wal_data_entry_size(key: &[u8], value: &[u8]) -> u64 {
     const WAL_ENTRY_HEADER_SIZE: usize = 32;
@@ -2333,6 +2438,14 @@ mod tests {
             background_tasks_enabled: false,
             ..Default::default()
         }
+    }
+
+    fn write_valid_orphan(path: &std::path::Path) {
+        let mut writer = SSTableWriter::new(path, SSTableConfig::default()).unwrap();
+        writer
+            .add_versioned(b"orphan:key", Some(b"orphan:value"), 1)
+            .unwrap();
+        writer.finish().unwrap();
     }
 
     async fn assert_scope_key_absent(engine: &Engine) {
@@ -5806,7 +5919,7 @@ mod tests {
         engine.shutdown().await.unwrap();
         drop(engine);
         let orphan = directory.path().join("sstables/L0/recovered-orphan.sst");
-        std::fs::write(&orphan, b"crash leftover").unwrap();
+        write_valid_orphan(&orphan);
         let cleanup_failure = super::super::failpoints::arm(
             directory.path(),
             super::super::failpoints::PersistenceBoundary::SstableCleanup,
@@ -5841,7 +5954,7 @@ mod tests {
         engine.shutdown().await.unwrap();
         drop(engine);
         let orphan = directory.path().join("sstables/L0/unscanned-orphan.sst");
-        std::fs::write(&orphan, b"crash leftover").unwrap();
+        write_valid_orphan(&orphan);
         let scan_failure = super::super::failpoints::arm(
             directory.path(),
             super::super::failpoints::PersistenceBoundary::SstableCleanupScan,

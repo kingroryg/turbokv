@@ -5,9 +5,15 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const SSTABLE_MAGIC: &[u8; 8] = b"HANSHIRO";
+/// Stable identifier for the released value-only entry layout. Version 1 did
+/// not encode tombstones or sequence numbers.
 pub const SSTABLE_VERSION_V1: u32 = 1;
+/// Stable identifier for entries with an explicit value/tombstone marker.
 pub const SSTABLE_VERSION_V2: u32 = 2;
-/// Format v3 stores an engine-wide sequence number with every entry.
+/// Stable identifier for entries with an engine-wide sequence number.
+///
+/// Readers retain v1/v2 tables in place. New flush and compaction output uses
+/// v3, so legacy tables migrate naturally when they are rewritten.
 pub const SSTABLE_VERSION: u32 = 3;
 pub const DEFAULT_BLOCK_SIZE: usize = 16 * 1024; // 16KB, better for larger security events
 pub const FOOTER_SIZE: usize = 40;

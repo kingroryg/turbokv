@@ -154,6 +154,20 @@ impl BloomFilter {
         }
     }
 
+    /// Reconstruct the exact parameters persisted in an SSTable. The older
+    /// `from_bytes` API derives them for callers that have only raw bits.
+    pub(crate) fn from_serialized_parts(
+        bits: Vec<u8>,
+        num_bits: usize,
+        num_hash_functions: usize,
+    ) -> Self {
+        Self {
+            bits,
+            num_bits,
+            num_hash_functions,
+        }
+    }
+
     pub fn metadata(&self) -> (usize, usize) {
         (self.num_hash_functions, self.num_bits)
     }

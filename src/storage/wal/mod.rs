@@ -26,7 +26,7 @@ mod types;
 pub use iterator::WalEntryIterator;
 pub use types::{
     encode_delete, encode_kv, EntryType, Result, WalConfig, WalEntry, WalError,
-    MAX_GROUP_COMMIT_DELAY_US,
+    MAX_GROUP_COMMIT_DELAY_US, WAL_VERSION, WAL_VERSION_V1, WAL_VERSION_V2, WAL_VERSION_V3,
 };
 
 use std::cell::RefCell;
@@ -46,8 +46,8 @@ use crate::core::crypto::crc32_checksum;
 use crate::storage::{directory_lock::DirectoryLock, manifest::sync_directory, InProgressGuard};
 use file::{
     create_file, entry_size, finalize_header, inspect_segment, open_recovered_file,
-    read_and_validate_header, read_entry_versioned, synchronize_segment_header,
-    wal_sequence_from_path, write_entries_batch, write_entry, WalFile,
+    preflight_active_segment, read_and_validate_header, read_entry_versioned,
+    synchronize_segment_header, wal_sequence_from_path, write_entries_batch, write_entry, WalFile,
 };
 use types::{encode_batch, ENTRY_HEADER_SIZE, ENTRY_RESERVED_SIZE, WAL_HEADER_SIZE};
 
@@ -286,21 +286,23 @@ pub struct WriteAheadLog {
 
 impl WriteAheadLog {
     pub async fn new(wal_dir: impl AsRef<Path>, config: WalConfig) -> Result<Self> {
-        Self::new_inner(wal_dir, config, None).await
+        Self::new_inner(wal_dir, config, None, None).await
     }
 
-    pub(crate) async fn new_with_directory_lock(
+    pub(crate) async fn new_preflighted_with_directory_lock(
         wal_dir: impl AsRef<Path>,
         config: WalConfig,
         directory_lock: Weak<DirectoryLock>,
+        preflight: WalDirectoryPreflight,
     ) -> Result<Self> {
-        Self::new_inner(wal_dir, config, Some(directory_lock)).await
+        Self::new_inner(wal_dir, config, Some(directory_lock), Some(preflight)).await
     }
 
     async fn new_inner(
         wal_dir: impl AsRef<Path>,
         config: WalConfig,
         directory_lock: Option<Weak<DirectoryLock>>,
+        preflight: Option<WalDirectoryPreflight>,
     ) -> Result<Self> {
         if config.max_batch_size == 0 {
             return Err(WalError::InvalidFormat(
@@ -314,6 +316,15 @@ impl WriteAheadLog {
         }
 
         let wal_dir = wal_dir.as_ref().to_path_buf();
+        let preflight = match preflight {
+            Some(preflight) if preflight.wal_dir == wal_dir => preflight,
+            Some(_) => {
+                return Err(WalError::InvalidFormat(
+                    "WAL preflight directory does not match the open directory".to_string(),
+                ))
+            }
+            None => preflight_directory(&wal_dir).await?,
+        };
         tokio::fs::create_dir_all(&wal_dir)
             .await
             .map_err(|e| WalError::Io {
@@ -322,7 +333,7 @@ impl WriteAheadLog {
             })?;
 
         let (wal_file, initial_sequence, batch_ranges) =
-            Self::open_or_create(&wal_dir, &config).await?;
+            Self::open_or_create(&wal_dir, &config, preflight)?;
         sync_wal_directory(&wal_dir)?;
         let byte_accounting = Arc::new(WalByteAccounting::new(retained_wal_bytes(&wal_dir)?));
         let current_file = Arc::new(RwLock::new(wal_file));
@@ -600,8 +611,7 @@ impl WriteAheadLog {
         self.flush().await?;
 
         let current_path = self.current_file.read().path.clone();
-        let mut wal_files = self.list_wal_files().await?;
-        wal_files.sort_by_key(|f| f.0);
+        let wal_files = self.list_wal_files().await?;
 
         for (_, path) in &wal_files {
             if *path == current_path {
@@ -623,8 +633,7 @@ impl WriteAheadLog {
     pub async fn iter_entries_from(&self, start_sequence: u64) -> Result<WalEntryIterator> {
         self.flush().await?;
 
-        let mut wal_files = self.list_wal_files().await?;
-        wal_files.sort_by_key(|f| f.0);
+        let wal_files = self.list_wal_files().await?;
 
         let paths: Vec<PathBuf> = wal_files.into_iter().map(|(_, path)| path).collect();
 
@@ -853,42 +862,29 @@ impl WriteAheadLog {
         )
     }
 
-    async fn open_or_create(
+    fn open_or_create(
         wal_dir: &Path,
         config: &WalConfig,
+        mut preflight: WalDirectoryPreflight,
     ) -> Result<(WalFile, u64, BTreeMap<u64, u64>)> {
-        let mut entries = tokio::fs::read_dir(wal_dir).await?;
-        let mut wal_files = Vec::new();
-
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if entry.file_type().await?.is_file() {
-                if let Some(sequence) = wal_sequence_from_path(&path) {
-                    wal_files.push((sequence, path));
-                }
-            }
-        }
-        wal_files.sort_by_key(|(sequence, _)| *sequence);
-
-        if let Some((latest_filename_sequence, latest)) = wal_files.last() {
+        if let Some(latest) = preflight.segments.pop() {
             let mut next_sequence = 0;
             let mut batch_ranges = BTreeMap::new();
-            for (_, path) in &wal_files[..wal_files.len() - 1] {
-                let metadata = inspect_segment(path, false)?;
-                synchronize_segment_header(path, &metadata)?;
-                next_sequence = next_sequence.max(metadata.next_sequence());
-                batch_ranges.extend(metadata.batch_ranges.iter().copied());
+            for segment in preflight.segments {
+                synchronize_segment_header(&segment.path, &segment.metadata)?;
+                next_sequence = next_sequence.max(segment.metadata.next_sequence());
+                batch_ranges.extend(segment.metadata.batch_ranges.iter().copied());
             }
-            let latest_metadata = inspect_segment(latest, true)?;
-            let (mut file, latest_next_sequence) = open_recovered_file(latest, &latest_metadata)?;
+            let (mut file, latest_next_sequence) =
+                open_recovered_file(&latest.path, &latest.metadata)?;
             next_sequence = next_sequence.max(latest_next_sequence);
-            batch_ranges.extend(latest_metadata.batch_ranges.iter().copied());
+            batch_ranges.extend(latest.metadata.batch_ranges.iter().copied());
 
             // Older segments remain readable, but current writes use v4. Start
             // a new segment rather than adding v4 batch records to an old one.
-            if !latest_metadata.format.is_current() {
+            if !latest.metadata.format.is_current() {
                 finalize_header(&mut file)?;
-                let new_sequence = next_sequence.max(latest_filename_sequence.saturating_add(1));
+                let new_sequence = next_sequence.max(latest.filename_sequence.saturating_add(1));
                 return Ok((
                     create_file(wal_dir, new_sequence, config)?,
                     new_sequence,
@@ -909,18 +905,7 @@ impl WriteAheadLog {
     }
 
     async fn list_wal_files(&self) -> Result<Vec<(u64, PathBuf)>> {
-        let mut files = Vec::new();
-        let mut entries = tokio::fs::read_dir(&self.wal_dir).await?;
-
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if entry.file_type().await?.is_file() {
-                if let Some(sequence) = wal_sequence_from_path(&path) {
-                    files.push((sequence, path));
-                }
-            }
-        }
-        Ok(files)
+        discover_wal_files(&self.wal_dir).await
     }
 
     fn read_entries_from_file(
@@ -953,6 +938,62 @@ impl WriteAheadLog {
         }
         Ok(())
     }
+}
+
+struct PreflightSegment {
+    filename_sequence: u64,
+    path: PathBuf,
+    metadata: file::SegmentMetadata,
+}
+
+/// Proof that every retained segment passed read-only validation. Construction
+/// consumes this token before any header rewrite, tail repair, or new segment.
+pub(crate) struct WalDirectoryPreflight {
+    wal_dir: PathBuf,
+    segments: Vec<PreflightSegment>,
+}
+
+/// Validate every retained segment without rewriting headers, truncating a
+/// recoverable active tail, creating a v4 segment, or syncing the directory.
+pub(crate) async fn preflight_directory(wal_dir: &Path) -> Result<WalDirectoryPreflight> {
+    let wal_files = discover_wal_files(wal_dir).await?;
+    let mut segments = Vec::with_capacity(wal_files.len());
+    let last_index = wal_files.len().checked_sub(1);
+    for (index, (filename_sequence, path)) in wal_files.into_iter().enumerate() {
+        let metadata = if Some(index) == last_index {
+            preflight_active_segment(&path)?
+        } else {
+            inspect_segment(&path, false)?
+        };
+        segments.push(PreflightSegment {
+            filename_sequence,
+            path,
+            metadata,
+        });
+    }
+    Ok(WalDirectoryPreflight {
+        wal_dir: wal_dir.to_path_buf(),
+        segments,
+    })
+}
+
+async fn discover_wal_files(wal_dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    if !wal_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = tokio::fs::read_dir(wal_dir).await?;
+    let mut wal_files = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if entry.file_type().await?.is_file() {
+            if let Some(sequence) = wal_sequence_from_path(&path) {
+                wal_files.push((sequence, path));
+            }
+        }
+    }
+    wal_files.sort_by_key(|(sequence, _)| *sequence);
+    Ok(wal_files)
 }
 
 // ========================================

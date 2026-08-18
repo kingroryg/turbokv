@@ -58,6 +58,9 @@ pub use iterator::SSTableIterator;
 pub(crate) use iterator::SSTableRangeCursor;
 pub(crate) use reader::SSTableEntry;
 pub use reader::SSTableReader;
-pub use types::{SSTableConfig, SSTableInfo, FOOTER_SIZE, SSTABLE_MAGIC, SSTABLE_VERSION};
+pub use types::{
+    SSTableConfig, SSTableInfo, FOOTER_SIZE, SSTABLE_MAGIC, SSTABLE_VERSION, SSTABLE_VERSION_V1,
+    SSTABLE_VERSION_V2,
+};
 pub(crate) use writer::OutputAppendDecision;
 pub use writer::SSTableWriter;

@@ -3,6 +3,15 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub const WAL_MAGIC: &[u8; 8] = b"TURBOKV\0";
+/// Stable identifiers for the Merkle-extension WAL layouts. Versions 1 and 2
+/// share the same physical entry representation.
+pub const WAL_VERSION_V1: u32 = 1;
+pub const WAL_VERSION_V2: u32 = 2;
+/// Stable identifier for entries after removal of the legacy extension.
+pub const WAL_VERSION_V3: u32 = 3;
+/// Stable identifier written by this release. Version 4 adds atomic batch
+/// records; opening a validated v1-v3 WAL starts a new v4 segment and retains
+/// the old segments for replay until their checkpoint permits reclamation.
 pub const WAL_VERSION: u32 = 4;
 pub const WAL_HEADER_SIZE: usize = 64;
 pub const ENTRY_HEADER_SIZE: usize = 32;

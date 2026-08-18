@@ -233,7 +233,12 @@ impl Db {
     /// Open a database at the given path with default options
     ///
     /// Creates the directory if it doesn't exist and then acquires exclusive
-    /// ownership before opening mutable database state.
+    /// ownership before opening mutable database state. For an existing
+    /// database, the manifest, every referenced or published-looking SSTable,
+    /// and every retained WAL are checked read-only before migration, cleanup,
+    /// header repair, or tail recovery. A failed open can leave only the empty
+    /// `.turbokv.lock` file used for advisory ownership; the file is
+    /// intentionally persistent and is never database-format state.
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open_with_options(path, DbOptions::default()).await
     }
