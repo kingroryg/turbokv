@@ -1,6 +1,5 @@
 //! SSTable types and configuration
 
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -23,7 +22,6 @@ pub struct SSTableConfig {
     pub block_size: usize,
     pub compression: super::CompressionType,
     pub bloom_bits_per_key: usize,
-    pub index_interval: usize,
 }
 
 impl Default for SSTableConfig {
@@ -32,7 +30,6 @@ impl Default for SSTableConfig {
             block_size: DEFAULT_BLOCK_SIZE,
             compression: super::CompressionType::Lz4,
             bloom_bits_per_key: 10,
-            index_interval: 16, // Denser index for faster point lookups
         }
     }
 }
@@ -58,34 +55,4 @@ pub struct SSTableInfo {
     /// Highest sequence retained by this table.
     #[serde(default)]
     pub max_sequence: u64,
-}
-
-impl SSTableInfo {
-    pub fn min_key_bytes(&self) -> Bytes {
-        Bytes::copy_from_slice(&self.min_key)
-    }
-
-    pub fn max_key_bytes(&self) -> Bytes {
-        Bytes::copy_from_slice(&self.max_key)
-    }
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct IndexEntry {
-    pub last_key: Bytes,
-    pub block_offset: u64,
-    pub block_size: u32,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct SSTableFooter {
-    pub index_offset: u64,
-    pub index_size: u32,
-    pub bloom_offset: u64,
-    pub bloom_size: u32,
-    pub magic: [u8; 8],
-    pub version: u32,
-    pub checksum: u32,
 }

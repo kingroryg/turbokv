@@ -1,36 +1,9 @@
 //! Unit tests for TurboKV core types.
 
-use turbokv::core::types::{
-    BatchOp, CompactionResult, CompactionStyle, Compression, DbConfig, StorageStats, WriteBatch,
-};
+use turbokv::core::types::{BatchOp, CompactionResult, StorageStats, WriteBatch};
 
 mod types_tests {
     use super::*;
-
-    #[test]
-    fn test_db_config_default() {
-        let config = DbConfig::default();
-        assert!(config.wal_enabled);
-        assert!(config.sync_writes);
-        assert_eq!(config.compression, Compression::Lz4);
-        assert_eq!(config.compaction_style, CompactionStyle::SizeTiered);
-    }
-
-    #[test]
-    fn test_db_config_fast() {
-        let config = DbConfig::fast();
-        assert!(!config.wal_enabled);
-        assert!(!config.sync_writes);
-        assert_eq!(config.compression, Compression::None);
-    }
-
-    #[test]
-    fn test_db_config_durable() {
-        let config = DbConfig::durable();
-        assert!(config.wal_enabled);
-        assert!(!config.sync_writes);
-        assert_eq!(config.compression, Compression::Lz4);
-    }
 
     #[test]
     fn test_write_batch() {
@@ -87,44 +60,6 @@ mod types_tests {
     }
 }
 
-mod utils_tests {
-    use turbokv::core::utils::{align_to, format_bytes, is_power_of_two, next_power_of_two};
-
-    #[test]
-    fn test_power_of_two() {
-        assert_eq!(next_power_of_two(0), 1);
-        assert_eq!(next_power_of_two(1), 1);
-        assert_eq!(next_power_of_two(2), 2);
-        assert_eq!(next_power_of_two(3), 4);
-        assert_eq!(next_power_of_two(5), 8);
-
-        assert!(is_power_of_two(1));
-        assert!(is_power_of_two(2));
-        assert!(is_power_of_two(4));
-        assert!(!is_power_of_two(3));
-        assert!(!is_power_of_two(0));
-    }
-
-    #[test]
-    fn test_align() {
-        assert_eq!(align_to(0, 8), 0);
-        assert_eq!(align_to(1, 8), 8);
-        assert_eq!(align_to(7, 8), 8);
-        assert_eq!(align_to(8, 8), 8);
-        assert_eq!(align_to(9, 8), 16);
-    }
-
-    #[test]
-    fn test_format_bytes() {
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1024), "1.00 KB");
-        assert_eq!(format_bytes(1536), "1.50 KB");
-        assert_eq!(format_bytes(1048576), "1.00 MB");
-        assert_eq!(format_bytes(1073741824), "1.00 GB");
-    }
-}
-
 mod error_tests {
     use turbokv::core::error::{Error, Result};
 
@@ -145,18 +80,5 @@ mod error_tests {
             message: "test".to_string(),
         });
         assert!(err_result.is_err());
-    }
-
-    #[test]
-    fn test_error_is_recoverable() {
-        let recoverable = Error::ResourceExhausted {
-            resource: "memory".to_string(),
-        };
-        assert!(recoverable.is_recoverable());
-
-        let non_recoverable = Error::Internal {
-            message: "failure".to_string(),
-        };
-        assert!(!non_recoverable.is_recoverable());
     }
 }

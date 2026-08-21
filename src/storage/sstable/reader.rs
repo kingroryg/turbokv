@@ -649,8 +649,8 @@ fn sstable_file_error(path: &Path, context: &str, error: Error) -> Error {
         Error::ResourceExhausted { resource } => Error::ResourceExhausted {
             resource: format!("{resource} while opening {} [{context}]", path.display()),
         },
-        other => Error::SSTable {
-            message: format!("{} [{context}]: {other}", path.display()),
+        Error::Internal { message } => Error::SSTable {
+            message: format!("{} [{context}]: Internal error: {message}", path.display()),
             source: None,
         },
     }

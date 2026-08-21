@@ -223,10 +223,6 @@ pub struct WalConfig {
     pub max_file_size: u64,
     /// Sync to disk after each write
     pub sync_on_write: bool,
-    /// Enable compression (not yet implemented)
-    pub compression: bool,
-    /// Write buffer size
-    pub buffer_size: usize,
     /// Maximum time the paranoid writer waits to collect a commit group.
     ///
     /// Zero disables the intentional wait while still grouping requests that
@@ -246,8 +242,6 @@ impl Default for WalConfig {
         Self {
             max_file_size: 1024 * 1024 * 1024, // 1GB
             sync_on_write: true,
-            compression: false,
-            buffer_size: 64 * 1024, // 64KB
             group_commit_delay_us: 2000,
             max_batch_size: 512,
         }

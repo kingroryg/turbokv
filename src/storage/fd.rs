@@ -268,55 +268,6 @@ impl Drop for OpenAttemptGuard<'_> {
     }
 }
 
-/// Global FD monitor for the entire process
-pub struct FdMonitor {
-    system_limit: u64,
-    soft_limit_ratio: f64,
-    #[allow(dead_code)]
-    check_interval_ms: u64,
-}
-
-impl FdMonitor {
-    pub fn new(soft_limit_ratio: f64) -> Self {
-        Self {
-            system_limit: get_fd_limit(),
-            soft_limit_ratio,
-            check_interval_ms: 1000,
-        }
-    }
-
-    /// Check current FD usage
-    pub fn check(&self) -> FdStatus {
-        let current = estimate_open_fds();
-        let threshold = (self.system_limit as f64 * self.soft_limit_ratio) as u64;
-
-        FdStatus {
-            current,
-            limit: self.system_limit,
-            threshold,
-            healthy: current < threshold,
-            usage_ratio: current as f64 / self.system_limit as f64,
-        }
-    }
-
-    /// Returns true if it's safe to open more files
-    pub fn can_open(&self, count: usize) -> bool {
-        let current = estimate_open_fds();
-        let threshold = (self.system_limit as f64 * self.soft_limit_ratio) as u64;
-        current + count as u64 <= threshold
-    }
-}
-
-/// FD status report
-#[derive(Debug, Clone)]
-pub struct FdStatus {
-    pub current: u64,
-    pub limit: u64,
-    pub threshold: u64,
-    pub healthy: bool,
-    pub usage_ratio: f64,
-}
-
 /// Get system file descriptor limit
 #[cfg(unix)]
 fn get_fd_limit() -> u64 {
@@ -424,16 +375,6 @@ mod tests {
         let limit = get_fd_limit();
         assert!(limit > 0, "Should detect a positive FD limit");
         println!("Detected FD limit: {}", limit);
-    }
-
-    #[test]
-    fn test_fd_monitor() {
-        let monitor = FdMonitor::new(0.8);
-        let status = monitor.check();
-
-        assert!(status.limit > 0);
-        assert!(status.usage_ratio >= 0.0 && status.usage_ratio <= 1.0);
-        println!("FD status: {:?}", status);
     }
 
     #[test]

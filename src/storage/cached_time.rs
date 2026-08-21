@@ -1,75 +1,81 @@
-//! Cached timestamp to eliminate syscalls for TTL/reaper checks.
-//! Background thread updates every 100ms - good enough for TTL expiry.
+//! Process-wide coarse wall clock for the WAL write path.
+//!
+//! WAL timestamps are diagnostic metadata rather than ordering state. A
+//! relaxed atomic load avoids placing wall-clock retrieval in every durable
+//! mutation while keeping the persisted value within one update interval of
+//! the system clock.
 
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+
 static CACHED_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
-static INIT: OnceLock<()> = OnceLock::new();
+static INITIALIZATION: OnceLock<Result<(), Arc<str>>> = OnceLock::new();
 
-/// Initialize the background timestamp updater (call once at startup)
-pub fn init() {
-    INIT.get_or_init(|| {
-        // Set initial value
+pub(crate) fn init() -> io::Result<()> {
+    match INITIALIZATION.get_or_init(|| {
         update_timestamp();
-
-        // Spawn background updater
         thread::Builder::new()
-            .name("timestamp-cache".into())
+            .name("turbokv-clock".into())
             .spawn(|| loop {
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(UPDATE_INTERVAL);
                 update_timestamp();
             })
-            .expect("Failed to spawn timestamp thread");
-    });
+            .map(|_| ())
+            .map_err(|error| Arc::<str>::from(error.to_string()))
+    }) {
+        Ok(()) => Ok(()),
+        Err(message) => Err(io::Error::other(message.to_string())),
+    }
 }
 
 fn update_timestamp() {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    CACHED_TIMESTAMP_MS.store(now, Ordering::Relaxed);
+    CACHED_TIMESTAMP_MS.store(system_timestamp_ms(), Ordering::Relaxed);
 }
 
-/// Get cached timestamp in milliseconds (±100ms accuracy)
+fn system_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[inline]
-pub fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     let cached = CACHED_TIMESTAMP_MS.load(Ordering::Relaxed);
     if cached == 0 {
-        // Not initialized, return real time
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
+        system_timestamp_ms()
     } else {
         cached
     }
 }
 
-/// Get cached timestamp in seconds
-#[inline]
-pub fn now_secs() -> u64 {
-    now_ms() / 1000
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
-    fn test_cached_time() {
-        init();
-        let t1 = now_ms();
-        assert!(t1 > 0);
-
-        // Should be close to real time
-        let real = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        assert!((real as i64 - t1 as i64).abs() < 200);
+    fn background_clock_advances_and_stays_close_to_wall_time() {
+        init().unwrap();
+        let initial = now_ms();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let cached = loop {
+            let observed = now_ms();
+            if observed > initial {
+                break observed;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cached clock did not advance after background initialization"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let wall = system_timestamp_ms();
+        assert!(wall.abs_diff(cached) <= 1_000);
     }
 }

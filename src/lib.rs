@@ -4,7 +4,6 @@
 //!
 //! TurboKV is optimized for high write throughput, with fast mode tuned for
 //! benchmark-heavy workloads and durable mode using a WAL for crash recovery.
-//! See the [`optimizations`] module for implementation notes.
 //!
 //! A TurboKV database exclusively owns its canonicalized data directory while
 //! open. Shared multi-writer access, whether from the same process or another
@@ -70,29 +69,28 @@
 //! ```
 
 pub mod core;
-pub mod optimizations;
 pub mod storage;
 
 // Primary API
 pub use core::types::{
-    CompactionResult, CompactionStyle, Compression, DatabaseStatus, DbConfig, LogicalStats,
-    MaintenanceFailure, MaintenanceOperationStatus, MaintenanceOrigin, MaintenanceStatus,
-    PhysicalCacheStats, PhysicalMemTableStats, PhysicalSSTableStats, PhysicalStats,
-    PhysicalVersionStats, WalStats, WriteAmplificationStats, WriteBackpressureCauseStatus,
-    WriteBackpressureStatus, WriteBatch, WriteStallStats,
+    CompactionResult, Compression, DatabaseStatus, LogicalStats, MaintenanceFailure,
+    MaintenanceOperationStatus, MaintenanceOrigin, MaintenanceStatus, PhysicalCacheStats,
+    PhysicalMemTableStats, PhysicalSSTableStats, PhysicalStats, PhysicalVersionStats, WalStats,
+    WriteAmplificationStats, WriteBackpressureCauseStatus, WriteBackpressureStatus, WriteBatch,
+    WriteStallStats,
 };
 pub use storage::db::{Db, DbError, DbOptions, DbStats};
 pub use storage::iter::{EntryGuard, PrefixIter, RangeIter, ScanEntry, ScanError, ScanResult};
 
 // Advanced API
-pub use core::crypto::crc32_checksum;
 pub use storage::compaction::CompactionConfig;
 pub use storage::engine::{
     Engine, MaintenanceShutdownError, Result as StorageResult, StorageConfig, StorageError,
 };
-pub use storage::memtable::{MemTableConfig, MemTableManager};
-pub use storage::sstable::{SSTableConfig, SSTableInfo};
-pub use storage::wal::{WalConfig, WriteAheadLog};
+pub use storage::fd::FdConfig;
+pub use storage::memtable::MemTableConfig;
+pub use storage::sstable::SSTableConfig;
+pub use storage::wal::WalConfig;
 
 /// Library version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

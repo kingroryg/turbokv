@@ -34,9 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::types::Compression;
-use crate::core::{
-    CompactionResult, DatabaseStatus, DbConfig, LogicalStats, PhysicalStats, WriteBatch,
-};
+use crate::core::{CompactionResult, DatabaseStatus, LogicalStats, PhysicalStats, WriteBatch};
 
 use super::directory_lock::LOCKED_DIRECTORY_GUIDANCE;
 use super::engine::{Engine, MaintenanceShutdownError, StorageConfig, StorageError};
@@ -255,16 +253,21 @@ impl Db {
             ));
         }
 
-        let db_config = DbConfig {
+        let mut storage_config = StorageConfig {
+            data_dir: path.as_ref().to_path_buf(),
+            wal_config: if options.sync_writes {
+                super::wal::WalConfig::paranoid()
+            } else {
+                super::wal::WalConfig::durable()
+            },
+            memtable_config: super::memtable::MemTableConfig {
+                max_size: options.memtable_size,
+                ..Default::default()
+            },
             wal_enabled: options.wal_enabled,
-            sync_writes: options.sync_writes,
-            memtable_size: options.memtable_size,
             block_cache_size: options.block_cache_size,
             ..Default::default()
         };
-
-        let mut storage_config =
-            StorageConfig::from_db_config(&db_config, path.as_ref().to_path_buf());
         // Convert user-facing Compression to internal CompressionType
         storage_config.sstable_config.compression = match options.compression {
             Compression::None => CompressionType::None,
@@ -580,7 +583,6 @@ mod tests {
     #[test]
     fn compression_defaults_consistently_select_lz4() {
         assert_eq!(Compression::default(), Compression::Lz4);
-        assert_eq!(DbConfig::default().compression, Compression::Lz4);
         assert_eq!(DbOptions::default().compression, Compression::Lz4);
         assert_eq!(SSTableConfig::default().compression, CompressionType::Lz4);
     }

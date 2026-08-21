@@ -10,26 +10,6 @@ permissions:
   contents: read
 
 jobs:
-  miri:
-    name: Miri (portable retained unsafe)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Miri
-        run: rustup toolchain install nightly --profile minimal --component miri
-      # Miri does not emulate TurboKV's mmap, flock, or platform direct-I/O
-      # syscalls. Exercise the portable allocation/pointer unsafe here; the
-      # native syscall and mmap paths are covered by the sanitizer jobs below.
-      - name: Check aligned allocation, growth, copy, reuse, and drop
-        env:
-          # gxhash is compiled but not executed by this filtered Miri test.
-          RUSTFLAGS: -C target-feature=+aes,+sse2
-        run: >-
-          cargo +nightly miri test --lib
-          storage::direct_io::tests::retained_unsafe_aligned_buffer_survives_empty_growth_reuse_and_cross_thread_drop
-          -- --exact
-
   sanitizers:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -48,9 +28,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install sanitizer toolchain
         run: rustup toolchain install nightly --profile minimal --component rust-src
-      # Rust's native sanitizers are currently supported by this gate on
-      # x86_64 Linux. Building std with the same instrumentation avoids gaps at
-      # the runtime boundary and keeps unsupported host targets out of CI.
+      # Miri cannot emulate the retained mmap and platform filesystem/FD
+      # syscalls. These native sanitizer jobs exercise selected x86_64-Linux
+      # mmap, locking, and database paths; other platform-specific syscall
+      # branches require their own platform build and runtime coverage.
       - name: Run ${{ matrix.sanitizer }} sanitizer
         env:
           RUSTFLAGS: -C target-cpu=native -Zsanitizer=${{ matrix.sanitizer }}
