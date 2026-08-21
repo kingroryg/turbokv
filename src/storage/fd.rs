@@ -60,6 +60,7 @@ pub struct FdStats {
 /// Single partition of the SSTable pool
 struct PoolPartition {
     cache: Mutex<LruCache<PathBuf, Arc<SSTableReader>>>,
+    capacity: usize,
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
@@ -69,9 +70,14 @@ struct PoolPartition {
 pub struct SSTablePool {
     config: FdConfig,
     partitions: Vec<PoolPartition>,
+    open_lock: Mutex<()>,
     current_open: AtomicUsize,
     system_fd_limit: u64,
     block_cache: Option<Arc<BlockCache>>,
+    #[cfg(test)]
+    opens_in_progress: AtomicUsize,
+    #[cfg(test)]
+    peak_opens_in_progress: AtomicUsize,
 }
 
 impl SSTablePool {
@@ -86,27 +92,35 @@ impl SSTablePool {
             .min(((system_fd_limit as f64 * config.soft_limit_ratio) as usize).saturating_sub(64));
 
         // 2 partitions per core, min 4, max 64
-        let num_partitions = if config.partitions > 0 {
+        let requested_partitions = if config.partitions > 0 {
             config.partitions
         } else {
             (num_cpus::get() * 2).clamp(4, 64)
         };
+        // More partitions than retained readers create zero-capacity shards
+        // without increasing useful concurrency.
+        let num_partitions = requested_partitions.min(max_size.max(1));
 
-        let per_partition = (max_size / num_partitions).max(1);
+        let per_partition = max_size / num_partitions;
+        let remainder = max_size % num_partitions;
 
         let partitions: Vec<_> = (0..num_partitions)
-            .map(|_| PoolPartition {
-                cache: Mutex::new(LruCache::new(NonZeroUsize::new(per_partition).unwrap())),
-                hits: AtomicU64::new(0),
-                misses: AtomicU64::new(0),
-                evictions: AtomicU64::new(0),
+            .map(|index| {
+                let capacity = per_partition + usize::from(index < remainder);
+                PoolPartition {
+                    cache: Mutex::new(LruCache::new(NonZeroUsize::new(capacity.max(1)).unwrap())),
+                    capacity,
+                    hits: AtomicU64::new(0),
+                    misses: AtomicU64::new(0),
+                    evictions: AtomicU64::new(0),
+                }
             })
             .collect();
 
         info!(
-            "SSTable pool: {} partitions, {} per partition, system_limit={}, block_cache={}",
+            "SSTable pool: {} partitions, {} total readers, system_limit={}, block_cache={}",
             num_partitions,
-            per_partition,
+            max_size,
             system_fd_limit,
             block_cache.is_some()
         );
@@ -114,9 +128,14 @@ impl SSTablePool {
         Self {
             config,
             partitions,
+            open_lock: Mutex::new(()),
             current_open: AtomicUsize::new(0),
             system_fd_limit,
             block_cache,
+            #[cfg(test)]
+            opens_in_progress: AtomicUsize::new(0),
+            #[cfg(test)]
+            peak_opens_in_progress: AtomicUsize::new(0),
         }
     }
 
@@ -133,16 +152,23 @@ impl SSTablePool {
         let path_buf = path.to_path_buf();
         let partition = self.partition_for(path);
 
-        // Check cache first
-        {
-            let mut cache = partition.cache.lock();
-            if let Some(reader) = cache.get(&path_buf) {
-                partition.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(Arc::clone(reader));
-            }
+        // Serialize lookup and open within one partition. Besides avoiding a
+        // burst of duplicate descriptors on concurrent misses, this makes
+        // `remove` a strict invalidation boundary for compaction cleanup.
+        let mut cache = partition.cache.lock();
+        if let Some(reader) = cache.get(&path_buf) {
+            partition.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Arc::clone(reader));
         }
 
         partition.misses.fetch_add(1, Ordering::Relaxed);
+
+        // Backpressure and the transient descriptor used by `open` share one
+        // process-pool admission lane. This closes the check/open race across
+        // partitions while cached-reader concurrency remains sharded.
+        let _open = self.open_lock.lock();
+        #[cfg(test)]
+        let _open_attempt = OpenAttemptGuard::new(self);
 
         if self.config.enable_backpressure && self.should_backpressure() {
             return Err(Error::Internal {
@@ -155,8 +181,7 @@ impl SSTablePool {
             None => Arc::new(SSTableReader::open(path)?),
         };
 
-        {
-            let mut cache = partition.cache.lock();
+        if partition.capacity > 0 {
             let old_len = cache.len();
             cache.put(path_buf, Arc::clone(&reader));
 
@@ -218,6 +243,28 @@ impl SSTablePool {
         let current = estimate_open_fds();
         let threshold = (self.system_fd_limit as f64 * self.config.soft_limit_ratio) as u64;
         current >= threshold
+    }
+}
+
+#[cfg(test)]
+struct OpenAttemptGuard<'a> {
+    pool: &'a SSTablePool,
+}
+
+#[cfg(test)]
+impl<'a> OpenAttemptGuard<'a> {
+    fn new(pool: &'a SSTablePool) -> Self {
+        let current = pool.opens_in_progress.fetch_add(1, Ordering::SeqCst) + 1;
+        pool.peak_opens_in_progress
+            .fetch_max(current, Ordering::SeqCst);
+        Self { pool }
+    }
+}
+
+#[cfg(test)]
+impl Drop for OpenAttemptGuard<'_> {
+    fn drop(&mut self) {
+        self.pool.opens_in_progress.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -342,7 +389,35 @@ fn estimate_open_fds() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    use tempfile::TempDir;
+
     use super::*;
+    use crate::storage::sstable::{CompressionType, SSTableConfig, SSTableWriter};
+
+    fn write_table(path: &Path, value: &[u8]) {
+        let mut writer = SSTableWriter::new(
+            path,
+            SSTableConfig {
+                compression: CompressionType::None,
+                ..SSTableConfig::default()
+            },
+        )
+        .unwrap();
+        writer.add(b"key", Some(value)).unwrap();
+        writer.finish().unwrap();
+    }
+
+    fn bounded_config(max_open_sstables: usize, partitions: usize) -> FdConfig {
+        FdConfig {
+            max_open_sstables,
+            soft_limit_ratio: 1.0,
+            enable_backpressure: false,
+            partitions,
+        }
+    }
 
     #[test]
     fn test_fd_limit_detection() {
@@ -375,5 +450,96 @@ mod tests {
         assert_eq!(stats.open_sstables, 0);
         assert_eq!(stats.cache_hits, 0);
         assert_eq!(stats.partitions, 8);
+    }
+
+    #[test]
+    fn partition_capacities_sum_to_the_configured_reader_limit() {
+        let pool = SSTablePool::new(bounded_config(5, 4));
+        assert_eq!(
+            pool.partitions
+                .iter()
+                .map(|partition| partition.capacity)
+                .sum::<usize>(),
+            5
+        );
+        assert_eq!(
+            pool.partitions
+                .iter()
+                .map(|partition| partition.capacity)
+                .collect::<Vec<_>>(),
+            vec![2, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn concurrent_misses_never_retain_more_readers_than_configured() {
+        const READERS: usize = 3;
+        const TABLES: usize = 24;
+        let directory = TempDir::new().unwrap();
+        let paths = (0..TABLES)
+            .map(|index| {
+                let path = directory.path().join(format!("{index:02}.sst"));
+                write_table(&path, &[index as u8]);
+                path
+            })
+            .collect::<Vec<_>>();
+        let pool = Arc::new(SSTablePool::new(bounded_config(READERS, 4)));
+        let start = Arc::new(Barrier::new(TABLES));
+        let workers = paths
+            .into_iter()
+            .map(|path| {
+                let pool = Arc::clone(&pool);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    assert!(pool.get(&path).unwrap().get(b"key").unwrap().is_some());
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let cached = pool
+            .partitions
+            .iter()
+            .map(|partition| partition.cache.lock().len())
+            .sum::<usize>();
+        let stats = pool.stats();
+        assert_eq!(
+            stats.open_sstables, cached,
+            "tables={TABLES}, readers={READERS}"
+        );
+        assert!(stats.open_sstables <= READERS);
+        assert_eq!(stats.cache_misses, TABLES as u64);
+        assert_eq!(pool.peak_opens_in_progress.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn same_path_same_size_replacement_cannot_reuse_reader_or_block_cache_data() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("table.sst");
+        let replacement = directory.path().join("replacement.sst");
+        write_table(&path, b"old");
+        write_table(&replacement, b"new");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            std::fs::metadata(&replacement).unwrap().len()
+        );
+        let block_cache = Arc::new(BlockCache::with_shards(1024 * 1024, 1));
+        let pool = SSTablePool::with_cache(bounded_config(2, 1), Some(block_cache));
+
+        assert_eq!(
+            pool.get(&path).unwrap().get(b"key").unwrap().unwrap(),
+            b"old"[..]
+        );
+        pool.remove(&path);
+        std::fs::rename(replacement, &path).unwrap();
+
+        assert_eq!(
+            pool.get(&path).unwrap().get(b"key").unwrap().unwrap(),
+            b"new"[..]
+        );
+        assert_eq!(pool.stats().open_sstables, 1);
     }
 }

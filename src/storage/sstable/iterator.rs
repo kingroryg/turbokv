@@ -105,7 +105,7 @@ impl SSTableCursorState {
                     Err(error) => {
                         self.failed = true;
                         self.current_block_data = None;
-                        return Some(Err(error));
+                        return Some(Err(reader.file_error("data block entry", error)));
                     }
                 }
             }

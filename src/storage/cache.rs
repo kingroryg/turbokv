@@ -3,7 +3,6 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -65,16 +64,23 @@ impl BlockCache {
             "shard count must be power of 2"
         );
 
-        let per_shard_entries = std::cmp::max(16, max_size_bytes / num_shards / 4096); // ~4KB per block
-        let per_shard_max_bytes = (max_size_bytes / num_shards) as u64;
+        let per_shard_max_bytes = max_size_bytes / num_shards;
+        let remainder = max_size_bytes % num_shards;
 
         let shards: Vec<_> = (0..num_shards)
-            .map(|_| CacheShard {
-                lru: Mutex::new(LruCache::new(NonZeroUsize::new(per_shard_entries).unwrap())),
-                max_size_bytes: per_shard_max_bytes,
-                size_bytes: AtomicU64::new(0),
-                hits: AtomicU64::new(0),
-                misses: AtomicU64::new(0),
+            .map(|index| {
+                let max_size_bytes = per_shard_max_bytes + usize::from(index < remainder);
+                CacheShard {
+                    // Manual byte eviction is authoritative. The unbounded
+                    // constructor does not eagerly reserve entry metadata;
+                    // zero-length values are rejected below so the number of
+                    // retained entries is still bounded by the byte budget.
+                    lru: Mutex::new(LruCache::unbounded()),
+                    max_size_bytes: max_size_bytes as u64,
+                    size_bytes: AtomicU64::new(0),
+                    hits: AtomicU64::new(0),
+                    misses: AtomicU64::new(0),
+                }
             })
             .collect();
 
@@ -115,7 +121,7 @@ impl BlockCache {
     pub fn insert(&self, key: CacheKey, value: Bytes) {
         let value_len = value.len() as u64;
         let shard = self.shard_for(&key);
-        if value_len > shard.max_size_bytes {
+        if value_len == 0 || value_len > shard.max_size_bytes {
             return;
         }
         let mut lru = shard.lru.lock();
@@ -190,6 +196,9 @@ impl BlockCache {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use super::*;
 
     #[test]
@@ -209,5 +218,67 @@ mod tests {
         assert_eq!(stats.entries, 1);
         assert_eq!(stats.size_bytes, 6_000);
         assert!(cache.get(&CacheKey::new(1, 2)).is_none());
+    }
+
+    #[test]
+    fn byte_budget_not_an_estimated_entry_count_controls_eviction() {
+        let cache = BlockCache::with_shards(32, 1);
+        for offset in 0..33 {
+            cache.insert(CacheKey::new(7, offset), Bytes::from_static(b"x"));
+        }
+
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 32);
+        assert_eq!(stats.size_bytes, 32);
+        assert!(cache.get(&CacheKey::new(7, 0)).is_none());
+        assert!(cache.get(&CacheKey::new(7, 32)).is_some());
+        cache.insert(CacheKey::new(7, 33), Bytes::new());
+        assert!(cache.get(&CacheKey::new(7, 33)).is_none());
+    }
+
+    #[test]
+    fn concurrent_replacements_and_evictions_keep_exact_byte_accounting() {
+        const THREADS: usize = 8;
+        const INSERTS: usize = 96;
+        const BUDGET: usize = 4_096;
+
+        let cache = Arc::new(BlockCache::with_shards(BUDGET, 1));
+        let start = Arc::new(Barrier::new(THREADS));
+        let mut workers = Vec::new();
+        for worker in 0..THREADS {
+            let cache = Arc::clone(&cache);
+            let start = Arc::clone(&start);
+            workers.push(thread::spawn(move || {
+                start.wait();
+                for offset in 0..INSERTS {
+                    let len = 1 + (worker * 17 + offset * 29) % 127;
+                    // Shared offsets exercise replacement accounting while
+                    // worker-specific offsets force byte-budget evictions.
+                    let key = CacheKey::new((worker % 2) as u64, offset as u64);
+                    cache.insert(key.clone(), Bytes::from(vec![worker as u8; len]));
+                    if offset % 7 == 0 {
+                        let _ = cache.get(&key);
+                    }
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let stats = cache.stats();
+        let retained_bytes = (0..2_u64)
+            .flat_map(|file_id| {
+                (0..INSERTS as u64).map(move |offset| CacheKey::new(file_id, offset))
+            })
+            .filter_map(|key| cache.get(&key))
+            .map(|value| value.len() as u64)
+            .sum::<u64>();
+        assert_eq!(
+            stats.size_bytes, retained_bytes,
+            "threads={THREADS}, inserts={INSERTS}"
+        );
+        assert!(stats.size_bytes <= BUDGET as u64);
+        assert!(stats.entries <= INSERTS * 2);
     }
 }
