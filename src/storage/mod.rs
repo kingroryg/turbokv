@@ -28,6 +28,8 @@ pub mod manifest;
 pub mod memtable;
 pub mod partitioning;
 pub mod sstable;
+#[cfg(test)]
+mod test_support;
 mod version;
 pub mod wal;
 
