@@ -18,6 +18,8 @@ use super::{
 };
 use crate::core::error::{Error, Result};
 
+const SSTABLE_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+
 struct EncodedBlock {
     compressed: Vec<u8>,
     compression: CompressionType,
@@ -138,7 +140,7 @@ impl SSTableWriter {
             .truncate(true)
             .open(&path)?;
 
-        let writer = BufWriter::new(file);
+        let writer = BufWriter::with_capacity(SSTABLE_WRITE_BUFFER_BYTES, file);
         let bloom_filter = BloomFilter::with_rate(0.01, 10000); // 1% false positive rate
         let bloom_serialized_size = measure_bloom_filter(&bloom_filter, config.bloom_bits_per_key);
         let footer_serialized_size = EncodedFooter {
