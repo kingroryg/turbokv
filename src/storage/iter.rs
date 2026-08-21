@@ -5,8 +5,8 @@
 //! one head and, for each SSTable source, at most one decompressed block. Its
 //! working set is therefore O(source count * block size), plus O(source count)
 //! merge metadata. The independently configured shared block cache is bounded
-//! by actual decompressed bytes. Collection helpers necessarily retain their
-//! output too.
+//! by decompressed payload and parsed-layout bytes. Collection helpers
+//! necessarily retain their output too.
 //!
 //! [`EntryGuard`] defers the copy of an in-memory value until it is requested.
 //! SSTable keys and values share a pinned decompressed block, so inspecting a

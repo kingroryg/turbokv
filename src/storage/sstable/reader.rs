@@ -10,8 +10,8 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use bytes::Bytes;
 use memmap2::{Mmap, MmapOptions};
 
-use super::super::cache::{BlockCache, CacheKey};
-use super::codec::{data_end, decode_entry_ref, parse_block_offsets};
+use super::super::cache::{BlockCache, CacheKey, CachedBlock};
+use super::codec::{decode_entry_ref, parse_block_layout};
 use super::types::{SSTABLE_VERSION_V1, SSTABLE_VERSION_V2};
 use super::{
     decompress_block, BloomFilter, CompressionType, SSTableIterator, FOOTER_SIZE, SSTABLE_MAGIC,
@@ -273,22 +273,23 @@ impl SSTableReader {
         };
 
         // Read and decompress block
-        let block_data = self.read_block_shared_inner(block_info.offset, block_info.size)?;
+        let block = self.read_block_shared_inner(block_info.offset, block_info.size)?;
 
         // Search within block
-        self.search_block_entry(&block_data, key)
+        self.search_block_entry(&block, key)
     }
 
     /// Read and decompress a block into shared storage.
     ///
-    /// Cache hits clone only a `Bytes` handle. On a miss, the decompressor's
-    /// output allocation becomes the cached block without another full copy.
-    pub(crate) fn read_block_shared(&self, offset: u64, size: u32) -> Result<Bytes> {
+    /// Cache hits clone only a `Bytes` handle and its inline parsed layout. On
+    /// a miss, the decompressor's output allocation becomes the cached block
+    /// without another full copy.
+    pub(crate) fn read_block_shared(&self, offset: u64, size: u32) -> Result<CachedBlock> {
         self.read_block_shared_inner(offset, size)
             .map_err(|error| self.file_error("data block", error))
     }
 
-    fn read_block_shared_inner(&self, offset: u64, size: u32) -> Result<Bytes> {
+    fn read_block_shared_inner(&self, offset: u64, size: u32) -> Result<CachedBlock> {
         if size < 5 {
             return Err(Error::SSTable {
                 message: "Block size is smaller than its footer".to_string(),
@@ -299,7 +300,7 @@ impl SSTableReader {
 
         // Check cache first
         if let Some(ref cache) = self.cache {
-            if let Some(cached) = cache.get(&cache_key) {
+            if let Some(cached) = cache.get_block(&cache_key) {
                 return Ok(cached);
             }
         }
@@ -343,13 +344,15 @@ impl SSTableReader {
 
         // Decompress
         let decompressed = Bytes::from(decompress_block(block_data, compression)?);
+        let layout = parse_block_layout(&decompressed)?;
+        let block = CachedBlock::validated(decompressed, layout);
 
         // Store in cache
         if let Some(ref cache) = self.cache {
-            cache.insert(cache_key, decompressed.clone());
+            cache.insert_block(cache_key, block.clone());
         }
 
-        Ok(decompressed)
+        Ok(block)
     }
 
     /// Validate every checksummed block and cross-check the unchecksummed index
@@ -373,21 +376,20 @@ impl SSTableReader {
             }
 
             let block = self.read_block_shared(index_entry.block_offset, index_entry.block_size)?;
-            let offsets = parse_block_offsets(&block)?;
-            if offsets.is_empty() {
+            let layout = block
+                .layout()
+                .expect("reader blocks always have a validated layout");
+            if layout.entry_count() == 0 {
                 return Err(sstable_corruption("index references an empty data block"));
             }
-            let entries_end = data_end(block.len(), offsets.len())?;
             let mut block_last_key = None;
-            for (entry_index, entry_offset) in offsets.iter().enumerate() {
-                let entry_end = offsets
-                    .get(entry_index + 1)
-                    .map_or(entries_end, |offset| *offset as usize);
+            for entry_index in 0..layout.entry_count() {
+                let entry_range = layout.entry_range(block.data(), entry_index);
                 let (key, _) = decode_entry_ref(
                     self.format_version,
-                    block.clone(),
-                    *entry_offset as usize,
-                    entry_end,
+                    block.data().clone(),
+                    entry_range.start,
+                    entry_range.end,
                 )?;
                 if previous_key
                     .as_ref()
@@ -428,26 +430,25 @@ impl SSTableReader {
     /// Search for key within a block
     fn search_block_entry(
         &self,
-        block_data: &Bytes,
+        block: &CachedBlock,
         target_key: &[u8],
     ) -> Result<Option<SSTableEntry>> {
-        let offsets = parse_block_offsets(block_data)?;
-        let block_data_end = data_end(block_data.len(), offsets.len())?;
+        let layout = block
+            .layout()
+            .expect("reader blocks always have a validated layout");
 
         // Binary search through entries
         let mut left = 0;
-        let mut right = offsets.len();
+        let mut right = layout.entry_count();
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let entry_end = offsets
-                .get(mid + 1)
-                .map_or(block_data_end, |offset| *offset as usize);
+            let entry_range = layout.entry_range(block.data(), mid);
             let (key, entry) = decode_entry_ref(
                 self.format_version,
-                block_data.clone(),
-                offsets[mid] as usize,
-                entry_end,
+                block.data().clone(),
+                entry_range.start,
+                entry_range.end,
             )?;
 
             match key.as_ref().cmp(target_key) {
@@ -902,7 +903,62 @@ mod tests {
             .read_block_shared(index.block_offset, index.block_size)
             .unwrap();
 
-        assert_eq!(first.as_ptr(), second.as_ptr());
+        assert_eq!(first.data().as_ptr(), second.data().as_ptr());
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    #[test]
+    fn malformed_offset_layout_never_enters_the_block_cache() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("bad-offsets.sst");
+        let mut writer = SSTableWriter::new(&path, uncompressed_config()).unwrap();
+        writer.add_versioned(b"a", Some(b"one"), 1).unwrap();
+        writer.add_versioned(b"b", Some(b"two"), 2).unwrap();
+        writer.finish().unwrap();
+
+        mutate_first_uncompressed_block(&path, |block| {
+            let offsets_start = block.len() - 4 - 2 * 4;
+            block[offsets_start + 4..offsets_start + 8].copy_from_slice(&0_u32.to_le_bytes());
+        });
+
+        let cache = Arc::new(BlockCache::new(1024 * 1024));
+        let reader = SSTableReader::open_with_cache(path, Arc::clone(&cache)).unwrap();
+        let index = &reader.index().entries()[0];
+        let error = reader
+            .read_block_shared(index.block_offset, index.block_size)
+            .unwrap_err();
+        assert!(error.to_string().contains("strictly increasing"));
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.size_bytes, 0);
+    }
+
+    #[test]
+    fn cached_layout_does_not_hide_late_entry_corruption_and_iterator_fuses() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("cached-bad-entry.sst");
+        let mut writer = SSTableWriter::new(&path, uncompressed_config()).unwrap();
+        writer.add_versioned(b"a", Some(b"one"), 1).unwrap();
+        writer.add_versioned(b"b", Some(b"two"), 2).unwrap();
+        writer.finish().unwrap();
+
+        mutate_first_uncompressed_block(&path, |block| {
+            // [key length][a][sequence][marker] precede the value length.
+            block[14..18].copy_from_slice(&100_u32.to_le_bytes());
+        });
+
+        let cache = Arc::new(BlockCache::new(1024 * 1024));
+        let reader = SSTableReader::open_with_cache(path, Arc::clone(&cache)).unwrap();
+        let index = &reader.index().entries()[0];
+        reader
+            .read_block_shared(index.block_offset, index.block_size)
+            .expect("the offset layout is valid and is cached before entry decoding");
+
+        let mut iterator = reader.iter();
+        let error = iterator.next().unwrap().unwrap_err();
+        assert!(error.to_string().contains("value length"));
+        assert!(iterator.next().is_none());
+        assert!(iterator.next().is_none());
         assert_eq!(cache.stats().hits, 1);
     }
 

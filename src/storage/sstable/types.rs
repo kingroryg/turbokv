@@ -30,7 +30,7 @@ impl Default for SSTableConfig {
     fn default() -> Self {
         Self {
             block_size: DEFAULT_BLOCK_SIZE,
-            compression: super::CompressionType::Snappy,
+            compression: super::CompressionType::Lz4,
             bloom_bits_per_key: 10,
             index_interval: 16, // Denser index for faster point lookups
         }

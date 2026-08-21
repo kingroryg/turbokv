@@ -372,7 +372,7 @@ pub struct PhysicalCacheStats {
     pub block_cache_enabled: bool,
     /// Current decompressed block-cache entry count.
     pub block_cache_entries: u64,
-    /// Current decompressed block-cache bytes.
+    /// Current decompressed block payload and parsed-layout cache bytes.
     pub block_cache_bytes: u64,
     /// Block-cache hits since open.
     pub block_cache_hits_since_open: u64,

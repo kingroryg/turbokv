@@ -3,11 +3,115 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use lru::LruCache;
 use parking_lot::Mutex;
+
+/// Validated location of an SSTable block's in-block offset table.
+///
+/// Offsets remain encoded in the decompressed block. Keeping only this small
+/// view avoids a per-read `Vec<u32>` while allowing the cache to account for
+/// every byte of additional retained layout metadata.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BlockLayout {
+    // One-based so `Option<BlockLayout>` uses this field as its niche and
+    // retains no separate discriminant or padding.
+    offsets_start_plus_one: NonZeroUsize,
+    entry_count: usize,
+}
+
+impl BlockLayout {
+    pub(crate) fn new(offsets_start: usize, entry_count: usize) -> Self {
+        Self {
+            offsets_start_plus_one: NonZeroUsize::new(
+                offsets_start
+                    .checked_add(1)
+                    .expect("slice-backed block offset fits in usize"),
+            )
+            .expect("one-based block offset is nonzero"),
+            entry_count,
+        }
+    }
+
+    fn offsets_start(self) -> usize {
+        self.offsets_start_plus_one.get() - 1
+    }
+
+    pub(crate) fn entry_count(self) -> usize {
+        self.entry_count
+    }
+
+    pub(crate) fn data_end(self) -> usize {
+        self.offsets_start()
+    }
+
+    pub(crate) fn entry_offset(self, block: &[u8], index: usize) -> usize {
+        debug_assert!(index < self.entry_count);
+        let start = self
+            .offsets_start()
+            .checked_add(
+                index
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .expect("validated block offset index"),
+            )
+            .expect("validated block offset position");
+        u32::from_le_bytes(
+            block[start..start + std::mem::size_of::<u32>()]
+                .try_into()
+                .expect("validated four-byte block offset"),
+        ) as usize
+    }
+
+    pub(crate) fn entry_range(self, block: &[u8], index: usize) -> Range<usize> {
+        let start = self.entry_offset(block, index);
+        let end = if index + 1 < self.entry_count {
+            self.entry_offset(block, index + 1)
+        } else {
+            self.data_end()
+        };
+        start..end
+    }
+
+    pub(crate) const fn retained_bytes() -> u64 {
+        std::mem::size_of::<Option<Self>>() as u64
+    }
+}
+
+/// A decompressed block and, for SSTable-owned entries, its validated layout.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedBlock {
+    data: Bytes,
+    layout: Option<BlockLayout>,
+}
+
+impl CachedBlock {
+    pub(crate) fn validated(data: Bytes, layout: BlockLayout) -> Self {
+        Self {
+            data,
+            layout: Some(layout),
+        }
+    }
+
+    fn raw(data: Bytes) -> Self {
+        Self { data, layout: None }
+    }
+
+    pub(crate) fn data(&self) -> &Bytes {
+        &self.data
+    }
+
+    pub(crate) fn layout(&self) -> Option<BlockLayout> {
+        self.layout
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        self.data.len() as u64 + self.layout.map_or(0, |_| BlockLayout::retained_bytes())
+    }
+}
 
 /// Cache key identifying a specific block in an SSTable
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -27,7 +131,7 @@ impl CacheKey {
 
 /// Single shard of the cache
 struct CacheShard {
-    lru: Mutex<LruCache<CacheKey, Bytes>>,
+    lru: Mutex<LruCache<CacheKey, CachedBlock>>,
     max_size_bytes: u64,
     size_bytes: AtomicU64,
     hits: AtomicU64,
@@ -44,6 +148,7 @@ pub struct BlockCache {
 #[derive(Debug, Clone, Default)]
 pub struct CacheStats {
     pub entries: usize,
+    /// Retained payload and parsed-layout bytes.
     pub size_bytes: u64,
     pub hits: u64,
     pub misses: u64,
@@ -101,27 +206,44 @@ impl BlockCache {
     /// Get a block from cache
     #[inline]
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
+        self.get_cached(key, false).map(|block| block.data)
+    }
+
+    pub(crate) fn get_block(&self, key: &CacheKey) -> Option<CachedBlock> {
+        self.get_cached(key, true)
+    }
+
+    fn get_cached(&self, key: &CacheKey, require_layout: bool) -> Option<CachedBlock> {
         let shard = self.shard_for(key);
         let mut lru = shard.lru.lock();
 
-        match lru.get(key) {
-            Some(value) => {
-                shard.hits.fetch_add(1, Ordering::Relaxed);
-                Some(value.clone())
-            }
-            None => {
-                shard.misses.fetch_add(1, Ordering::Relaxed);
-                None
-            }
+        let usable = lru
+            .peek(key)
+            .is_some_and(|value| !require_layout || value.layout.is_some());
+        if usable {
+            shard.hits.fetch_add(1, Ordering::Relaxed);
+            lru.get(key).cloned()
+        } else {
+            shard.misses.fetch_add(1, Ordering::Relaxed);
+            None
         }
     }
 
     /// Insert a block into cache
     #[inline]
     pub fn insert(&self, key: CacheKey, value: Bytes) {
-        let value_len = value.len() as u64;
+        self.insert_cached(key, CachedBlock::raw(value));
+    }
+
+    pub(crate) fn insert_block(&self, key: CacheKey, value: CachedBlock) {
+        debug_assert!(value.layout.is_some());
+        self.insert_cached(key, value);
+    }
+
+    fn insert_cached(&self, key: CacheKey, value: CachedBlock) {
+        let value_len = value.retained_bytes();
         let shard = self.shard_for(&key);
-        if value_len == 0 || value_len > shard.max_size_bytes {
+        if value.data.is_empty() || value_len > shard.max_size_bytes {
             return;
         }
         let mut lru = shard.lru.lock();
@@ -130,14 +252,14 @@ impl BlockCache {
         if let Some(old) = lru.pop(&key) {
             shard
                 .size_bytes
-                .fetch_sub(old.len() as u64, Ordering::Relaxed);
+                .fetch_sub(old.retained_bytes(), Ordering::Relaxed);
         }
 
         // Insert new entry (LRU handles eviction of oldest)
         if let Some((_, evicted)) = lru.push(key, value) {
             shard
                 .size_bytes
-                .fetch_sub(evicted.len() as u64, Ordering::Relaxed);
+                .fetch_sub(evicted.retained_bytes(), Ordering::Relaxed);
         }
         shard.size_bytes.fetch_add(value_len, Ordering::Relaxed);
 
@@ -147,7 +269,7 @@ impl BlockCache {
             };
             shard
                 .size_bytes
-                .fetch_sub(evicted.len() as u64, Ordering::Relaxed);
+                .fetch_sub(evicted.retained_bytes(), Ordering::Relaxed);
         }
     }
 
@@ -158,7 +280,7 @@ impl BlockCache {
         if let Some(old) = lru.pop(key) {
             shard
                 .size_bytes
-                .fetch_sub(old.len() as u64, Ordering::Relaxed);
+                .fetch_sub(old.retained_bytes(), Ordering::Relaxed);
         }
     }
 
@@ -234,6 +356,64 @@ mod tests {
         assert!(cache.get(&CacheKey::new(7, 32)).is_some());
         cache.insert(CacheKey::new(7, 33), Bytes::new());
         assert!(cache.get(&CacheKey::new(7, 33)).is_none());
+    }
+
+    #[test]
+    fn dense_validated_layout_metadata_is_charged_to_the_byte_budget() {
+        const PAYLOAD: usize = 4_096;
+        const ENTRIES: usize = 256;
+        assert_eq!(
+            std::mem::size_of::<Option<BlockLayout>>(),
+            std::mem::size_of::<BlockLayout>(),
+            "BlockLayout must retain its niche-optimized representation"
+        );
+        let charge = PAYLOAD as u64 + BlockLayout::retained_bytes();
+        let cache = BlockCache::with_shards(charge as usize, 1);
+        let block = CachedBlock::validated(
+            Bytes::from(vec![0; PAYLOAD]),
+            BlockLayout::new(PAYLOAD - ENTRIES * 4 - 4, ENTRIES),
+        );
+
+        cache.insert_block(CacheKey::new(11, 0), block.clone());
+        assert_eq!(cache.stats().size_bytes, charge);
+        assert!(cache.get_block(&CacheKey::new(11, 0)).is_some());
+
+        cache.insert_block(CacheKey::new(11, 1), block);
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.size_bytes, charge);
+        assert!(cache.get_block(&CacheKey::new(11, 0)).is_none());
+        assert!(cache.get_block(&CacheKey::new(11, 1)).is_some());
+
+        let too_small = BlockCache::with_shards(charge as usize - 1, 1);
+        too_small.insert_block(
+            CacheKey::new(12, 0),
+            CachedBlock::validated(
+                Bytes::from(vec![0; PAYLOAD]),
+                BlockLayout::new(PAYLOAD - ENTRIES * 4 - 4, ENTRIES),
+            ),
+        );
+        assert_eq!(too_small.stats().entries, 0);
+    }
+
+    #[test]
+    fn typed_lookup_counts_incompatible_raw_entries_as_misses() {
+        let cache = BlockCache::with_shards(1024, 1);
+        let key = CacheKey::new(13, 7);
+        cache.insert(key.clone(), Bytes::from_static(b"raw public entry"));
+
+        assert!(cache.get_block(&key).is_none());
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 1);
+
+        assert_eq!(
+            cache.get(&key).unwrap(),
+            Bytes::from_static(b"raw public entry")
+        );
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
     }
 
     #[test]

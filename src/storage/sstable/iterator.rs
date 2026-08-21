@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::codec::{data_end, decode_entry_ref, parse_block_offsets, SSTableEntryRef};
+use super::super::cache::CachedBlock;
+#[cfg(test)]
+use super::codec::parse_block_offsets;
+use super::codec::{decode_entry_ref, SSTableEntryRef};
 use super::reader::SSTableEntry;
 use super::SSTableReader;
 use crate::core::error::Result;
@@ -18,9 +21,7 @@ pub struct SSTableIterator<'a> {
 /// Block traversal state shared by borrowed and reader-owning cursors.
 struct SSTableCursorState {
     current_block_idx: usize,
-    current_block_data: Option<Bytes>,
-    current_block_entries: Vec<u32>,
-    current_data_end: usize,
+    current_block: Option<CachedBlock>,
     current_entry_idx: usize,
     failed: bool,
 }
@@ -46,9 +47,7 @@ impl SSTableCursorState {
     fn new(current_block_idx: usize) -> Self {
         Self {
             current_block_idx,
-            current_block_data: None,
-            current_block_entries: Vec::new(),
-            current_data_end: 0,
+            current_block: None,
             current_entry_idx: 0,
             failed: false,
         }
@@ -61,33 +60,34 @@ impl SSTableCursorState {
         }
 
         let entry = &index_entries[self.current_block_idx];
-        let block_data = reader.read_block_shared(entry.block_offset, entry.block_size)?;
-        self.current_block_entries = parse_block_offsets(&block_data)?;
-        self.current_data_end = data_end(block_data.len(), self.current_block_entries.len())?;
-        self.current_block_data = Some(block_data);
+        self.current_block = Some(reader.read_block_shared(entry.block_offset, entry.block_size)?);
         self.current_entry_idx = 0;
         self.current_block_idx += 1;
         Ok(true)
     }
 
     fn read_next_entry(&mut self, format_version: u32) -> Result<Option<(Bytes, SSTableEntryRef)>> {
-        if self.current_entry_idx >= self.current_block_entries.len() {
-            return Ok(None);
-        }
-
-        let Some(block_data) = self.current_block_data.as_ref() else {
+        let Some(block) = self.current_block.as_ref() else {
             return Ok(None);
         };
-        let key_offset = self.current_block_entries[self.current_entry_idx] as usize;
-        let entry_end = self
-            .current_block_entries
-            .get(self.current_entry_idx + 1)
-            .map_or(self.current_data_end, |offset| *offset as usize);
+        let layout = block
+            .layout()
+            .expect("reader blocks always have a validated layout");
+        if self.current_entry_idx >= layout.entry_count() {
+            return Ok(None);
+        }
+        let entry_range = layout.entry_range(block.data(), self.current_entry_idx);
         // An error belongs to this physical entry. Advance first so callers can
         // never observe the same error forever.
         self.current_entry_idx += 1;
 
-        decode_entry_ref(format_version, block_data.clone(), key_offset, entry_end).map(Some)
+        decode_entry_ref(
+            format_version,
+            block.data().clone(),
+            entry_range.start,
+            entry_range.end,
+        )
+        .map(Some)
     }
 
     fn next_versioned_ref(
@@ -98,13 +98,13 @@ impl SSTableCursorState {
             return None;
         }
         loop {
-            if self.current_block_data.is_some() {
+            if self.current_block.is_some() {
                 match self.read_next_entry(reader.format_version()) {
                     Ok(Some(entry)) => return Some(Ok(entry)),
-                    Ok(None) => self.current_block_data = None,
+                    Ok(None) => self.current_block = None,
                     Err(error) => {
                         self.failed = true;
-                        self.current_block_data = None;
+                        self.current_block = None;
                         return Some(Err(reader.file_error("data block entry", error)));
                     }
                 }
@@ -115,7 +115,7 @@ impl SSTableCursorState {
                 Ok(false) => return None,
                 Err(error) => {
                     self.failed = true;
-                    self.current_block_data = None;
+                    self.current_block = None;
                     return Some(Err(error));
                 }
             }
@@ -153,7 +153,7 @@ impl SSTableRangeCursor {
 
     #[cfg(test)]
     pub(crate) fn retained_block(&self) -> Option<&Bytes> {
-        self.cursor.current_block_data.as_ref()
+        self.cursor.current_block.as_ref().map(CachedBlock::data)
     }
 }
 

@@ -3,6 +3,7 @@ use std::ops::Range;
 
 use bytes::Bytes;
 
+use super::super::cache::BlockLayout;
 use super::reader::{SSTableEntry, SSTableValue};
 use crate::core::error::{Error, Result};
 
@@ -60,7 +61,20 @@ impl SSTableEntryRef {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_block_offsets(block_data: &[u8]) -> Result<Vec<u32>> {
+    let layout = parse_block_layout(block_data)?;
+    Ok((0..layout.entry_count())
+        .map(|index| layout.entry_offset(block_data, index) as u32)
+        .collect())
+}
+
+/// Validate a block's encoded offset table without materializing it.
+///
+/// The returned layout is safe to reuse only with the same immutable block.
+/// This function is the single validation authority for point reads, scans,
+/// and cache insertion.
+pub(crate) fn parse_block_layout(block_data: &[u8]) -> Result<BlockLayout> {
     let data_len = block_data.len();
     if data_len < 4 {
         return Err(invalid_block("block is missing its entry count"));
@@ -81,31 +95,27 @@ pub(crate) fn parse_block_offsets(block_data: &[u8]) -> Result<Vec<u32>> {
         .checked_sub(footer_bytes)
         .ok_or_else(|| invalid_block("entry offset table exceeds block"))?;
 
-    let mut offsets = Vec::with_capacity(entry_count);
+    let mut previous = None;
     for bytes in block_data[offsets_start..data_len - 4].chunks_exact(4) {
         let offset = u32::from_le_bytes(bytes.try_into().expect("four-byte chunk"));
         if offset as usize >= offsets_start {
             return Err(invalid_block("entry offset points outside entry data"));
         }
-        if offsets.last().is_some_and(|previous| *previous >= offset) {
+        if previous.is_some_and(|previous| previous >= offset) {
             return Err(invalid_block("entry offsets are not strictly increasing"));
         }
-        offsets.push(offset);
+        previous = Some(offset);
     }
-    if offsets.first().is_some_and(|offset| *offset != 0) {
+    if entry_count > 0
+        && u32::from_le_bytes(
+            block_data[offsets_start..offsets_start + 4]
+                .try_into()
+                .expect("four-byte first offset"),
+        ) != 0
+    {
         return Err(invalid_block("first entry offset is not zero"));
     }
-    Ok(offsets)
-}
-
-pub(crate) fn data_end(block_len: usize, entry_count: usize) -> Result<usize> {
-    let offsets_bytes = entry_count
-        .checked_mul(4)
-        .and_then(|bytes| bytes.checked_add(4))
-        .ok_or_else(|| invalid_block("entry offset table length overflow"))?;
-    block_len
-        .checked_sub(offsets_bytes)
-        .ok_or_else(|| invalid_block("entry offset table exceeds block"))
+    Ok(BlockLayout::new(offsets_start, entry_count))
 }
 
 pub(crate) fn decode_entry_ref(
