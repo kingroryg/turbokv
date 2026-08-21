@@ -11,11 +11,13 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,no_run
-//! use turbokv::{Db, DbOptions};
+//! ```rust
+//! use turbokv::Db;
 //!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let db = Db::open("./my_data").await?;
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let directory = tempfile::tempdir()?;
+//! let db = Db::open(directory.path()).await?;
 //!
 //! db.insert(b"hello", b"world").await?;
 //! db.insert(b"foo", b"bar").await?;
@@ -29,41 +31,56 @@
 //! for (key, value) in db.range(b"a", b"z").await? {
 //!     println!("{:?} -> {:?}", key, value);
 //! }
+//! db.close().await?;
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! ## Durability Modes
 //!
-//! ```rust,no_run
+//! ```rust
 //! use turbokv::{Db, DbOptions};
 //!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let directory = tempfile::tempdir()?;
+//!
 //! // Fast: no WAL, no fsync (for caches, temporary data)
-//! let db = Db::open_with_options("./data", DbOptions::fast()).await?;
+//! let fast = Db::open_with_options(directory.path().join("fast"), DbOptions::fast()).await?;
+//! fast.close().await?;
 //!
-//! // Durable: WAL enabled, periodic sync (survives process crash)
-//! let db = Db::open_with_options("./data", DbOptions::durable()).await?;
+//! // Durable: append to the WAL before acknowledgement without per-write sync.
+//! // Intended for process-crash recovery; it does not guarantee recent writes
+//! // against power loss.
+//! let durable =
+//!     Db::open_with_options(directory.path().join("durable"), DbOptions::durable()).await?;
+//! durable.close().await?;
 //!
-//! // Paranoid: WAL + fsync every write (survives power loss)
-//! let db = Db::open_with_options("./data", DbOptions::paranoid()).await?;
+//! // Paranoid: sync the WAL before acknowledgement. This is the strongest
+//! // mode, subject to the filesystem and device honoring sync.
+//! let paranoid =
+//!     Db::open_with_options(directory.path().join("paranoid"), DbOptions::paranoid()).await?;
+//! paranoid.close().await?;
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! ## Batch Operations
 //!
-//! ```rust,no_run
+//! ```rust
 //! use turbokv::{Db, WriteBatch};
 //!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let db = Db::open("./data").await?;
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let directory = tempfile::tempdir()?;
+//! let db = Db::open(directory.path()).await?;
 //!
 //! let mut batch = WriteBatch::new();
 //! batch.put(b"key1", b"value1");
 //! batch.put(b"key2", b"value2");
 //! batch.delete(b"old_key");
 //! db.write_batch(&batch).await?;
+//! db.close().await?;
 //! # Ok(())
 //! # }
 //! ```

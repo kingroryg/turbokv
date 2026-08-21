@@ -3,7 +3,7 @@
 
 **A fast, embedded key-value store in Rust**
 
-[![Codeberg](https://img.shields.io/badge/repo-Codeberg-blue.svg)](https://codeberg.org/kingroryg/turbokv)
+[![GitHub](https://img.shields.io/badge/repo-GitHub-blue.svg)](https://github.com/kingroryg/turbokv)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
@@ -71,58 +71,15 @@ tokio = { version = "1", features = ["full"] }
 
 or just run `cargo add turbokv`
 
-
 ### Basic Usage
 
-```rust
-use turbokv::{Db, DbOptions};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open database with default options (durable mode)
-    let db = Db::open("./my_data").await?;
-
-    // Insert key-value pairs
-    db.insert(b"hello", b"world").await?;
-    db.insert(b"user:1", b"alice").await?;
-
-    // Get values
-    if let Some(value) = db.get(b"hello").await? {
-        println!("Got: {}", String::from_utf8_lossy(&value));
-    }
-
-    // Delete keys
-    db.remove(b"hello").await?;
-
-    // Range scan
-    for (key, value) in db.range(b"user:", b"user:~").await? {
-        println!("{}: {}",
-            String::from_utf8_lossy(&key),
-            String::from_utf8_lossy(&value)
-        );
-    }
-
-    // Prefix scan
-    let users = db.scan_prefix(b"user:").await?;
-
-    Ok(())
-}
-```
+The self-cleaning [`basic` example](examples/basic.rs) covers insert, get,
+update, and remove operations. Run it with `cargo run --example basic`.
 
 ### Batch Writes
 
-```rust
-use turbokv::{Db, WriteBatch};
-
-let db = Db::open("./my_data").await?;
-
-// Batch write (atomic in the WAL and published atomically to readers)
-let mut batch = WriteBatch::new();
-batch.put(b"key1", b"value1");
-batch.put(b"key2", b"value2");
-batch.delete(b"old_key");
-db.write_batch(&batch).await?;
-```
+The [`batch_writes` example](examples/batch_writes.rs) shows an atomic mix of
+puts and deletes. Run it with `cargo run --example batch_writes`.
 
 ### Configuration Options
 
@@ -131,8 +88,8 @@ TurboKV provides three durability modes to balance speed and safety:
 | Mode | WAL | Fsync | On Crash |
 |------|-----|-------|----------|
 | `fast()` | No | No | Flushed data survives; unflushed data lost |
-| `durable()` | Yes | Periodic | All data survives process crash |
-| `paranoid()` | Yes | Every commit group | Acknowledged data survives power loss |
+| `durable()` | Yes | Not per write | Intended to survive process crashes; no power-loss guarantee for recent writes |
+| `paranoid()` | Yes | Before acknowledgement | Strongest mode, subject to filesystem and device sync semantics |
 
 **Recommended for most users:** `fast()` or `durable()` mode.
 
@@ -148,37 +105,18 @@ in the flush-health lane until reopen. Because a complete failed-group record
 may be recovered after reopening, treat the failed mutation outcome as
 indeterminate before retrying a non-idempotent operation.
 
-```rust
-use turbokv::{Db, DbOptions};
-
-// Fast mode - maximum speed, no durability guarantees
-// Best for: caches, temporary data, benchmarks
-let db = Db::open_with_options("./data", DbOptions::fast()).await?;
-
-// Durable mode (RECOMMENDED) - WAL protects against process crashes
-// Best for: most production workloads
-let db = Db::open_with_options("./data", DbOptions::durable()).await?;
-
-// Paranoid mode - every acknowledgement follows a successful sync barrier
-// Best for: financial transactions, critical records, audit logs
-let db = Db::open_with_options("./data", DbOptions::paranoid()).await?;
-```
+The [`persistence` example](examples/persistence.rs) exercises synced WAL
+recovery after an unclean drop using `DbOptions::paranoid()`.
 
 ### Custom Configuration
 
-```rust
-use turbokv::{DbOptions, Compression};
+The [`configuration` example](examples/configuration.rs) starts from the
+supported durable preset, then selects compression and documented cache and
+memtable sizes.
 
-let options = DbOptions {
-    wal_enabled: true,           // Write-ahead log for durability
-    sync_writes: false,          // Periodic sync (true = synced acknowledgements)
-    memtable_size: 64 * 1024 * 1024,   // 64MB memtable
-    block_cache_size: 64 * 1024 * 1024, // 64MB block cache
-    compression: Compression::Lz4,      // Lz4, Snappy, Zstd, or None
-};
-
-let db = Db::open_with_options("./data", options).await?;
-```
+See also the [`range_queries`](examples/range_queries.rs) and
+[`concurrent`](examples/concurrent.rs) examples for ordered scans and shared
+access from multiple tasks.
 
 ## Performance
 
