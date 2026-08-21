@@ -133,6 +133,9 @@ fn low_level_compactor_keeps_its_legacy_single_output_contract() {
     assert_eq!(output.path, output_path);
     assert_eq!(output.entry_count, 32);
     assert_eq!(result.bytes_written, output.size);
+    assert_eq!(result.live_keys.len(), 32);
+    assert_eq!(result.live_keys.first().unwrap(), b"key-0000");
+    assert_eq!(result.live_keys.last().unwrap(), b"key-0031");
     assert!(SSTableReader::open(output.path).is_ok());
 
     let empty_path = sstable_directory.join("43_empty.sst");

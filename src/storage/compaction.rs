@@ -110,6 +110,9 @@ struct CompactionExecutionOptions {
     target_file_size: u64,
     first_output: Option<CompactionOutputIdentity>,
     require_output: bool,
+    /// Populate the deprecated low-level result without charging coordinated
+    /// compactions for a key copy that none of their consumers observe.
+    collect_live_keys: bool,
     tombstone_reclamation_frontier: TombstoneReclamationFrontier,
 }
 
@@ -370,6 +373,7 @@ impl Compactor {
                         creation: CompactionOutputCreation::CallerOwned,
                     }),
                     require_output: true,
+                    collect_live_keys: true,
                     tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
                 },
             )
@@ -499,7 +503,7 @@ impl Compactor {
                             .expect("an appended output is present to seal");
                         output_sstables.push(self.finish_output(job.output_level, completed)?);
                     }
-                    if entry.value.is_some() {
+                    if options.collect_live_keys && entry.value.is_some() {
                         live_keys.push(entry.key.to_vec());
                     }
                     entries_merged += 1;
@@ -1313,6 +1317,7 @@ impl CompactionCoordinator {
                 target_file_size: self.compactor.config.target_file_size,
                 first_output: None,
                 require_output: false,
+                collect_live_keys: false,
                 tombstone_reclamation_frontier,
             },
         );
@@ -2173,12 +2178,14 @@ mod tests {
                     target_file_size: compactor.config.target_file_size,
                     first_output: None,
                     require_output: false,
+                    collect_live_keys: false,
                     tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
                 },
             )
             .unwrap();
         attempts.mark_manifest_committed();
 
+        assert!(result.live_keys.is_empty());
         let output = result.output_sstables.into_iter().next().unwrap();
         assert_eq!((output.min_sequence, output.max_sequence), (20, 20));
         let reader = SSTableReader::open(output.path).unwrap();
@@ -2221,6 +2228,7 @@ mod tests {
                         target_file_size: compactor.config.target_file_size,
                         first_output: None,
                         require_output: false,
+                        collect_live_keys: false,
                         tombstone_reclamation_frontier: frontier,
                     },
                 )
@@ -2313,6 +2321,7 @@ mod tests {
                         target_file_size: TARGET_SIZE,
                         first_output: None,
                         require_output: false,
+                        collect_live_keys: false,
                         tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
                     },
                 )
@@ -2409,6 +2418,7 @@ mod tests {
                         target_file_size,
                         first_output: None,
                         require_output: false,
+                        collect_live_keys: false,
                         tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
                     },
                 )
