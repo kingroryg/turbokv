@@ -60,7 +60,14 @@ type BufferRegistry = Mutex<HashMap<RegistryKey, Arc<Mutex<Vec<BufferEntry>>>>>;
 static BUFFER_REGISTRY: std::sync::LazyLock<BufferRegistry> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Manages active and immutable memtables
+/// Manages one active memtable, frozen generations, and optional write buffers.
+///
+/// This low-level component provides no WAL or filesystem durability. Direct
+/// mutations are visible on return. Buffered mutations own copies in a
+/// per-thread registry and become visible only when that buffer is drained.
+/// Point reads return owned value copies; the public range and prefix helpers
+/// materialize complete owned result sets. The engine wraps this component in
+/// its ordering, persistence, and snapshot barriers.
 pub struct MemTableManager {
     /// Unique identifier for this manager (used for buffer registry)
     id: u64,
@@ -83,7 +90,7 @@ pub struct MemTableManager {
 }
 
 impl MemTableManager {
-    /// Create a new MemTableManager
+    /// Creates a manager with an empty active table and sequence zero.
     pub fn new(config: MemTableConfig) -> Self {
         Self::new_with_next_sequence(config, 0)
     }
@@ -116,9 +123,11 @@ impl MemTableManager {
             .clone()
     }
 
-    /// Insert a key-value pair
+    /// Copies and inserts one key-value pair into the active table.
     ///
-    /// Automatically rotates the memtable if full.
+    /// The synchronous call assigns a sequence, automatically rotates a full
+    /// table, and makes the mutation visible before success. It can return a
+    /// memtable capacity or read-only error and provides no durability itself.
     pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<u64> {
         let sequence = self.allocate_sequence();
         self.insert_with_sequence(key, value, sequence)?;
@@ -152,8 +161,11 @@ impl MemTableManager {
     /// Writes are accumulated in a thread-local buffer and batch-inserted
     /// when the buffer is full. This reduces lock contention significantly.
     ///
-    /// # Performance
-    /// ~25-35% faster than `insert()` by reducing lock acquisitions.
+    /// Key and value bytes are copied into the buffer. A full buffer is drained
+    /// synchronously and can return a capacity or read-only error; otherwise
+    /// the mutation is not visible through the manager's read methods until a
+    /// later buffer drain. Engine-level ordered barriers perform that drain
+    /// before reads or non-buffered mutations.
     #[inline]
     pub fn insert_buffered(&self, key: &[u8], value: &[u8]) -> Result<u64> {
         let sequence = self.allocate_sequence();
@@ -184,7 +196,12 @@ impl MemTableManager {
         Ok(sequence)
     }
 
-    /// Insert multiple key-value pairs while rotating at batch boundaries.
+    /// Copies and inserts multiple pairs while rotating at batch boundaries.
+    ///
+    /// This low-level helper allocates a staging vector. It preserves input
+    /// order and sequences, but it is not a durable database batch and an error
+    /// can follow earlier in-memory application; use `Db::write_batch` for the
+    /// engine's atomic visibility and recovery contract.
     pub fn insert_many(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
         let start_sequence = self.reserve_sequence_range(entries.len());
         let buffered: Vec<_> = entries
@@ -299,11 +316,14 @@ impl MemTableManager {
         Err(MemTableError::Full)
     }
 
-    /// Flush ALL thread-local buffers from ALL threads for this manager
+    /// Drains this manager's registered buffers from all threads.
     ///
     /// This iterates over the global buffer registry and flushes each buffer
     /// that belongs to this manager instance.
-    /// Call this before reading to ensure all writes from all threads are visible.
+    /// The synchronous call can block on buffer and memtable locks, and can
+    /// return a capacity or read-only error after attempting a drain. Call this
+    /// before using the low-level read helpers when buffered inserts must be
+    /// visible.
     pub fn flush_thread_local(&self) -> Result<()> {
         // Get all registered buffers for this manager
         let registry = BUFFER_REGISTRY.lock();
@@ -326,9 +346,11 @@ impl MemTableManager {
         Ok(())
     }
 
-    /// Delete a key
+    /// Copies `key` and publishes a tombstone in the active table.
     ///
-    /// Automatically rotates the memtable if full.
+    /// The synchronous call assigns a sequence, automatically rotates a full
+    /// table, and makes the deletion visible before success. It can return a
+    /// memtable capacity or read-only error and provides no durability itself.
     pub fn delete(&self, key: &[u8]) -> Result<u64> {
         let sequence = self.allocate_sequence();
         self.delete_with_sequence(key, sequence)?;
@@ -352,9 +374,10 @@ impl MemTableManager {
         Err(MemTableError::Full)
     }
 
-    /// Get a value by key
+    /// Returns an owned copy of the newest in-memory value for `key`.
     ///
-    /// Searches active memtable first, then immutable memtables.
+    /// All active and immutable candidates are resolved by sequence and a
+    /// newest tombstone returns `None`. Buffered entries must first be drained.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.get_entry(key).and_then(|entry| entry.value)
     }
@@ -388,7 +411,11 @@ impl MemTableManager {
         newest.map(|(entry, _)| entry)
     }
 
-    /// Scan a range of keys across all memtables
+    /// Materializes the half-open range `[start, end)` across all memtables.
+    ///
+    /// The result contains owned key/value copies in sorted order, resolves
+    /// duplicate versions and tombstones, and allocates proportional to the
+    /// complete result. Buffered entries must first be drained.
     pub fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.range_entries(start, end)
             .into_iter()
@@ -401,7 +428,11 @@ impl MemTableManager {
         self.merge_entries(|key| key >= start && key < end)
     }
 
-    /// Scan all keys with a given prefix across all memtables
+    /// Materializes all matching keys across all memtables.
+    ///
+    /// The result contains owned key/value copies in sorted order, resolves
+    /// duplicate versions and tombstones, and allocates proportional to the
+    /// complete result. Buffered entries must first be drained.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.scan_prefix_entries(prefix)
             .into_iter()
@@ -447,9 +478,12 @@ impl MemTableManager {
         Ok(())
     }
 
-    /// Get an immutable memtable for flushing to SSTable
+    /// Removes and returns the oldest immutable memtable.
     ///
-    /// Returns the oldest immutable memtable (FIFO order).
+    /// This low-level operation immediately removes the generation from manager
+    /// reads and must not be used by failure-retryable persistence code. The
+    /// engine instead retains the FIFO entry until durable installation
+    /// succeeds. The returned [`Arc`] keeps the removed table allocated.
     pub fn get_immutable_for_flush(&self) -> Option<Arc<MemTable>> {
         let mut immutable = self.immutable.write();
         if immutable.is_empty() {
@@ -591,7 +625,10 @@ impl MemTableManager {
             .collect()
     }
 
-    /// Get statistics for all memtables
+    /// Samples approximate physical statistics for all memtables and buffers.
+    ///
+    /// The synchronous sample can block briefly on buffer/table locks and is
+    /// not a transactional snapshot with concurrent mutations.
     pub fn stats(&self) -> MemTableManagerStats {
         // Ordinary buffered inserts publish only atomics. This shared lock
         // coordinates sampling with the less frequent batched handoff into the
@@ -615,7 +652,10 @@ impl MemTableManager {
         }
     }
 
-    /// Force rotation (for testing or manual flush)
+    /// Freezes a nonempty active table and appends it to the immutable FIFO.
+    ///
+    /// This is an in-memory visibility transition only; it does not persist or
+    /// flush the generation. The synchronous call can block on manager locks.
     pub fn force_rotate(&self) -> Result<()> {
         let mut active_lock = self.active.write();
 

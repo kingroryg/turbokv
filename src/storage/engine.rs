@@ -1,34 +1,37 @@
 //! # Storage Engine for TurboKV
 //!
-//! LSM-tree based storage engine with:
-//! - Write-ahead logging for durability
-//! - In-memory buffering with concurrent skip list
-//! - Sorted string tables with block-based compression
-//! - Background compaction
+//! LSM-tree storage engine with an optional write-ahead log, concurrent
+//! memtables, immutable compressed SSTables, and coordinated maintenance.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                    Storage Engine                           │
-//! ├─────────────────────────────────────────────────────────────┤
-//! │                                                             │
-//! │  Write Path:                                                │
-//! │  ┌─────────┐    ┌─────────┐    ┌──────────┐                 │
-//! │  │   KV    │───>│   WAL   │───>│ MemTable │                 │
-//! │  └─────────┘    └─────────┘    └────┬─────┘                 │
-//! │                                     │ Flush                 │
-//! │                                     ▼                       │
-//! │                                ┌──────────┐                 │
-//! │                                │ SSTable  │                 │
-//! │                                └──────────┘                 │
-//! │                                                             │
-//! │  Read Path:                                                 │
-//! │  ┌─────────┐    ┌──────────┐    ┌──────────┐                │
-//! │  │  Query  │───>│ MemTable │───>│ SSTables │                │
-//! │  └─────────┘    └──────────┘    └──────────┘                │
-//! │                                                             │
-//! └─────────────────────────────────────────────────────────────┘
+//! WRITE
+//! caller ──> backpressure/order barrier ─┬─> WAL disabled: thread buffer ─┐
+//!                                          └─> WAL append/sync* ──┐  │
+//!                                                                  ▼  ▼
+//!                                                           active memtable
+//! * durable: OS page cache; paranoid: shared File::sync_all barrier
+//!
+//! RECOVERY
+//! directory lock ──> manifest/SST/WAL read-only preflight ──> format migration
+//!              ──> active-tail repair ──> replay WAL from manifest checkpoint
+//!              ──> active memtable ──> start flush/compaction tasks
+//!
+//! READ
+//! point ─┬─> active + immutable memtables ──────────────┬─> highest sequence
+//!       └─> pinned SSTables ──> Bloom/index/cache/block ──┘   (tombstone hides value)
+//! scan ───> freeze active generation ──> k-way ordered merge of retained sources
+//!
+//! FLUSH
+//! drain thread buffers ──> freeze ──> oldest immutable FIFO ──> temp L0 SST
+//!   ──> file sync ──> rename + directory sync ──> manifest sync/replace
+//!   ──> publish live reader set ──> sync/reclaim checkpointed WAL ──> dequeue
+//!
+//! COMPACTION
+//! fair coordinator ──> select + overlap closure ──> streaming version merge
+//!   ──> safe tombstone/version drop ──> target-size split outputs + sync
+//!   ──> manifest sync/replace ──> publish live set ──> unlink/defer old inputs
 //! ```
 
 use std::collections::{BTreeSet, HashSet};
@@ -75,38 +78,52 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// Storage engine error types
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    /// A filesystem operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// WAL validation, recovery, append, sync, or reclamation failed.
     #[error("WAL error: {0}")]
     Wal(#[from] super::wal::WalError),
 
+    /// An in-memory mutation or generation transition failed.
     #[error("MemTable error: {0}")]
     MemTable(#[from] super::memtable::MemTableError),
 
+    /// An SSTable could not be encoded, validated, read, or published.
     #[error("SSTable error: {0}")]
     SSTable(String),
 
+    /// Manifest validation or durable replacement failed.
     #[error("Manifest error: {0}")]
     Manifest(String),
 
+    /// Compaction selection, execution, publication, or cleanup failed.
     #[error("Compaction error: {0}")]
     Compaction(String),
 
+    /// Another cooperating process or engine owns the canonical data directory.
     #[error(
         "database directory is already open for exclusive access: {}; {guidance}",
         path.display(),
         guidance = LOCKED_DIRECTORY_GUIDANCE
     )]
-    DirectoryLocked { path: PathBuf },
+    DirectoryLocked {
+        /// Canonicalized database directory whose advisory lock is held.
+        path: PathBuf,
+    },
 
+    /// The lock file could not be opened, canonicalized, or locked.
     #[error("failed to acquire the database-directory lock at {}: {source}", path.display())]
     DirectoryLockIo {
+        /// Database directory for which ownership could not be established.
         path: PathBuf,
+        /// Underlying canonicalization, file-open, or advisory-lock error.
         #[source]
         source: std::io::Error,
     },
 
+    /// A storage failure without a more specific compatibility variant.
     #[error("Storage error: {0}")]
     Other(String),
 }
@@ -182,7 +199,10 @@ impl Default for StorageConfig {
 }
 
 impl StorageConfig {
-    /// Fast configuration (less durability)
+    /// Creates the no-WAL preset rooted at `data_dir`.
+    ///
+    /// Successful mutations are visible in memory but can be lost until an
+    /// explicit/background flush installs them in an SSTable and manifest.
     pub fn fast(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
@@ -192,7 +212,11 @@ impl StorageConfig {
         }
     }
 
-    /// Durable configuration - WAL enabled, no sync per write
+    /// Creates the process-crash-oriented WAL preset rooted at `data_dir`.
+    ///
+    /// Each mutation reaches an ordinary file write and the operating-system
+    /// page cache before acknowledgement; no per-write `sync_all` is requested.
+    /// Recent writes are therefore not promised across OS or power failure.
     pub fn durable(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
@@ -202,7 +226,11 @@ impl StorageConfig {
         }
     }
 
-    /// Paranoid configuration - WAL + sync on every write
+    /// Creates the strongest WAL preset rooted at `data_dir`.
+    ///
+    /// Concurrent mutations can share an ordered group and `sync_all` barrier,
+    /// and each call is acknowledged only after its group crosses that barrier.
+    /// Power-loss survival still depends on filesystem and device sync semantics.
     pub fn paranoid(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
@@ -213,7 +241,12 @@ impl StorageConfig {
     }
 }
 
-/// Main storage engine
+/// Advanced storage engine with explicit component configuration.
+///
+/// The visibility, version-order, error, and directory-ownership contracts are
+/// the same as [`Db`](crate::Db). Unlike `Db::close`, graceful shutdown borrows
+/// this value; directory ownership is retained until every `Engine`/scan guard
+/// holding it is dropped.
 pub struct Engine {
     config: StorageConfig,
     directory_lock: Arc<DirectoryLock>,
@@ -480,7 +513,18 @@ impl SstableStatistics {
 }
 
 impl Engine {
-    /// Open or create a storage engine
+    /// Open or create an exclusively owned storage engine.
+    ///
+    /// Startup acquires the canonical directory lock, performs read-only
+    /// manifest/SSTable/WAL preflight, then may repair a recoverable WAL tail,
+    /// migrate formats, clean valid orphans, replay from the checkpoint, and
+    /// start background tasks. Manifest, mmap, checksum, and WAL work includes
+    /// synchronous filesystem operations on the calling Tokio worker; startup
+    /// orphan cleanup is offloaded. If this future is cancelled after cleanup
+    /// starts, that detached cleanup retains the directory lock until it
+    /// finishes, so another open cannot race it. Cancellation can still leave
+    /// created directories or completed repair/migration side effects for the
+    /// next open to validate.
     pub async fn open(mut config: StorageConfig) -> Result<Self> {
         // Create directories
         tokio::fs::create_dir_all(&config.data_dir).await?;
@@ -555,12 +599,15 @@ impl Engine {
             .collect::<HashSet<_>>();
         let cleanup_directory = sstable_dir.clone();
         let cleanup_data_directory = config.data_dir.clone();
+        let cleanup_directory_lock = Arc::clone(&directory_lock);
         let startup_sstable_cleanup = tokio::task::spawn_blocking(move || {
-            cleanup_unreferenced_sstables(
-                &cleanup_data_directory,
-                &cleanup_directory,
-                &referenced_sstables,
-            )
+            run_with_directory_lock(cleanup_directory_lock, || {
+                cleanup_unreferenced_sstables(
+                    &cleanup_data_directory,
+                    &cleanup_directory,
+                    &referenced_sstables,
+                )
+            })
         })
         .await
         .map_err(|error| StorageError::Other(format!("SSTable cleanup task failed: {error}")))?;
@@ -728,11 +775,13 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Insert a key-value pair
+    /// Copy and publish one key-value mutation at the configured durability boundary.
     ///
-    /// Automatically uses optimal path based on configuration:
-    /// - No WAL: Sync path with thread-local buffering (faster)
-    /// - With WAL: Async path for durability
+    /// No-WAL inserts use a per-thread buffer. Unsynced WAL mode performs a
+    /// blocking file write to the OS page cache, while synced mode allocates an
+    /// owned WAL payload and awaits ordered group commit. The future can also
+    /// await backpressure and mutation barriers. Errors or cancellation after a
+    /// WAL append have an indeterminate outcome; inspect or reopen before retry.
     pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.maybe_stall_writes().await;
         let _mutation = self.mutation_barrier.read().await;
@@ -764,7 +813,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Insert multiple key-value pairs.
+    /// Append multiple puts in slice order and then publish them to memtables.
+    ///
+    /// This allocates WAL references, sequence metadata, and an encoded batch.
+    /// It does not provide a single visibility transition to concurrent reads;
+    /// use [`Self::write_batch`] for that contract. Error and cancellation after
+    /// append can leave the complete record recoverable after reopen.
     pub async fn insert_many(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -805,10 +859,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Flush any pending writes from ALL thread-local buffers
+    /// Drain pending inserts from all registered thread-local buffers.
     ///
     /// This flushes buffers from ALL threads (not just the calling thread),
-    /// ensuring all concurrent writes are visible before reading.
+    /// ensuring writes already staged there enter the active memtable. This is a
+    /// synchronous in-memory operation: it may allocate/copy buffered entries
+    /// and contend on manager locks, but it does not create SSTables or sync the
+    /// WAL. Capacity/read-only failures are returned as [`StorageError::MemTable`].
     pub fn flush_write_buffers(&self) -> Result<()> {
         self.memtable_manager
             .flush_thread_local()
@@ -816,7 +873,10 @@ impl Engine {
         Ok(())
     }
 
-    /// Delete a key
+    /// Copy and publish one tombstone at the configured durability boundary.
+    ///
+    /// Waiting, blocking I/O, errors, poisoning, and cancellation follow
+    /// [`Self::insert`].
     pub async fn delete(&self, key: &[u8]) -> Result<()> {
         self.maybe_stall_writes().await;
         let _mutation = self.mutation_barrier.read().await;
@@ -847,7 +907,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Get a value by key
+    /// Resolve and copy the newest visible value for a key.
+    ///
+    /// This examines active/immutable memtables and every pinned candidate
+    /// SSTable by sequence before applying tombstones. Synchronous mmap/cache
+    /// reads and decompression run on the calling Tokio worker. A present value
+    /// is allocated as `Vec<u8>`; corruption and I/O are returned. Cancellation
+    /// changes no logical data but can update caches or drain no-WAL buffers.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut newest = self
             .snapshot_memtable(|manager| manager.get_entry(key))
@@ -870,12 +936,20 @@ impl Engine {
         Ok(newest.and_then(|entry| entry.value))
     }
 
-    /// Check if a key exists
+    /// Check whether the newest visible version is live.
+    ///
+    /// This calls [`Self::get`] and therefore temporarily allocates a present
+    /// value and has identical blocking and error behavior.
     pub async fn contains_key(&self, key: &[u8]) -> Result<bool> {
         Ok(self.get(key).await?.is_some())
     }
 
-    /// Scan a range of keys
+    /// Eagerly collect `[start, end)` in raw-byte lexicographic order.
+    ///
+    /// This freezes a coherent snapshot and allocates every returned key/value.
+    /// Synchronous iteration can block on mmap reads and decompression. Late
+    /// errors are mapped to [`StorageError`]; cancellation may leave a memtable
+    /// generation frozen for later flush but changes no logical data.
     pub async fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.range_iter(start, end)
             .await?
@@ -883,7 +957,10 @@ impl Engine {
             .map_err(super::iter::ScanError::into_storage_error)
     }
 
-    /// Scan all keys with a given prefix
+    /// Eagerly collect all keys with a raw-byte prefix.
+    ///
+    /// Empty prefixes cover the full database. Allocation, blocking, error,
+    /// snapshot, and cancellation behavior matches [`Self::range`].
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.scan_prefix_iter(prefix)
             .await?
@@ -893,7 +970,11 @@ impl Engine {
 
     /// Scan a range of keys, returning a guard iterator for lazy value access.
     ///
-    /// This allows filtering by key without loading values until needed.
+    /// This freezes a nonempty active generation and pins the directory lock and
+    /// source readers until the iterator is dropped. Construction allocates
+    /// O(source count) merge state. Advancing the returned iterator is
+    /// synchronous and fallible; key access avoids value copies, but each
+    /// visited SSTable block is read, verified, and decompressed as a unit.
     pub async fn range_iter(&self, start: &[u8], end: &[u8]) -> Result<RangeIter> {
         if start >= end {
             return Ok(RangeIter::empty(Arc::clone(&self.directory_lock)));
@@ -907,13 +988,20 @@ impl Engine {
 
     /// Scan keys with a prefix, returning a guard iterator for lazy value access.
     ///
-    /// This allows filtering by key without loading values until needed.
+    /// Snapshot lifetime, allocation, blocking, and errors match
+    /// [`Self::range_iter`]. Empty prefixes cover the full database.
     pub async fn scan_prefix_iter(&self, prefix: &[u8]) -> Result<super::iter::PrefixIter> {
         self.scan_iter(ScanBounds::prefix(prefix), Arc::clone(&self.directory_lock))
             .await
     }
 
-    /// Write a batch of operations atomically
+    /// Publish an owned write batch as one visibility transition.
+    ///
+    /// This allocates operation references, sequences, and a checksummed WAL
+    /// envelope. Concurrent reads observe either the pre-batch state or the
+    /// complete batch. The call can await backpressure, batch ordering, and sync.
+    /// Cancellation after WAL work can leave the complete batch recoverable but
+    /// never publishes an in-memory prefix.
     pub async fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -974,7 +1062,15 @@ impl Engine {
         Ok(())
     }
 
-    /// Flush memtable to SSTable
+    /// Persist all writes captured by this flush to SSTables and a synced WAL.
+    ///
+    /// This drains no-WAL thread buffers, freezes the active generation, and
+    /// processes the immutable FIFO. SSTable encoding/compression, file sync,
+    /// atomic rename, directory sync, manifest replacement, and WAL reclamation
+    /// include blocking work on runtime workers and allocate generation/encoding
+    /// buffers. Concurrent later writes may require another flush. On error or
+    /// cancellation, uncompleted generations remain visible and registered for
+    /// retry even when some filesystem side effects are already durable.
     pub async fn flush(&self) -> Result<()> {
         self.flush_with_origin(MaintenanceOrigin::Foreground).await
     }
@@ -1035,7 +1131,11 @@ impl Engine {
     /// manual request carries descendants of its initial live-file scope to a
     /// fixed point while excluding unrelated concurrent flush arrivals;
     /// overlap closure can still pull a later arrival into a scoped job. Once
-    /// shutdown starts, new requests are successful no-ops.
+    /// shutdown starts, new requests are successful no-ops. Execution performs
+    /// blocking mmap reads, compression, file/directory sync, and cleanup in an
+    /// owned worker task. Cancelling while queued removes the waiter; cancelling
+    /// after ownership transfer detaches the waiter but the accepted job runs to
+    /// a safe publication boundary.
     pub async fn compact(&self) -> Result<CompactionResult> {
         self.compaction_coordinator.request_manual().await
     }
@@ -1084,6 +1184,8 @@ impl Engine {
     /// freeze can cause additional bytes to be written by a later flush and
     /// compaction. Tombstones and superseded versions are resolved by the same
     /// streaming merge used for range scans and never inflate these counts.
+    /// Synchronous block reads/decompression run while the future is polled;
+    /// cancellation may leave a generation frozen but changes no logical data.
     pub async fn logical_stats(&self) -> Result<LogicalStats> {
         let mut iterator = self.scan_prefix_iter(b"").await?;
         let mut stats = LogicalStats::default();
@@ -1272,6 +1374,11 @@ impl Engine {
     /// still unresolved afterward is returned through the legacy
     /// [`StorageError::Other`] variant. Use [`Self::shutdown_with_status`] to
     /// inspect the structured maintenance snapshot.
+    ///
+    /// The future waits for background tasks and in-flight compaction, then runs
+    /// the same blocking persistence path as [`Self::flush`]. Cancelling it does
+    /// not release directory ownership because `self` is borrowed; shutdown may
+    /// be incomplete and callers must retry or drop the engine and recover.
     pub async fn shutdown(&self) -> Result<()> {
         self.shutdown_with_status()
             .await
@@ -1289,6 +1396,7 @@ impl Engine {
     /// distinguish ordinary storage failures from retryable maintenance left
     /// unresolved after the final flush. Like [`Self::shutdown`], this borrows
     /// the engine and retains directory ownership until the engine is dropped.
+    /// Blocking and cancellation behavior is identical to [`Self::shutdown`].
     pub async fn shutdown_with_status(&self) -> std::result::Result<(), MaintenanceShutdownError> {
         let _shutdown = self.shutdown_lock.lock().await;
         let compaction_pause = self.compaction_coordinator.pause_requests();
@@ -2161,6 +2269,14 @@ impl StartupSstableCleanup {
         self.failure.get_or_insert(message);
         self.deferred_paths.push(path);
     }
+}
+
+fn run_with_directory_lock<T>(
+    directory_lock: Arc<DirectoryLock>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let _directory_lock = directory_lock;
+    operation()
 }
 
 fn cleanup_unreferenced_sstables(
@@ -6994,6 +7110,55 @@ mod tests {
         );
         let reopened = Engine::open(config).await.unwrap();
         reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_logical_stats_releases_scan_ownership_before_reopen() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), true);
+        let mut engine = Engine::open(config.clone()).await.unwrap();
+        engine.insert(b"stats:key", b"value").await.unwrap();
+
+        for _ in 0..8 {
+            assert_eq!(engine.logical_stats().await.unwrap().live_keys, 1);
+            drop(engine);
+            engine = Engine::open(config.clone()).await.unwrap();
+        }
+        engine.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn detached_startup_cleanup_retains_directory_ownership() {
+        let directory = TempDir::new().unwrap();
+        let directory_lock = Arc::new(
+            DirectoryLock::acquire(directory.path())
+                .unwrap_or_else(|_| panic!("initial directory lock must be available")),
+        );
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+
+        let cleanup_lock = Arc::clone(&directory_lock);
+        let cleanup_entered = Arc::clone(&entered);
+        let cleanup_release = Arc::clone(&release);
+        let cleanup = std::thread::spawn(move || {
+            run_with_directory_lock(cleanup_lock, || {
+                cleanup_entered.wait();
+                cleanup_release.wait();
+            });
+        });
+
+        entered.wait();
+        drop(directory_lock);
+        assert!(matches!(
+            DirectoryLock::acquire(directory.path()),
+            Err(DirectoryLockAcquireError::Locked { .. })
+        ));
+
+        release.wait();
+        cleanup.join().unwrap();
+        let reopened = DirectoryLock::acquire(directory.path())
+            .unwrap_or_else(|_| panic!("directory lock must be released after cleanup"));
+        drop(reopened);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1,9 +1,10 @@
-//! The manifest tracks:
+//! The manifest is the durable authority for:
 //! - All SSTables and their metadata
 //! - WAL checkpoint (first sequence that recovery must replay)
-//! - Database version for compatibility
+//! - Manifest format version for compatibility
 //!
-//! Manifest File Format
+//! Current manifest file format (v3):
+//! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                    MANIFEST File                            │
 //! ├─────────────────────────────────────────────────────────────┤
@@ -11,9 +12,10 @@
 //! │  Version: u32                                               │
 //! │  WAL Checkpoint: u64 (next replay sequence)                 │
 //! │  SSTable Count: u32                                         │
-//! │  SSTable Entries: [SSTableManifestEntry...]                 │
+//! │  Entries: id, level, path, sizes/counts, key/sequence bounds│
 //! │  Checksum: u32 (CRC32)                                      │
 //! └─────────────────────────────────────────────────────────────┘
+//! ```
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -56,16 +58,27 @@ pub struct Manifest {
 /// SSTable metadata stored in manifest
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SSTableManifestEntry {
+    /// Engine-wide table identifier.
     pub id: u64,
+    /// LSM level containing the table.
     pub level: u32,
+    /// Table path, resolved against the database directory when relative.
     pub path: PathBuf,
+    /// Encoded file length in bytes.
     pub size: u64,
+    /// Number of physical key versions in the table.
     pub entry_count: u64,
+    /// Number of tombstone versions in the table.
     pub tombstone_count: u64,
+    /// Smallest raw key, or empty for an empty table.
     pub min_key: Vec<u8>,
+    /// Largest raw key, or empty for an empty table.
     pub max_key: Vec<u8>,
+    /// Smallest engine sequence represented by the table.
     pub min_sequence: u64,
+    /// Largest engine sequence represented by the table.
     pub max_sequence: u64,
+    /// Unix timestamp in seconds recorded when the table was finished.
     pub creation_time: u64,
 }
 
@@ -79,7 +92,11 @@ impl Manifest {
         }
     }
 
-    /// Load manifest from disk, or create new if doesn't exist
+    /// Load `MANIFEST` from `data_dir`, or return a new in-memory manifest.
+    ///
+    /// A missing file is not created by this function. Existing bytes are read
+    /// synchronously, fully allocated in memory, checksummed, and structurally
+    /// validated before a value is returned.
     pub fn load_or_create(data_dir: &Path) -> Result<Self> {
         let manifest_path = data_dir.join("MANIFEST");
 
@@ -91,7 +108,7 @@ impl Manifest {
         }
     }
 
-    /// Load manifest from file
+    /// Synchronously read, allocate, checksum, and decode a manifest file.
     pub fn load(path: &Path) -> Result<Self> {
         // Read entire file into memory for checksum verification
         let file = File::open(path).map_err(|e| Error::Io {
@@ -202,7 +219,12 @@ impl Manifest {
         })
     }
 
-    /// Save manifest to disk (atomic write via rename)
+    /// Durably replace the manifest through a temporary file.
+    ///
+    /// The complete encoded manifest is allocated in memory, written and
+    /// synced, atomically renamed, and followed by a directory sync where the
+    /// platform exposes one. Failure can occur after the rename; callers that
+    /// need to distinguish that outcome must reload and compare the manifest.
     pub fn save(&self, data_dir: &Path) -> Result<()> {
         let manifest_path = data_dir.join("MANIFEST");
         let temp_path = data_dir.join("MANIFEST.tmp");
@@ -273,17 +295,19 @@ impl Manifest {
         self.save(data_dir)
     }
 
-    /// Update the exclusive durable frontier after a successful flush.
+    /// Update the first WAL sequence that recovery must replay.
+    ///
+    /// This mutates only the in-memory value; call [`Self::save`] to persist it.
     pub fn update_checkpoint(&mut self, sequence: u64) {
         self.wal_checkpoint = sequence;
     }
 
-    /// Add SSTable to manifest
+    /// Append an SSTable to this in-memory manifest.
     pub fn add_sstable(&mut self, entry: SSTableManifestEntry) {
         self.sstables.push(entry);
     }
 
-    /// Remove SSTables (after compaction)
+    /// Remove matching SSTable identifiers from this in-memory manifest.
     pub fn remove_sstables(&mut self, ids: &[u64]) {
         self.sstables.retain(|e| !ids.contains(&e.id));
     }

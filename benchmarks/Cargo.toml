@@ -25,6 +25,10 @@ harness = false
 name = "benchmark_protocol"
 path = "protocol_tests.rs"
 
+[[test]]
+name = "published_claims"
+path = "published_claims.rs"
+
 [lints.rust]
 unsafe_code = "forbid"
 

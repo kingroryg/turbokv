@@ -12,7 +12,13 @@ use super::reader::SSTableEntry;
 use super::SSTableReader;
 use crate::core::error::Result;
 
-/// Iterator over SSTable entries
+/// Sorted, fallible iterator over every entry in one SSTable.
+///
+/// Data blocks are read, verified, decompressed, and optionally cached lazily
+/// as [`Iterator::next`] advances. Keys are copied into owned [`Bytes`]; values
+/// may share immutable block storage. Tombstones are returned as `None`. The
+/// iterator yields one error for the first unreadable block or entry and is
+/// fused afterward.
 pub struct SSTableIterator<'a> {
     reader: &'a SSTableReader,
     cursor: SSTableCursorState,

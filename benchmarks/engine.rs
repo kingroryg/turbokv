@@ -13,8 +13,8 @@ use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
-use turbokv::{Engine, PhysicalStats, StorageConfig, WalConfig};
+use std::time::{Duration, Instant};
+use turbokv::{Engine, PhysicalStats, StorageConfig, StorageError, WalConfig};
 
 pub type DynError = Box<dyn std::error::Error>;
 
@@ -183,7 +183,26 @@ impl Database {
 
     pub async fn reopen(&mut self) -> Result<(), DynError> {
         self.state.take();
-        self.state = Some(open_state(self.name, self.durability, &self.path).await?);
+        let handoff_started = Instant::now();
+        loop {
+            match open_state(self.name, self.durability, &self.path).await {
+                Ok(state) => {
+                    self.state = Some(state);
+                    break;
+                }
+                Err(error)
+                    if self.name == EngineName::TurboKv
+                        && handoff_started.elapsed() < Duration::from_secs(5)
+                        && matches!(
+                            error.downcast_ref::<StorageError>(),
+                            Some(StorageError::DirectoryLocked { .. })
+                        ) =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 

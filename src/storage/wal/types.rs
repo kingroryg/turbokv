@@ -2,10 +2,13 @@ use bytes::Bytes;
 use std::time::Duration;
 use thiserror::Error;
 
+/// Magic bytes at the start of every WAL segment.
 pub const WAL_MAGIC: &[u8; 8] = b"TURBOKV\0";
-/// Stable identifiers for the Merkle-extension WAL layouts. Versions 1 and 2
-/// share the same physical entry representation.
+/// Stable identifier for the first released WAL layout.
 pub const WAL_VERSION_V1: u32 = 1;
+/// Stable identifier for the second released WAL layout.
+///
+/// Versions 1 and 2 share the same physical entry representation.
 pub const WAL_VERSION_V2: u32 = 2;
 /// Stable identifier for entries after removal of the legacy extension.
 pub const WAL_VERSION_V3: u32 = 3;
@@ -13,7 +16,9 @@ pub const WAL_VERSION_V3: u32 = 3;
 /// records; opening a validated v1-v3 WAL starts a new v4 segment and retains
 /// the old segments for replay until their checkpoint permits reclamation.
 pub const WAL_VERSION: u32 = 4;
+/// Encoded segment-header size in bytes.
 pub const WAL_HEADER_SIZE: usize = 64;
+/// Encoded v3/v4 record-header size in bytes.
 pub const ENTRY_HEADER_SIZE: usize = 32;
 /// Largest supported paranoid group-commit collection window.
 pub const MAX_GROUP_COMMIT_DELAY_US: u64 = 60_000_000;
@@ -29,26 +34,35 @@ const BATCH_HEADER_SIZE: usize = 4;
 const BATCH_OPERATION_HEADER_SIZE: usize = 9;
 
 #[derive(Debug, Error)]
+/// Errors produced while validating, reading, writing, syncing, or reclaiming WALs.
 pub enum WalError {
+    /// A filesystem operation failed.
     #[error("I/O error: {message}")]
     Io {
+        /// Operation-specific failure description.
         message: String,
+        /// Optional underlying operating-system error.
         #[source]
         source: Option<std::io::Error>,
     },
 
+    /// Header, record, sequence, or configuration bytes violate the WAL format.
     #[error("Invalid WAL format: {0}")]
     InvalidFormat(String),
 
+    /// A record payload does not match its stored CRC32.
     #[error("CRC mismatch: data corrupted")]
     CrcMismatch,
 
+    /// Bytes cannot be safely classified as a recoverable active-tail failure.
     #[error("WAL corruption: {0}")]
     Corruption(String),
 
+    /// The paranoid group-commit writer is unavailable or poisoned.
     #[error("Channel closed")]
     ChannelClosed,
 
+    /// An iterator or decoder reached the physical end of a segment.
     #[error("EOF reached")]
     Eof,
 }
@@ -62,16 +76,18 @@ impl From<std::io::Error> for WalError {
     }
 }
 
+/// Result type for low-level WAL operations.
 pub type Result<T> = std::result::Result<T, WalError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+/// Physical WAL record types.
 pub enum EntryType {
     /// Normal key-value data
     Data = 1,
-    /// Checkpoint marker (safe point for recovery)
+    /// Reserved legacy checkpoint record; current checkpoints live in the manifest.
     Checkpoint = 2,
-    /// Truncation marker
+    /// Reserved legacy truncation record; current reclamation unlinks whole segments.
     Truncate = 3,
     /// Tombstone (key deletion)
     Delete = 4,
@@ -97,18 +113,28 @@ impl TryFrom<u8> for EntryType {
     }
 }
 
-/// The `data` field contains encoded key-value pair:
+/// One logical mutation decoded from a validated WAL record.
+///
+/// The `data` field contains an encoded key-value pair:
 /// - For Data: `[key_len: u32][key][value]`
 /// - For Delete: `[key_len: u32][key]`
+///
+/// Physical batch envelopes are expanded by the public WAL iterator and read
+/// methods, so callers normally receive `Data` and `Delete` entries.
 #[derive(Debug, Clone)]
 pub struct WalEntry {
+    /// Engine-wide mutation sequence.
     pub sequence: u64,
+    /// Milliseconds since the Unix epoch recorded when the physical record formed.
     pub timestamp: u64,
+    /// Logical mutation kind.
     pub entry_type: EntryType,
+    /// Encoded key and optional value payload.
     pub data: Bytes,
 }
 
 impl WalEntry {
+    /// Borrow the encoded key, or return `None` for a malformed payload.
     pub fn decode_key(&self) -> Option<&[u8]> {
         if self.data.len() < 4 {
             return None;
@@ -122,6 +148,10 @@ impl WalEntry {
         Some(&self.data[4..4 + key_len])
     }
 
+    /// Borrow the encoded value.
+    ///
+    /// Returns `None` for deletes and malformed payloads. An empty stored value
+    /// is returned as `Some(&[])`.
     pub fn decode_value(&self) -> Option<&[u8]> {
         if self.entry_type == EntryType::Delete {
             return None;
@@ -138,6 +168,9 @@ impl WalEntry {
         Some(&self.data[4 + key_len..])
     }
 
+    /// Decode a non-batch mutation into its borrowed key and optional value.
+    ///
+    /// Returns `None` for malformed payloads and physical batch envelopes.
     pub fn decode_kv(&self) -> Option<(&[u8], Option<&[u8]>)> {
         if self.entry_type == EntryType::Batch {
             return None;
@@ -218,6 +251,11 @@ impl AsRef<WalEntry> for WalEntry {
 }
 
 #[derive(Debug, Clone)]
+/// Low-level WAL rotation and acknowledgement configuration.
+///
+/// `sync_on_write = false` acknowledges after a direct file write reaches the
+/// operating-system page cache. `true` routes callers through ordered group
+/// commit and acknowledges only after `File::sync_all` succeeds.
 pub struct WalConfig {
     /// Maximum file size before rotation (bytes)
     pub max_file_size: u64,
@@ -249,7 +287,7 @@ impl Default for WalConfig {
 }
 
 impl WalConfig {
-    /// Fast WAL config - no sync, optimized for throughput
+    /// Configure unsynced WAL acknowledgement for throughput-oriented tools.
     pub fn fast() -> Self {
         Self {
             sync_on_write: false,
@@ -259,8 +297,10 @@ impl WalConfig {
         }
     }
 
-    /// Durable WAL config - WAL enabled but no sync per write
-    /// Data survives process crash (OS flushes buffers)
+    /// Configure process-crash-oriented WAL acknowledgement without per-write sync.
+    ///
+    /// Success means the record was written into the operating-system page
+    /// cache. It does not promise recent acknowledgements survive power loss.
     pub fn durable() -> Self {
         Self {
             sync_on_write: false,
@@ -270,8 +310,10 @@ impl WalConfig {
         }
     }
 
-    /// Paranoid WAL config - sync on every write
-    /// Data survives power loss
+    /// Configure group-committed `File::sync_all` acknowledgement.
+    ///
+    /// This is power-loss-oriented but still depends on the filesystem and
+    /// device honoring the platform sync contract.
     pub fn paranoid() -> Self {
         Self {
             sync_on_write: true,
@@ -302,6 +344,7 @@ impl WalConfig {
 }
 
 #[inline]
+/// Allocate the v3/v4 payload for one put record.
 pub fn encode_kv(key: &[u8], value: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + key.len() + value.len());
     buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -311,6 +354,7 @@ pub fn encode_kv(key: &[u8], value: &[u8]) -> Vec<u8> {
 }
 
 #[inline]
+/// Allocate the v3/v4 payload for one delete record.
 pub fn encode_delete(key: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + key.len());
     buf.extend_from_slice(&(key.len() as u32).to_le_bytes());

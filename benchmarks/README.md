@@ -16,8 +16,13 @@ terminated with LF. The report hashes that manifest with `git hash-object
 final artifact commit must match, even when the measured pre-artifact commit has
 been removed by Git garbage collection.
 
-This protocol establishes evidence before optimization. It is not a source of
-published performance claims.
+The root README's current acknowledgement claims are checked against
+`results/apple-m4-macos-15.3.2/durability-baseline-current.json`, which must
+carry a clean source-manifest hash matching the checked-out revision. Archived
+reports remain reproducibility records, not current-head claims. Cross-engine
+claims use only equivalent acknowledgement boundaries: the settlement phase
+invokes engine-specific compaction policies and is intentionally not compared
+between engines.
 
 ## Running it
 

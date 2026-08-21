@@ -1,14 +1,17 @@
 //! # Compaction
 //!
-//! Background compaction merges small SSTables into larger ones,
-//! removing deleted/overwritten data and bounding file count.
+//! Foreground and background requests share one fair coordinator. Each job
+//! closes its input set over overlapping key ranges, streams the newest version
+//! of each key into target-sized outputs, atomically publishes the manifest,
+//! and then removes or defers obsolete input cleanup.
 //!
-//! ## Strategy: Size-Tiered with Aggressive L0
+//! ## Selection strategy
 //!
-//! For SecOps workloads (bursty writes during incidents):
-//! - L0: Flush target, compact when 4+ files accumulate
-//! - L1-L6: 10x size multiplier per level
-//! - Streaming merge to handle large files without RAM pressure
+//! - L0 is prioritized when its file-count trigger is reached.
+//! - Higher levels are selected when their geometric byte budget is exceeded.
+//! - A manual drain follows descendants of its captured scope to a fixed point.
+//! - Tombstones are dropped only behind a captured sequence frontier proving no
+//!   older live source can make the deleted value reappear.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
@@ -39,16 +42,16 @@ use super::sstable::{
 use super::version::VersionOrder;
 use super::InProgressGuard;
 
-/// Compaction configuration
+/// Selection thresholds and output sizing for coordinated compaction.
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
-    /// Max SSTables at L0 before triggering compaction
+    /// L0 file count that makes an automatic selection eligible.
     pub l0_compaction_trigger: usize,
-    /// Max levels (typically 7)
+    /// Number of levels including L0; values below two disable normal selection.
     pub max_levels: u32,
-    /// Size multiplier between levels (typically 10)
+    /// Geometric byte-budget multiplier between nonzero levels.
     pub level_size_multiplier: u64,
-    /// Target file size for L1+ (64MB default)
+    /// Approximate encoded output-file target; one oversized entry can exceed it.
     pub target_file_size: u64,
 }
 

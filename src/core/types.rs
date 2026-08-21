@@ -416,9 +416,17 @@ impl CompactionResult {
 #[derive(Debug, Clone)]
 pub enum BatchOp {
     /// Insert or update a key-value pair
-    Put { key: Vec<u8>, value: Vec<u8> },
+    Put {
+        /// Owned raw key bytes.
+        key: Vec<u8>,
+        /// Owned raw value bytes.
+        value: Vec<u8>,
+    },
     /// Delete a key
-    Delete { key: Vec<u8> },
+    Delete {
+        /// Owned raw key bytes.
+        key: Vec<u8>,
+    },
 }
 
 /// Atomic write batch
@@ -433,14 +441,16 @@ impl WriteBatch {
         Self { ops: Vec::new() }
     }
 
-    /// Create a write batch with pre-allocated capacity
+    /// Create a write batch with capacity for `capacity` operations.
+    ///
+    /// This allocates operation slots eagerly but no key or value storage.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             ops: Vec::with_capacity(capacity),
         }
     }
 
-    /// Add a put operation
+    /// Copy a key and value into a put operation at the end of the batch.
     pub fn put<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, key: K, value: V) {
         self.ops.push(BatchOp::Put {
             key: key.as_ref().to_vec(),
@@ -448,7 +458,7 @@ impl WriteBatch {
         });
     }
 
-    /// Add a delete operation
+    /// Copy a key into a delete operation at the end of the batch.
     pub fn delete<K: AsRef<[u8]>>(&mut self, key: K) {
         self.ops.push(BatchOp::Delete {
             key: key.as_ref().to_vec(),

@@ -1,11 +1,20 @@
-//! LSM-tree based storage engine optimized for high write throughput.
+//! LSM-tree storage engine used by [`Db`](crate::Db) and [`Engine`](engine::Engine).
 //!
 //! ## Architecture
 //!
 //! ```text
-//! Write Path: Incoming Write -> WAL (Optional) -> MemTable -> SSTable
-//! Read Path:  Query -> MemTable -> SSTables (newest first, with Bloom filters)
+//! write:    mutation ──> optional WAL ──> active memtable
+//!                                      └─> immutable FIFO ──> L0 SSTable
+//! recovery: directory lock ──> read-only format preflight ──> WAL tail repair
+//!                                                        └─> replay from checkpoint
+//! read:     point ──> memtable generations + pinned SSTables ──> newest sequence
+//!           scan  ──> frozen memtables + pinned SSTables ──> ordered merge
+//! compact:  coordinated SSTable selection ──> streaming merge/split ──> manifest
 //! ```
+//!
+//! SSTables and the manifest are fsynced and atomically published before WAL
+//! reclamation. See [`engine`] for the complete lifecycle and durability
+//! boundaries.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

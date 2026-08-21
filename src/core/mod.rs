@@ -3,7 +3,7 @@
 //! This module provides:
 //! - Database value and status types ([`Compression`], [`DatabaseStatus`])
 //! - Error handling ([`Error`], [`Result`])
-//! - Data integrity primitives ([`crypto`])
+//! - Internal data-integrity primitives
 
 pub(crate) mod crypto;
 pub mod error;

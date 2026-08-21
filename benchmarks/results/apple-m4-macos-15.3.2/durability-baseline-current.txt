@@ -1,0 +1,231 @@
+TurboKV durability-equivalent baseline protocol v4 (release)
+commit: 2d0a821afda8ab4ecf19d6051c931fd31d3f5c9d
+source manifest git hash: 6db82b9cac7a8d0ffed599f542683d78f4846f98
+machine: Apple M4 (Mac16,1), 32 GiB, macOS 15.3.2 / Apple M4 / Mac16,1 / 34359738368 bytes RAM
+environment: ProductName:		macOS; ProductVersion:		15.3.2; BuildVersion:		24D81 / aarch64 / 10 CPUs / filesystem APFS / rustc 1.88.0 (6b00bc388 2025-06-23)
+dataset: 1000 keys, 20-byte keys, 400-byte values, seed 0x545552424f4b5604, 3 repetition(s)
+equivalence: WAL on; durable and paranoid classes reported separately; compression disabled; block cache 0 bytes; batch 1; concurrency 1; memtable 67108864 bytes
+benchmark Cargo.lock fnv1a64: 263c27ce3fd0d590
+
+engine    mode      workload          run  ack ops/s  settled ops/s  p50 ns  p95 ns  p99 ns  max ns  disk bytes  wal bytes  flush bytes  compact r/w
+turbokv   durable   sequential_fill     1     401318          41559    1167    3416    7500  847833      916114     456000       459816 0/0
+fjall     durable   sequential_fill     1     977955          12623     750    1875    3833   53083    33988014          -            - -/-
+rocksdb   durable   sequential_fill     1     546722          39893    1416    3584    5125   48709      454649     436000       421307 0/0
+fjall     durable   random_fill         1     806614          10012     875    3167    5833   62833    33988014          -            - -/-
+rocksdb   durable   random_fill         1     512612          30808    1500    3709    6000   31625      467542     436000       434562 0/0
+turbokv   durable   random_fill         1     552550          45211    1292    3542    5834   70750      916114     456000       459816 0/0
+rocksdb   durable   overwrite           1     426811          52636    1875    4458    6583   55750      476813     436000       434563 866234/434408
+turbokv   durable   overwrite           1     504817          49923    1542    4166    5916   48500     1832136     456000       459816 0/0
+fjall     durable   overwrite           1    1015314          12438     750    1917    3375   21583    34419872          -            - -/-
+turbokv   durable   random_read         1     381049         381049    2583    2667    2750    8833      916114          0            0 0/0
+fjall     durable   random_read         1     262878         262878    3958    4458    5459    8667    33988014          -            - -/-
+rocksdb   durable   random_read         1     721371         721371    1333    1500    1666   20959      467542          0            0 0/0
+fjall     durable   sequential_scan     1    1269277        1269277  805084  818167  818167  818167    33988014          -            - -/-
+rocksdb   durable   sequential_scan     1    1719395        1719395  574667  642708  642708  642708      454287          0            0 0/0
+turbokv   durable   sequential_scan     1    1877699        1877699  530666  539459  539459  539459      916114          0            0 0/0
+rocksdb   durable   mixed               1     475653          53235    1833    4167    5500   44333      476808     218000       217958 650419/434408
+turbokv   durable   mixed               1     467681          45328    2375    3250    4292   68958     1383006     228000       238686 0/0
+fjall     durable   mixed               1     187598          11094    5916   10083   10625   60041    34203914          -            - -/-
+turbokv   durable   recovery            1         83             83 12457542 12823958 12823958 12823958      456064          -            - -/-
+fjall     durable   recovery            1        509            509 1436000 4119500 4119500 4119500      462074          -            - -/-
+rocksdb   durable   recovery            1        598            598 1514958 2529375 2529375 2529375      576431          -            - -/-
+fjall     durable   flush               1      26823          26823 37281750 37281750 37281750 37281750    33989760          -            - -/-
+rocksdb   durable   flush               1      62243          62243 16066084 16066084 16066084 16066084      466199          0       434562 0/0
+turbokv   durable   flush               1      58171          58171 17190833 17190833 17190833 17190833      916114          0       459816 0/0
+rocksdb   durable   compaction          1     110727         110727 9031208 9031208 9031208 9031208      489970          0            0 2161712/434408
+turbokv   durable   compaction          1      75043          75043 13325709 13325709 13325709 13325709     2740113          0            0 2299080/459816
+fjall     durable   compaction          1      40220          40220 24863416 24863416 24863416 24863416    35715522          -            - -/-
+fjall     durable   sequential_fill     2     519447          12391    1333    4166    8417   76750    33988014          -            - -/-
+rocksdb   durable   sequential_fill     2     596481          38695    1334    3209    4666   27917      454287     436000       421307 0/0
+turbokv   durable   sequential_fill     2     652600          50201    1167    3250    4583   33208      916114     456000       459816 0/0
+rocksdb   durable   random_fill         2     475851          38602    1709    4000    5541   27250      467542     436000       434562 0/0
+turbokv   durable   random_fill         2     538950          52875    1458    3833    5375   32042      916114     456000       459816 0/0
+fjall     durable   random_fill         2     787453          12892     958    2333    4542   67584    33988014          -            - -/-
+turbokv   durable   overwrite           2     576868          49667    1291    3583    5750   60833     1832136     456000       459816 0/0
+fjall     durable   overwrite           2     642622          11908    1250    2959    5125   15250    34419872          -            - -/-
+rocksdb   durable   overwrite           2     422438          47483    1792    4250    6542   91917      476814     436000       434563 866234/434408
+fjall     durable   random_read         2     133823         133823    7917    8500    9250   58375    33988014          -            - -/-
+rocksdb   durable   random_read         2     740101         740101    1292    1458    1708    7625      467542          0            0 0/0
+turbokv   durable   random_read         2     387653         387653    2542    2667    3083    6417      916114          0            0 0/0
+rocksdb   durable   sequential_scan     2    1533449        1533449  649083  669167  669167  669167      454287          0            0 0/0
+turbokv   durable   sequential_scan     2    1608795        1608795  612584  657000  657000  657000      916114          0            0 0/0
+fjall     durable   sequential_scan     2     915674         915674 1058250 1195834 1195834 1195834    33988014          -            - -/-
+turbokv   durable   mixed               2     416479          45409    2625    3625    5166   49333     1383006     228000       238686 0/0
+fjall     durable   mixed               2     222350          11973    4791    8167    9625   63417    34203914          -            - -/-
+rocksdb   durable   mixed               2     446620          47727    1833    4292    6125   85917      476808     218000       217958 650419/434408
+fjall     durable   recovery            2        519            519 1411542 4104250 4104250 4104250      462074          -            - -/-
+rocksdb   durable   recovery            2        545            545 1783666 2524208 2524208 2524208      576431          -            - -/-
+turbokv   durable   recovery            2         84             84 12582500 12677750 12677750 12677750      456064          -            - -/-
+rocksdb   durable   flush               2      57835          57835 17290583 17290583 17290583 17290583      466199          0       434562 0/0
+turbokv   durable   flush               2      52220          52220 19149791 19149791 19149791 19149791      916114          0       459816 0/0
+fjall     durable   flush               2      27133          27133 36855500 36855500 36855500 36855500    33989760          -            - -/-
+turbokv   durable   compaction          2      74829          74829 13363833 13363833 13363833 13363833     2740113          0            0 2299080/459816
+fjall     durable   compaction          2      40080          40080 24949875 24949875 24949875 24949875    35715522          -            - -/-
+rocksdb   durable   compaction          2      99364          99364 10064000 10064000 10064000 10064000      489963          0            0 2161712/434408
+rocksdb   durable   sequential_fill     3     377994          39000    2125    5167    7167   28875      454287     436000       421307 0/0
+turbokv   durable   sequential_fill     3     411742          45481    1792    5042    6708   84625      916114     456000       459816 0/0
+fjall     durable   sequential_fill     3     576383          12557    1333    3667    6250   24833    33988014          -            - -/-
+turbokv   durable   random_fill         3     599595          49944    1250    3500    4708   61250      916114     456000       459816 0/0
+fjall     durable   random_fill         3     928361          12759     792    2000    3917   72625    33988014          -            - -/-
+rocksdb   durable   random_fill         3     552473          36574    1500    3417    4500   28292      467542     436000       434562 0/0
+fjall     durable   overwrite           3     710038          13726    1125    2750    4584   12125    34419872          -            - -/-
+rocksdb   durable   overwrite           3     454528          50027    1667    3959    5375   82750      476814     436000       434563 866234/434408
+turbokv   durable   overwrite           3     511563          45248    1458    4000    6916   64333     1832136     456000       459816 0/0
+rocksdb   durable   random_read         3     568775         568775    1708    1875    2125    8834      467542          0            0 0/0
+turbokv   durable   random_read         3     269939         269939    3583    3834    5083   41042      916114          0            0 0/0
+fjall     durable   random_read         3     117760         117760    8375   10000   11167   40709    33988014          -            - -/-
+turbokv   durable   sequential_scan     3    1861533        1861533  530917  564916  564916  564916      916114          0            0 0/0
+fjall     durable   sequential_scan     3     944473         944473 1056500 1112709 1112709 1112709    33988014          -            - -/-
+rocksdb   durable   sequential_scan     3    1707650        1707650  582875  591500  591500  591500      454287          0            0 0/0
+fjall     durable   mixed               3     238150          11992    4625    7375    8541   65666    34203914          -            - -/-
+rocksdb   durable   mixed               3     439560          47449    1916    4541    5917   73708      476808     218000       217958 650419/434408
+turbokv   durable   mixed               3     362149          50077    3166    4292    6125   25708     1383006     228000       238686 0/0
+rocksdb   durable   recovery            3        507            507 1762542 3134625 3134625 3134625      576431          -            - -/-
+turbokv   durable   recovery            3         78             78 12552709 14722625 14722625 14722625      456064          -            - -/-
+fjall     durable   recovery            3        343            343 1395042 8964084 8964084 8964084      462074          -            - -/-
+turbokv   durable   flush               3      54173          54173 18459375 18459375 18459375 18459375      916114          0       459816 0/0
+fjall     durable   flush               3      27561          27561 36283375 36283375 36283375 36283375    33989760          -            - -/-
+rocksdb   durable   flush               3      67097          67097 14903875 14903875 14903875 14903875      466199          0       434562 0/0
+fjall     durable   compaction          3      40352          40352 24782000 24782000 24782000 24782000    35715522          -            - -/-
+rocksdb   durable   compaction          3     109548         109548 9128458 9128458 9128458 9128458      489964          0            0 2161712/434408
+turbokv   durable   compaction          3      68181          68181 14666791 14666791 14666791 14666791     2740113          0            0 2299080/459816
+fjall     paranoid  sequential_fill     1        250            246 3995917 4456750 6235083 10648208    33988014          -            - -/-
+rocksdb   paranoid  sequential_fill     1        254            252 3992459 4097500 6052834 10647416      454289     436000       421307 0/0
+turbokv   paranoid  sequential_fill     1        249            248 3995042 4141375 6030541 20697834      916114     456000       459816 0/0
+rocksdb   paranoid  random_fill         1        256            254 3992875 4044125 5002875 10816125      467544     436000       434562 0/0
+turbokv   paranoid  random_fill         1        255            253 3993791 4165041 6014292 10661000      916114     456000       459816 0/0
+fjall     paranoid  random_fill         1        269            263 3970666 4054500 5968084 10573291    33988014          -            - -/-
+turbokv   paranoid  overwrite           1        272            270 3948292 4054792 5981958 10644417     1832136     456000       459816 0/0
+fjall     paranoid  overwrite           1        276            270 3928500 4038375 4972292 10623291    33988142          -            - -/-
+rocksdb   paranoid  overwrite           1        273            271 3949834 4036125 4346958 11659291      476819     436000       434563 866234/434408
+fjall     paranoid  random_read         1      94154          94154    9709   14458   19500   80208    33988014          -            - -/-
+rocksdb   paranoid  random_read         1     214211         214211    4417    5375    9417   37250      467544          0            0 0/0
+turbokv   paranoid  random_read         1     177900         177900    4875    7167   12125   38709      916114          0            0 0/0
+rocksdb   paranoid  sequential_scan     1     813278         813278 1173250 1384084 1384084 1384084      454289          0            0 0/0
+turbokv   paranoid  sequential_scan     1     799345         799345 1130958 1748084 1748084 1748084      916114          0            0 0/0
+fjall     paranoid  sequential_scan     1     766323         766323 1136084 2100500 2100500 2100500    33988014          -            - -/-
+turbokv   paranoid  mixed               1        591            584 2826417 3983708 4044458 4965667     1383006     228000       238686 0/0
+fjall     paranoid  mixed               1        528            504 2759792 3994417 4362167 10475292    33988078          -            - -/-
+rocksdb   paranoid  mixed               1        529            521 2817750 3983458 4049583 9599500      476814     218000       217958 650419/434408
+fjall     paranoid  recovery            1        409            409 1533000 6371000 6371000 6371000      462074          -            - -/-
+rocksdb   paranoid  recovery            1        202            202 4414125 9130791 9130791 9130791      576431          -            - -/-
+turbokv   paranoid  recovery            1         57             57 17420334 18933750 18933750 18933750      456064          -            - -/-
+rocksdb   paranoid  flush               1      49410          49410 20238750 20238750 20238750 20238750      466201          0       434562 0/0
+turbokv   paranoid  flush               1      47670          47670 20977417 20977417 20977417 20977417      916114          0       459816 0/0
+fjall     paranoid  flush               1      29261          29261 34174833 34174833 34174833 34174833    33989760          -            - -/-
+turbokv   paranoid  compaction          1      60114          60114 16635125 16635125 16635125 16635125     2740113          0            0 2299080/459816
+fjall     paranoid  compaction          1      39090          39090 25581708 25581708 25581708 25581708    33988142          -            - -/-
+rocksdb   paranoid  compaction          1      66772          66772 14976250 14976250 14976250 14976250      489972          0            0 2161712/434408
+rocksdb   paranoid  sequential_fill     2        259            257 3988583 4049333 4979709 10570000      454289     436000       421307 0/0
+turbokv   paranoid  sequential_fill     2        262            260 3978667 4058250 5000875 10577541      916114     456000       459816 0/0
+fjall     paranoid  sequential_fill     2        253            247 3995500 4069667 5013084 10571958    33988014          -            - -/-
+turbokv   paranoid  random_fill         2        259            258 3984291 4056500 4473084 10647833      916114     456000       459816 0/0
+fjall     paranoid  random_fill         2        269            264 3966292 4088792 5942916 9622125    33988014          -            - -/-
+rocksdb   paranoid  random_fill         2        258            256 3991042 4052458 5015417 10682917      467544     436000       434562 0/0
+fjall     paranoid  overwrite           2        278            272 3912000 4047000 4909041 10602250    33988142          -            - -/-
+rocksdb   paranoid  overwrite           2        265            263 3975166 4113500 5000292 10691958      476819     436000       434563 866234/434408
+turbokv   paranoid  overwrite           2        270            268 3949708 4048041 4921125 10618917     1832136     456000       459816 0/0
+rocksdb   paranoid  random_read         2     228458         228458    4417    5375    9625   48542      467544          0            0 0/0
+turbokv   paranoid  random_read         2     203352         203352    4209   10958   12042   51875      916114          0            0 0/0
+fjall     paranoid  random_read         2     103678         103678    9417   12333   19417   62875    33988014          -            - -/-
+turbokv   paranoid  sequential_scan     2     876040         876040 1186458 1577416 1577416 1577416      916114          0            0 0/0
+fjall     paranoid  sequential_scan     2     872784         872784 1095834 1225500 1225500 1225500    33988014          -            - -/-
+rocksdb   paranoid  sequential_scan     2     771516         771516 1364500 1502250 1502250 1502250      454289          0            0 0/0
+fjall     paranoid  mixed               2        585            560 2825291 3952709 4031334 4949583    33988078          -            - -/-
+rocksdb   paranoid  mixed               2        553            545 2435625 3972125 4055416 10411125      476814     218000       217958 650419/434408
+turbokv   paranoid  mixed               2        588            580 2815250 3987208 4128125 9512833     1383006     228000       238686 0/0
+rocksdb   paranoid  recovery            2        249            249 2943917 7897625 7897625 7897625      576431          -            - -/-
+turbokv   paranoid  recovery            2         61             61 17027791 18108459 18108459 18108459      456064          -            - -/-
+fjall     paranoid  recovery            2        418            418 1384584 6477625 6477625 6477625      462074          -            - -/-
+turbokv   paranoid  flush               2      45638          45638 21911542 21911542 21911542 21911542      916114          0       459816 0/0
+fjall     paranoid  flush               2      33114          33114 30198375 30198375 30198375 30198375    33989760          -            - -/-
+rocksdb   paranoid  flush               2      54840          54840 18234916 18234916 18234916 18234916      466201          0       434562 0/0
+fjall     paranoid  compaction          2      39285          39285 25455166 25455166 25455166 25455166    33988142          -            - -/-
+rocksdb   paranoid  compaction          2      50652          50652 19742666 19742666 19742666 19742666      489972          0            0 2161712/434408
+turbokv   paranoid  compaction          2      61338          61338 16303042 16303042 16303042 16303042     2740113          0            0 2299080/459816
+turbokv   paranoid  sequential_fill     3        274            272 3949458 4049542 4121333 9697458      916114     456000       459816 0/0
+fjall     paranoid  sequential_fill     3        251            247 3996417 4086958 4507916 10656250    33988014          -            - -/-
+rocksdb   paranoid  sequential_fill     3        269            267 3974083 4045041 4139875 10533167      454289     436000       421307 0/0
+fjall     paranoid  random_fill         3        272            266 3959958 4042000 4890500 10625333    33988014          -            - -/-
+rocksdb   paranoid  random_fill         3        266            264 3959334 4066875 6580375 10632083      467544     436000       434562 0/0
+turbokv   paranoid  random_fill         3        271            269 3938875 4060250 6735250 10523917      916114     456000       459816 0/0
+rocksdb   paranoid  overwrite           3        267            265 3955125 4044708 6735000 11572500      476819     436000       434563 866234/434408
+turbokv   paranoid  overwrite           3        288            286 3089167 4046916 5434875 10687125     1832136     456000       459816 0/0
+fjall     paranoid  overwrite           3        264            259 3966167 4068542 6039958 10892750    33988142          -            - -/-
+turbokv   paranoid  random_read         3     141572         141572    6166   11042   11834  137792      916114          0            0 0/0
+fjall     paranoid  random_read         3      92645          92645    9500   16375   24000   65916    33988014          -            - -/-
+rocksdb   paranoid  random_read         3     292926         292926    3292    4000    4583   18708      467544          0            0 0/0
+fjall     paranoid  sequential_scan     3     616513         616513 1396167 2457292 2457292 2457292    33988014          -            - -/-
+rocksdb   paranoid  sequential_scan     3     821664         821664 1039167 1780167 1780167 1780167      454289          0            0 0/0
+turbokv   paranoid  sequential_scan     3    1187918        1187918  820959  900792  900792  900792      916114          0            0 0/0
+rocksdb   paranoid  mixed               3        532            524 2632125 3992417 4071125 4977709      476814     218000       217958 650419/434408
+turbokv   paranoid  mixed               3        553            547 2756042 4010125 4111875 10573167     1383006     228000       238686 0/0
+fjall     paranoid  mixed               3        524            504 2148125 4003167 6144166 10514209    33988078          -            - -/-
+turbokv   paranoid  recovery            3         59             59 17056125 17822500 17822500 17822500      456064          -            - -/-
+fjall     paranoid  recovery            3        346            346 1421166 8815375 8815375 8815375      462074          -            - -/-
+rocksdb   paranoid  recovery            3        197            197 5100792 8598959 8598959 8598959      576431          -            - -/-
+fjall     paranoid  flush               3      33053          33053 30254583 30254583 30254583 30254583    33989760          -            - -/-
+rocksdb   paranoid  flush               3      57399          57399 17422041 17422041 17422041 17422041      466201          0       434562 0/0
+turbokv   paranoid  flush               3      47829          47829 20907709 20907709 20907709 20907709      916114          0       459816 0/0
+rocksdb   paranoid  compaction          3      70926          70926 14099292 14099292 14099292 14099292      489972          0            0 2161712/434408
+turbokv   paranoid  compaction          3      63068          63068 15855833 15855833 15855833 15855833     2740113          0            0 2299080/459816
+fjall     paranoid  compaction          3      37876          37876 26402125 26402125 26402125 26402125    33988142          -            - -/-
+
+repeated-run throughput dispersion (population CV)
+engine    mode      workload          ack median  ack CV%  settled median  settled CV%
+turbokv   durable   sequential_fill       411742    23.76           45481         7.72
+turbokv   durable   random_fill           552550     4.61           49944         6.40
+turbokv   durable   overwrite             511563     6.12           49667         4.44
+turbokv   durable   random_read           381049    15.60          381049        15.60
+turbokv   durable   sequential_scan      1861533     6.91         1861533         6.91
+turbokv   durable   mixed                 416479    10.37           45409         4.73
+turbokv   durable   recovery                  83     3.32              83         3.32
+turbokv   durable   flush                  54173     4.51           54173         4.51
+turbokv   durable   compaction             74829     4.38           74829         4.38
+turbokv   paranoid  sequential_fill          262     3.86             260         3.86
+turbokv   paranoid  random_fill              259     2.57             258         2.49
+turbokv   paranoid  overwrite                272     2.89             270         2.88
+turbokv   paranoid  random_read           177900    14.55          177900        14.55
+turbokv   paranoid  sequential_scan       876040    17.61          876040        17.61
+turbokv   paranoid  mixed                    588     2.96             580         2.97
+turbokv   paranoid  recovery                  59     2.96              59         2.96
+turbokv   paranoid  flush                  47670     2.12           47670         2.12
+turbokv   paranoid  compaction             61338     1.97           61338         1.97
+fjall     durable   sequential_fill       576383    29.52           12557         0.78
+fjall     durable   random_fill           806614     7.42           12759        11.17
+fjall     durable   overwrite             710038    20.54           12438         6.02
+fjall     durable   random_read           133823    37.88          133823        37.88
+fjall     durable   sequential_scan       944473    15.37          944473        15.37
+fjall     durable   mixed                 222350     9.77           11973         3.59
+fjall     durable   recovery                 509    17.60             509        17.60
+fjall     durable   flush                  27133     1.11           27133         1.11
+fjall     durable   compaction             40220     0.28           40220         0.28
+fjall     paranoid  sequential_fill          251     0.37             247         0.24
+fjall     paranoid  random_fill              269     0.47             264         0.52
+fjall     paranoid  overwrite                276     2.18             270         2.10
+fjall     paranoid  random_read            94154     5.04           94154         5.04
+fjall     paranoid  sequential_scan       766323    13.98          766323        13.98
+fjall     paranoid  mixed                    528     5.14             504         5.05
+fjall     paranoid  recovery                 409     8.27             409         8.27
+fjall     paranoid  flush                  33053     5.67           33053         5.67
+fjall     paranoid  compaction             39090     1.61           39090         1.61
+rocksdb   durable   sequential_fill       546722    18.44           39000         1.30
+rocksdb   durable   random_fill           512612     6.09           36574         9.35
+rocksdb   durable   overwrite             426811     3.27           50027         4.20
+rocksdb   durable   random_read           721371    11.34          721371        11.34
+rocksdb   durable   sequential_scan      1707650     5.14         1707650         5.14
+rocksdb   durable   mixed                 446620     3.44           47727         5.39
+rocksdb   durable   recovery                 545     6.80             545         6.80
+rocksdb   durable   flush                  62243     6.06           62243         6.06
+rocksdb   durable   compaction            109548     4.79          109548         4.79
+rocksdb   paranoid  sequential_fill          259     2.35             257         2.33
+rocksdb   paranoid  random_fill              258     1.70             256         1.71
+rocksdb   paranoid  overwrite                267     1.31             265         1.28
+rocksdb   paranoid  random_read           228458    13.97          228458        13.97
+rocksdb   paranoid  sequential_scan       813278     2.73          813278         2.73
+rocksdb   paranoid  mixed                    532     2.01             524         2.05
+rocksdb   paranoid  recovery                 202    10.88             202        10.88
+rocksdb   paranoid  flush                  54840     6.18           54840         6.18
+rocksdb   paranoid  compaction             66772    13.93           66772        13.93
+
+Null byte counters mean unavailable, never estimated. Setup is excluded from each timed workload. Durable and paranoid rows are different durability classes and must not be compared with each other. These are baseline observations, not performance claims.

@@ -49,22 +49,30 @@ pub type Result<T> = std::result::Result<T, DbError>;
 /// Database errors
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
+    /// The requested option combination has no supported durability contract.
     #[error("Invalid database options: {0}")]
     InvalidOptions(String),
 
+    /// Another cooperating process or engine owns the canonical data directory.
     #[error(
         "database directory is already open for exclusive access: {}; {guidance}",
         path.display(),
         guidance = LOCKED_DIRECTORY_GUIDANCE
     )]
-    DirectoryLocked { path: PathBuf },
+    DirectoryLocked {
+        /// Canonicalized database directory whose advisory lock is held.
+        path: PathBuf,
+    },
 
+    /// The storage engine rejected or could not complete an operation.
     #[error("Storage error: {0}")]
     Storage(#[source] StorageError),
 
+    /// A direct database-level filesystem operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A database failure without a more specific compatibility variant.
     #[error("Database error: {0}")]
     Other(String),
 }
@@ -240,6 +248,13 @@ impl Db {
     /// header repair, or tail recovery. A failed open can leave only the empty
     /// `.turbokv.lock` file used for advisory ownership; the file is
     /// intentionally persistent and is never database-format state.
+    ///
+    /// The default is [`DbOptions::durable`]. Startup performs synchronous
+    /// manifest, mmap, checksum, and WAL validation on the calling Tokio worker,
+    /// although orphan cleanup is offloaded. Errors include ownership, I/O,
+    /// unsupported/corrupt format, recovery, and background-task setup failures.
+    /// Cancelling open releases ownership but may leave newly created directories
+    /// or a successfully repaired/migrated format for the next open to validate.
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open_with_options(path, DbOptions::default()).await
     }
@@ -249,6 +264,8 @@ impl Db {
     /// Returns [`DbError::InvalidOptions`] before creating database files when
     /// the requested durability combination is contradictory. Returns
     /// [`DbError::DirectoryLocked`] if another database owns the directory.
+    /// Other startup, blocking, allocation, and cancellation behavior matches
+    /// [`Self::open`].
     pub async fn open_with_options<P: AsRef<Path>>(path: P, options: DbOptions) -> Result<Self> {
         if options.sync_writes && !options.wal_enabled {
             return Err(DbError::InvalidOptions(
@@ -293,10 +310,17 @@ impl Db {
     /// point selected by [`DbOptions`]. Keys and values are arbitrary bytes;
     /// an empty value is a stored value, not a deletion.
     ///
-    /// # Performance
-    /// Automatically uses the optimal path based on configuration:
-    /// - Fast mode (no WAL): Uses sync path with thread-local buffering
-    /// - Durable modes: Uses async path for WAL writes
+    /// The key and value are copied before returning. Fast mode stages inserts
+    /// in a per-thread buffer; durable mode performs a blocking file write into
+    /// the OS page cache; paranoid mode additionally awaits a shared sync group.
+    /// The future may also wait behind write backpressure and ordering barriers.
+    ///
+    /// # Errors and cancellation
+    ///
+    /// An error or cancellation can occur after a WAL append but before
+    /// in-memory publication. Its outcome is indeterminate: inspect the key or
+    /// reopen before retrying a non-idempotent mutation. A paranoid sync failure
+    /// poisons later writes on this handle.
     pub async fn insert<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, key: K, value: V) -> Result<()> {
         self.engine.insert(key.as_ref(), value.as_ref()).await?;
         Ok(())
@@ -306,7 +330,12 @@ impl Db {
     ///
     /// With WAL enabled, all entries are appended to the WAL before any entry
     /// is made visible in the memtable. If a key occurs more than once, its last
-    /// value in the iterator is visible after success.
+    /// value in the iterator is visible after success. This call first copies
+    /// every key and value into one allocation-backed input vector and then
+    /// allocates WAL batch metadata. Concurrent readers are not promised one
+    /// atomic visibility transition; use [`Self::write_batch`] for that contract.
+    /// Errors and cancellation can leave the complete WAL record recoverable
+    /// even when the call did not acknowledge; verify before retrying.
     pub async fn insert_many<I, K, V>(&self, entries: I) -> Result<()>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -325,7 +354,11 @@ impl Db {
     /// Get the latest acknowledged value for a key.
     ///
     /// Returns `None` if the key is absent or deleted. An existing empty value
-    /// is returned as `Some(Vec::new())`.
+    /// is returned as `Some(Vec::new())`. A present value is copied into the
+    /// returned vector. The async method performs synchronous mmap/cache/block
+    /// reads and decompression on the calling runtime thread and can return
+    /// SSTable I/O, checksum, or decode errors. Cancellation changes no logical
+    /// data, though it can populate caches or drain fast-mode thread buffers.
     pub async fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<Vec<u8>>> {
         Ok(self.engine.get(key.as_ref()).await?)
     }
@@ -333,13 +366,17 @@ impl Db {
     /// Remove a key.
     ///
     /// This is a no-op if the key doesn't exist. Success means the tombstone has
-    /// reached the selected durability point.
+    /// reached the selected durability point. The key is copied. Waiting,
+    /// blocking I/O, errors, poisoning, and cancellation follow [`Self::insert`].
     pub async fn remove<K: AsRef<[u8]>>(&self, key: K) -> Result<()> {
         self.engine.delete(key.as_ref()).await?;
         Ok(())
     }
 
-    /// Check if a key exists
+    /// Check whether the latest acknowledged version is a live value.
+    ///
+    /// This currently resolves through [`Self::get`], including its blocking
+    /// reads and temporary value allocation, and propagates the same errors.
     pub async fn contains_key<K: AsRef<[u8]>>(&self, key: K) -> Result<bool> {
         Ok(self.engine.get(key.as_ref()).await?.is_some())
     }
@@ -347,11 +384,19 @@ impl Db {
     /// Scan a byte range in lexicographic key order.
     ///
     /// The start bound is inclusive and the end bound is exclusive.
+    /// This eagerly allocates every returned key and value after freezing a
+    /// coherent source snapshot. It performs synchronous block reads and
+    /// decompression while the future is polled; late corruption is returned as
+    /// [`DbError`]. Cancellation can leave the snapshot generation frozen for a
+    /// later flush but does not change logical data.
     pub async fn range<K: AsRef<[u8]>>(&self, start: K, end: K) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         Ok(self.engine.range(start.as_ref(), end.as_ref()).await?)
     }
 
-    /// Scan all keys with a given byte prefix in lexicographic order.
+    /// Scan all keys with a byte prefix in lexicographic order.
+    ///
+    /// Empty prefixes scan the full database. Allocation, blocking, snapshot,
+    /// error, and cancellation behavior matches [`Self::range`].
     pub async fn scan_prefix<K: AsRef<[u8]>>(&self, prefix: K) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         Ok(self.engine.scan_prefix(prefix.as_ref()).await?)
     }
@@ -362,6 +407,12 @@ impl Db {
     /// advancing it use the purpose-specific [`ScanError`]. Inspecting a key
     /// does not copy its value; each SSTable block is decompressed as a unit
     /// because the on-disk format interleaves keys and values.
+    /// Construction freezes a nonempty active memtable and pins the directory
+    /// lock plus source readers until the iterator is dropped. It allocates
+    /// source/heap state proportional to the number of retained sources.
+    /// Advancing is synchronous and can block on mmap reads, decompression, and
+    /// cache locks. Cancelling construction may leave a generation frozen but
+    /// changes no logical data.
     ///
     /// # Example
     ///
@@ -410,7 +461,8 @@ impl Db {
     /// Scan keys with a prefix using guard iterator for lazy value access.
     ///
     /// Iterator construction reports [`DbError`]; failures discovered while
-    /// advancing it use the purpose-specific [`ScanError`].
+    /// advancing it use the purpose-specific [`ScanError`]. Snapshot lifetime,
+    /// allocation, blocking, and cancellation match [`Self::range_iter`].
     ///
     /// # Example
     ///
@@ -455,7 +507,11 @@ impl Db {
     /// observe either the state before publication or the complete batch. A
     /// torn record is discarded during tail repair, so recovery never applies
     /// only a valid prefix. If the same key occurs more than once, its last
-    /// operation wins.
+    /// operation wins. `WriteBatch` already owns copies of all inputs; this call
+    /// additionally allocates operation references and WAL encoding metadata.
+    /// It can wait on backpressure, batch ordering, and a paranoid sync group.
+    /// Cancellation before publication can leave the complete batch recoverable
+    /// after reopen, but never publishes a visible prefix.
     pub async fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
         self.engine.write_batch(batch).await?;
         Ok(())
@@ -466,7 +522,12 @@ impl Db {
     /// Success means thread-local write buffers have been drained, current
     /// memtable contents have been installed as SSTables, and the WAL has been
     /// synced. Concurrent writes that begin after the flush starts may require
-    /// a later flush.
+    /// a later flush. The future waits for mutation/flush barriers and performs
+    /// blocking SSTable encoding, compression, file sync, atomic rename,
+    /// directory sync, manifest replacement, and WAL reclamation on runtime
+    /// workers. It can allocate a full frozen generation plus encoding buffers.
+    /// On error or cancellation, uncompleted immutable generations remain live
+    /// and registered for retry; some files or metadata may already be durable.
     pub async fn flush(&self) -> Result<()> {
         self.engine.flush().await?;
         Ok(())
@@ -475,13 +536,19 @@ impl Db {
     /// Close the database cleanly after persisting pending writes.
     ///
     /// This consumes the database handle. Success means buffered writes have
-    /// been flushed, background tasks have stopped, and the directory lock has
-    /// been released as this handle is dropped. Dropping a [`Db`] does not
-    /// provide the persistence guarantee; call `close` when pending writes must
-    /// be persisted. Close returns an error when its final flush fails or a
-    /// background maintenance failure remains unresolved. Use
+    /// been flushed, background tasks have stopped, and this handle has
+    /// released its directory ownership. A live [`crate::RangeIter`] retains its own
+    /// ownership guard, so another open can remain locked until every iterator
+    /// is dropped. Dropping a [`Db`] does not provide the persistence guarantee;
+    /// call `close` when pending writes must be persisted. Close returns an
+    /// error when its final flush fails or a background maintenance failure
+    /// remains unresolved. Use
     /// [`Self::close_with_status`] to inspect unresolved maintenance as a
     /// structured snapshot.
+    /// Cancelling this future is an unclean drop: the moved handle is destroyed,
+    /// background work is aborted, and persistence is not promised. Its
+    /// ownership is released, but any live iterator continues to hold the
+    /// directory lock. The next successful open performs recovery.
     pub async fn close(self) -> Result<()> {
         self.engine.shutdown().await?;
         Ok(())
@@ -491,7 +558,8 @@ impl Db {
     ///
     /// This is the production monitoring form of [`Self::close`]. It consumes
     /// the database exactly like the legacy method, while distinguishing
-    /// ordinary storage errors from unresolved flush or compaction work.
+    /// ordinary storage errors from unresolved flush or compaction work. Its
+    /// blocking and cancellation behavior is identical to [`Self::close`].
     pub async fn close_with_status(self) -> std::result::Result<(), MaintenanceShutdownError> {
         self.engine.shutdown_with_status().await
     }
@@ -508,6 +576,11 @@ impl Db {
     /// Obsolete input cleanup can be deferred after replacement publication;
     /// that retry remains visible through [`Self::status`] even though the
     /// logical compaction result is successful.
+    /// The request can perform substantial synchronous mmap reads, compression,
+    /// file and directory syncs in a worker task and allocates one block per
+    /// input plus output buffers. Cancellation while queued removes the waiter;
+    /// once coordinator ownership is acquired, the accepted job continues to a
+    /// safe publication boundary even if the caller is cancelled.
     pub async fn compact(&self) -> Result<CompactionResult> {
         Ok(self.engine.compact().await?)
     }
@@ -557,8 +630,13 @@ impl Db {
     /// This fallible async operation is O(physical versions), reads SSTable
     /// blocks, and freezes a nonempty active memtable while taking the
     /// snapshot. That freeze can increase bytes written by later flushes and
-    /// compactions. Tombstones and superseded versions never inflate the
-    /// returned key or byte counts.
+    /// compactions. It performs synchronous block I/O and decompression on the
+    /// calling runtime worker and retains scan-state and block allocations for
+    /// the traversal. Cancellation drops that scan state, but a generation
+    /// frozen during snapshot capture remains immutable and can be flushed
+    /// later. Tombstones and superseded versions never inflate the returned key
+    /// or byte counts. See [`Engine::logical_stats`](crate::Engine::logical_stats)
+    /// for the engine-level contract.
     pub async fn logical_stats(&self) -> Result<LogicalStats> {
         Ok(self.engine.logical_stats().await?)
     }
