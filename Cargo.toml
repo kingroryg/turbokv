@@ -5,14 +5,14 @@ authors = ["kingroryg"]
 edition = "2021"
 rust-version = "1.80.0"
 license = "Apache-2.0"
-repository = "https://codeberg.org/kingroryg/turbokv"
-homepage = "https://codeberg.org/kingroryg/turbokv"
+repository = "https://github.com/kingroryg/turbokv"
+homepage = "https://github.com/kingroryg/turbokv"
 documentation = "https://docs.rs/turbokv"
 readme = "README.md"
 description = "A fast, embedded key-value store with BTreeMap-like API."
 keywords = ["database", "kv", "lsm", "storage", "key-value"]
 categories = ["database-implementations", "data-structures"]
-include = ["src/**/*", "Cargo.toml", "CHANGELOG.md", "LICENSE.md", "README.md"]
+include = ["src/**/*", "examples/**/*", "Cargo.toml", "CHANGELOG.md", "LICENSE.md", "README.md"]
 
 [dependencies]
 # Async runtime
@@ -147,3 +147,34 @@ harness = false
 [[test]]
 name = "benchmark_protocol"
 path = "benchmarks/protocol_tests.rs"
+
+# Run example main functions as part of `cargo test --examples`.
+[[example]]
+name = "basic"
+test = true
+harness = false
+
+[[example]]
+name = "batch_writes"
+test = true
+harness = false
+
+[[example]]
+name = "concurrent"
+test = true
+harness = false
+
+[[example]]
+name = "configuration"
+test = true
+harness = false
+
+[[example]]
+name = "persistence"
+test = true
+harness = false
+
+[[example]]
+name = "range_queries"
+test = true
+harness = false

@@ -4,12 +4,14 @@
 //!
 //! ## Example Usage
 //!
-//! ```rust,no_run
-//! use turbokv::{Db, DbOptions};
+//! ```rust
+//! use turbokv::Db;
 //!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let directory = tempfile::tempdir()?;
 //! // Open with default options
-//! let db = Db::open("./my_data").await?;
+//! let db = Db::open(directory.path()).await?;
 //!
 //! // Insert key-value pairs
 //! db.insert(b"hello", b"world").await?;
@@ -26,6 +28,7 @@
 //! for (key, value) in db.range(b"a", b"z").await? {
 //!     println!("{:?} -> {:?}", key, value);
 //! }
+//! db.close().await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -362,18 +365,36 @@ impl Db {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use turbokv::Db;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let directory = tempfile::tempdir()?;
+    /// let db = Db::open(directory.path()).await?;
+    /// db.insert(b"user:1:active", b"yes").await?;
+    /// db.insert(b"user:2:name", b"Ada").await?;
+    ///
     /// // Count keys without loading values
-    /// let count = db.range_iter(b"user:", b"user:\xff").await?.count()?;
+    /// let count = db
+    ///     .range_iter(b"user:".as_slice(), b"user:\xff".as_slice())
+    ///     .await?
+    ///     .count()?;
+    /// assert_eq!(count, 2);
     ///
     /// // Filter by key, only load matching values
-    /// for guard in db.range_iter(b"user:", b"user:\xff").await? {
+    /// for guard in db
+    ///     .range_iter(b"user:".as_slice(), b"user:\xff".as_slice())
+    ///     .await?
+    /// {
     ///     let guard = guard?;
     ///     if guard.key().ends_with(b":active") {
-    ///         let value = guard.value();
-    ///         // process value
+    ///         assert_eq!(guard.value(), b"yes");
     ///     }
     /// }
+    /// db.close().await?;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// [`EntryGuard`]: super::iter::EntryGuard
@@ -393,15 +414,29 @@ impl Db {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use turbokv::Db;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let directory = tempfile::tempdir()?;
+    /// let db = Db::open(directory.path()).await?;
+    /// db.insert(b"user:1", b"Ada").await?;
+    /// db.insert(b"user:2", b"Grace").await?;
+    ///
     /// // Get only keys
     /// let keys = db.scan_prefix_iter(b"user:").await?.keys()?;
+    /// assert_eq!(keys, vec![b"user:1".to_vec(), b"user:2".to_vec()]);
     ///
     /// // Paginate results
     /// let page: Vec<_> = db.scan_prefix_iter(b"user:").await?
-    ///     .paginate(offset, limit)
+    ///     .paginate(1, 1)
     ///     .map(|g| g.map(|g| g.into_pair()))
     ///     .collect::<Result<Vec<_>, _>>()?;
+    /// assert_eq!(page, vec![(b"user:2".to_vec(), b"Grace".to_vec())]);
+    /// db.close().await?;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// [`EntryGuard`]: super::iter::EntryGuard
