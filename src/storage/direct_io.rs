@@ -152,10 +152,10 @@ unsafe impl Sync for AlignedBuffer {}
 impl AlignedBuffer {
     /// Create a new aligned buffer with the specified capacity
     pub fn new(capacity: usize, alignment: usize) -> Self {
-        // Round up capacity to alignment
-        let aligned_capacity = (capacity + alignment - 1) & !(alignment - 1);
+        let aligned_capacity = aligned_allocation_size(capacity, alignment);
 
-        let layout = std::alloc::Layout::from_size_align(aligned_capacity, alignment).unwrap();
+        let layout = std::alloc::Layout::from_size_align(aligned_capacity, alignment)
+            .expect("aligned buffer allocation exceeds the platform layout limit");
 
         let ptr = unsafe {
             let p = std::alloc::alloc_zeroed(layout);
@@ -196,7 +196,10 @@ impl AlignedBuffer {
 
     /// Extend the buffer with data, growing if necessary
     pub fn extend_aligned(&mut self, data: &[u8]) {
-        let new_len = self.len + data.len();
+        let new_len = self
+            .len
+            .checked_add(data.len())
+            .expect("aligned buffer length overflows usize");
         if new_len > self.capacity {
             self.grow(new_len);
         }
@@ -211,7 +214,10 @@ impl AlignedBuffer {
         let remainder = self.len % self.alignment;
         if remainder != 0 {
             let padding = self.alignment - remainder;
-            let new_len = self.len + padding;
+            let new_len = self
+                .len
+                .checked_add(padding)
+                .expect("aligned buffer padding overflows usize");
             if new_len > self.capacity {
                 self.grow(new_len);
             }
@@ -235,11 +241,14 @@ impl AlignedBuffer {
     /// Grow the buffer to accommodate at least `min_capacity` bytes.
     fn grow(&mut self, min_capacity: usize) {
         // Double the capacity or use min_capacity, whichever is larger
-        let new_capacity = std::cmp::max(self.capacity * 2, min_capacity);
-        // Round up to alignment
-        let new_capacity = (new_capacity + self.alignment - 1) & !(self.alignment - 1);
+        let requested = self
+            .capacity
+            .checked_mul(2)
+            .map_or(min_capacity, |doubled| doubled.max(min_capacity));
+        let new_capacity = aligned_allocation_size(requested, self.alignment);
 
-        let new_layout = std::alloc::Layout::from_size_align(new_capacity, self.alignment).unwrap();
+        let new_layout = std::alloc::Layout::from_size_align(new_capacity, self.alignment)
+            .expect("aligned buffer growth exceeds the platform layout limit");
 
         let new_ptr = unsafe {
             let p = std::alloc::alloc_zeroed(new_layout);
@@ -257,6 +266,21 @@ impl AlignedBuffer {
         self.capacity = new_capacity;
         self.layout = new_layout;
     }
+}
+
+fn aligned_allocation_size(capacity: usize, alignment: usize) -> usize {
+    assert!(
+        alignment.is_power_of_two(),
+        "aligned buffer alignment must be a non-zero power of two"
+    );
+    // `alloc_zeroed`/`dealloc` require a non-zero allocation. An empty public
+    // buffer therefore owns one aligned allocation unit while retaining len 0.
+    capacity
+        .max(1)
+        .checked_add(alignment - 1)
+        .map(|size| size & !(alignment - 1))
+        .filter(|size| *size != 0)
+        .expect("aligned buffer capacity overflows usize")
 }
 
 impl Drop for AlignedBuffer {
@@ -332,6 +356,32 @@ mod tests {
 
         buf.pad_to_alignment();
         assert_eq!(buf.len() % DIRECT_IO_ALIGNMENT, 0);
+    }
+
+    #[test]
+    fn retained_unsafe_aligned_buffer_survives_empty_growth_reuse_and_cross_thread_drop() {
+        let empty = AlignedBuffer::new(0, DIRECT_IO_ALIGNMENT);
+        assert!(empty.is_empty());
+        assert!(empty.is_aligned());
+        drop(empty);
+
+        let mut buffer = std::thread::spawn(|| {
+            let mut buffer = AlignedBuffer::new(1, 64);
+            let payload = (0..16_385).map(|index| index as u8).collect::<Vec<_>>();
+            buffer.extend_aligned(&payload);
+            assert_eq!(buffer.as_slice(), payload);
+            assert!(buffer.is_aligned());
+            buffer
+        })
+        .join()
+        .unwrap();
+
+        buffer.clear();
+        buffer.extend_aligned(b"reused");
+        buffer.pad_to_alignment();
+        assert_eq!(&buffer.as_slice()[..6], b"reused");
+        assert!(buffer.as_slice()[6..].iter().all(|byte| *byte == 0));
+        assert_eq!(buffer.len() % buffer.alignment(), 0);
     }
 
     #[test]
