@@ -12,12 +12,6 @@ pub fn crc32_checksum(data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
-/// Verify CRC32 checksum
-#[inline]
-pub fn verify_crc32(data: &[u8], expected: u32) -> bool {
-    crc32_checksum(data) == expected
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -26,7 +20,7 @@ mod tests {
     fn test_checksums() {
         let data = b"test data";
         let checksum = crc32_checksum(data);
-        assert!(verify_crc32(data, checksum));
-        assert!(!verify_crc32(b"tampered", checksum));
+        assert_eq!(crc32_checksum(data), checksum);
+        assert_ne!(crc32_checksum(b"tampered"), checksum);
     }
 }

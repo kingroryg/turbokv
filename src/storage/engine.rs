@@ -43,11 +43,10 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use crate::core::{
-    CompactionResult, DatabaseStatus, DbConfig, Error as CoreError, LogicalStats,
-    MaintenanceOrigin, MaintenanceStatus, PhysicalCacheStats, PhysicalMemTableStats,
-    PhysicalSSTableStats, PhysicalStats, PhysicalVersionStats, StorageStats, WalStats,
-    WriteAmplificationStats, WriteBackpressureCauseStatus, WriteBackpressureStatus, WriteBatch,
-    WriteStallStats,
+    CompactionResult, DatabaseStatus, Error as CoreError, LogicalStats, MaintenanceOrigin,
+    MaintenanceStatus, PhysicalCacheStats, PhysicalMemTableStats, PhysicalSSTableStats,
+    PhysicalStats, PhysicalVersionStats, StorageStats, WalStats, WriteAmplificationStats,
+    WriteBackpressureCauseStatus, WriteBackpressureStatus, WriteBatch, WriteStallStats,
 };
 
 #[cfg(test)]
@@ -60,7 +59,7 @@ use super::{
     directory_lock::{
         AcquireError as DirectoryLockAcquireError, DirectoryLock, LOCKED_DIRECTORY_GUIDANCE,
     },
-    fd::{FdConfig, FdMonitor, SSTablePool},
+    fd::{FdConfig, SSTablePool},
     iter::{RangeIter, ScanBounds, ScanSstable},
     maintenance::{MaintenanceHealth, MaintenanceOperation},
     manifest::{atomic_replace, sync_directory, Manifest, SSTableManifestEntry, MANIFEST_VERSION},
@@ -183,26 +182,6 @@ impl Default for StorageConfig {
 }
 
 impl StorageConfig {
-    /// Create config from DbConfig
-    pub fn from_db_config(db_config: &DbConfig, data_dir: PathBuf) -> Self {
-        let wal_config = if db_config.sync_writes {
-            WalConfig::paranoid()
-        } else {
-            WalConfig::durable()
-        };
-        Self {
-            data_dir,
-            wal_config,
-            memtable_config: MemTableConfig {
-                max_size: db_config.memtable_size,
-                ..Default::default()
-            },
-            wal_enabled: db_config.wal_enabled,
-            block_cache_size: db_config.block_cache_size,
-            ..Default::default()
-        }
-    }
-
     /// Fast configuration (less durability)
     pub fn fast(data_dir: PathBuf) -> Self {
         Self {
@@ -259,8 +238,6 @@ pub struct Engine {
     shutdown_lock: AsyncMutex<()>,
     next_sstable_id: Arc<std::sync::atomic::AtomicU64>,
     sstable_pool: Arc<SSTablePool>,
-    #[allow(dead_code)]
-    fd_monitor: Arc<FdMonitor>,
     compaction_coordinator: Arc<CompactionCoordinator>,
     sstable_stats: Arc<SstableStatistics>,
     logical_bytes_ingested: Arc<AtomicU64>,
@@ -505,9 +482,6 @@ impl SstableStatistics {
 impl Engine {
     /// Open or create a storage engine
     pub async fn open(mut config: StorageConfig) -> Result<Self> {
-        // Initialize cached timestamp
-        super::cached_time::init();
-
         // Create directories
         tokio::fs::create_dir_all(&config.data_dir).await?;
         let directory_lock = Arc::new(DirectoryLock::acquire(&config.data_dir).map_err(
@@ -679,8 +653,6 @@ impl Engine {
             config.fd_config.clone(),
             block_cache,
         ));
-        let fd_monitor = Arc::new(FdMonitor::new(config.fd_config.soft_limit_ratio));
-
         let sstable_stats = Arc::new(SstableStatistics::new(&sstables));
         let sstables = Arc::new(AsyncRwLock::new(sstables));
         let manifest = Arc::new(AsyncMutex::new(manifest));
@@ -736,7 +708,6 @@ impl Engine {
             shutdown_lock: AsyncMutex::new(()),
             next_sstable_id,
             sstable_pool,
-            fd_monitor,
             compaction_coordinator,
             sstable_stats,
             logical_bytes_ingested: Arc::new(AtomicU64::new(0)),

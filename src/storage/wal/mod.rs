@@ -325,6 +325,7 @@ impl WriteAheadLog {
             }
             None => preflight_directory(&wal_dir).await?,
         };
+        super::cached_time::init()?;
         tokio::fs::create_dir_all(&wal_dir)
             .await
             .map_err(|e| WalError::Io {

@@ -2,14 +2,16 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use turbokv::storage::compaction::{CompactionConfig, CompactionJob};
-use turbokv::storage::manifest::SSTableManifestEntry;
-use turbokv::storage::{Compactor, SSTableConfig, SSTableReader, SSTableWriter};
-use turbokv::{Db, DbError, DbOptions, Engine, StorageConfig, StorageError, WriteBatch};
+use turbokv::storage::cache::BlockCache;
+use turbokv::storage::sstable::{CompressionType, SSTableReader, SSTableWriter};
+use turbokv::storage::wal::WriteAheadLog;
+use turbokv::{
+    CompactionConfig, Db, DbError, DbOptions, Engine, FdConfig, MemTableConfig, SSTableConfig,
+    StorageConfig, StorageError, WalConfig, WriteBatch,
+};
 
 const CRASH_WRITER_PATH: &str = "TURBOKV_CONTRACT_CRASH_WRITER_PATH";
 const CRASH_WRITER_MODE: &str = "TURBOKV_CONTRACT_CRASH_WRITER_MODE";
@@ -58,100 +60,234 @@ fn expect_directory_locked(result: Result<Db, DbError>) -> std::path::PathBuf {
 }
 
 #[test]
-#[allow(deprecated)]
-fn low_level_compactor_keeps_its_legacy_single_output_contract() {
+fn removed_dormant_surfaces_stay_absent_from_package_sources() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for relative in [
+        "src/optimizations.rs",
+        "src/core/config.rs",
+        "src/core/metrics.rs",
+        "src/core/serialization.rs",
+        "src/core/traits.rs",
+        "src/core/utils.rs",
+        "src/storage/buffer_pool.rs",
+        "src/storage/direct_io.rs",
+        "src/storage/partitioning.rs",
+    ] {
+        assert!(!root.join(relative).exists(), "{relative} was reintroduced");
+    }
+
+    let root_api = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+    for removed in [
+        "DbConfig",
+        "CompactionStyle",
+        "crc32_checksum",
+        "MemTableManager",
+        "SSTableInfo",
+        "WriteAheadLog",
+    ] {
+        assert!(
+            !root_api.contains(removed),
+            "removed root export {removed} was reintroduced"
+        );
+    }
+
+    let storage_api = std::fs::read_to_string(root.join("src/storage/mod.rs")).unwrap();
+    for removed in [
+        "pub mod buffer_pool",
+        "pub mod cached_time",
+        "pub mod direct_io",
+        "pub mod partitioning",
+        "pub use buffer_pool",
+        "pub use cache",
+        "pub use compaction",
+        "pub use direct_io",
+    ] {
+        assert!(
+            !storage_api.contains(removed),
+            "removed storage surface {removed} was reintroduced"
+        );
+    }
+
+    let bloom = std::fs::read_to_string(root.join("src/storage/sstable/bloom.rs")).unwrap();
+    assert!(!bloom.contains("PrefixBloomFilter"));
+    let core_error = std::fs::read_to_string(root.join("src/core/error.rs")).unwrap();
+    for removed in [
+        "WriteAheadLog",
+        "MemTable",
+        "Compaction {",
+        "IndexCorruption",
+        "QueryError",
+        "Configuration",
+    ] {
+        assert!(
+            !core_error.contains(removed),
+            "removed core error variant {removed} was reintroduced"
+        );
+    }
+    let compaction = std::fs::read_to_string(root.join("src/storage/compaction.rs")).unwrap();
+    for removed in [
+        "pub struct Compactor",
+        "pub struct CompactionJob",
+        "pub fn pick_compaction",
+        "pub fn execute",
+        "pub fn cleanup_inputs",
+    ] {
+        assert!(!compaction.contains(removed), "{removed} was reintroduced");
+    }
+    let wal_config = std::fs::read_to_string(root.join("src/storage/wal/types.rs")).unwrap();
+    for removed in ["pub compression: bool", "pub buffer_size: usize"] {
+        assert!(!wal_config.contains(removed), "{removed} was reintroduced");
+    }
+    let sstable_config =
+        std::fs::read_to_string(root.join("src/storage/sstable/types.rs")).unwrap();
+    assert!(!sstable_config.contains("pub index_interval:"));
+
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    for dependency in [
+        "anyhow",
+        "async-trait",
+        "bincode",
+        "chrono",
+        "crossbeam-channel",
+        "crossbeam-utils",
+        "dashmap",
+        "fjall",
+        "quickcheck",
+        "rayon",
+        "rkyv",
+        "rmp-serde",
+        "serde_json",
+        "uuid",
+    ] {
+        assert!(
+            !manifest
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("{dependency} ="))),
+            "removed dependency {dependency} was reintroduced"
+        );
+    }
+}
+
+#[test]
+fn direct_sstable_reader_writer_and_cache_form_a_supported_storage_seam() {
     let directory = TempDir::new().unwrap();
-    let sstable_directory = directory.path().join("sstables");
-    std::fs::create_dir_all(&sstable_directory).unwrap();
-    let config = SSTableConfig::default();
-    let input_path = sstable_directory.join("input.sst");
-    let mut writer = SSTableWriter::new(&input_path, config.clone()).unwrap();
-    for index in 0_u64..32 {
-        let value = [index as u8; 256];
+    let path = directory.path().join("direct.sst");
+    let mut writer = SSTableWriter::new(
+        &path,
+        SSTableConfig {
+            block_size: 512,
+            compression: CompressionType::Lz4,
+            ..SSTableConfig::default()
+        },
+    )
+    .unwrap();
+    for index in 0_u32..64 {
         writer
-            .add(format!("key-{index:04}").as_bytes(), Some(&value))
+            .add(
+                format!("direct:{index:04}").as_bytes(),
+                Some(&index.to_le_bytes()),
+            )
             .unwrap();
     }
-    let input_info = writer.finish().unwrap();
-    let input = SSTableManifestEntry {
-        id: 1,
-        level: 0,
-        path: input_info.path,
-        size: input_info.file_size,
-        entry_count: input_info.entry_count,
-        tombstone_count: input_info.tombstone_count,
-        min_key: input_info.min_key,
-        max_key: input_info.max_key,
-        min_sequence: input_info.min_sequence,
-        max_sequence: input_info.max_sequence,
-        creation_time: input_info.creation_time,
-    };
-    let compactor = Compactor::new(
-        CompactionConfig {
-            target_file_size: 1,
-            ..CompactionConfig::default()
-        },
-        config,
-        directory.path().to_path_buf(),
-        Arc::new(AtomicU64::new(2)),
-    );
-    let selectable = (0_u64..4)
-        .map(|index| SSTableManifestEntry {
-            id: index + 10,
-            creation_time: index,
-            ..input.clone()
-        })
-        .collect::<Vec<_>>();
-    let picked = compactor.pick_compaction(&selectable).unwrap();
-    assert_eq!(picked.input_sstables.len(), 4);
-    assert_eq!(picked.output_level, 1);
+    writer.finish().unwrap();
+
+    let cache = Arc::new(BlockCache::new(128 * 1024));
+    let reader = SSTableReader::open_with_cache(&path, Arc::clone(&cache)).unwrap();
     assert_eq!(
-        picked.output_path.parent(),
-        Some(sstable_directory.as_path())
+        reader.get(b"direct:0032").unwrap(),
+        Some(bytes::Bytes::copy_from_slice(&32_u32.to_le_bytes()))
     );
-    assert!(picked
-        .output_path
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .starts_with("2_"));
-    assert!(!picked.output_path.exists());
+    let after_first_read = cache.stats();
+    assert!(after_first_read.misses > 0);
+    assert!(after_first_read.entries > 0);
 
-    let output_path = sstable_directory.join("42_legacy.sst");
-    std::fs::write(&output_path, b"replace this existing caller-owned file").unwrap();
+    assert_eq!(
+        reader.get(b"direct:0032").unwrap(),
+        Some(bytes::Bytes::copy_from_slice(&32_u32.to_le_bytes()))
+    );
+    assert!(cache.stats().hits > after_first_read.hits);
+    assert_eq!(reader.iter().count(), 64);
+}
 
-    let result = compactor
-        .execute(CompactionJob {
-            input_sstables: vec![input],
-            output_level: 1,
-            output_path: output_path.clone(),
-        })
+#[tokio::test]
+async fn advanced_engine_configuration_runs_through_flush_compaction_and_recovery() {
+    let directory = TempDir::new().unwrap();
+    let database_path = directory.path().join("advanced-engine");
+    let mut config = StorageConfig::durable(database_path.clone());
+    config.wal_config = WalConfig {
+        max_file_size: 512,
+        ..WalConfig::durable()
+    };
+    config.memtable_config = MemTableConfig {
+        max_size: 2 * 1024,
+        max_entries: 8,
+        ..MemTableConfig::default()
+    };
+    config.sstable_config = SSTableConfig {
+        block_size: 512,
+        ..SSTableConfig::default()
+    };
+    config.compaction_config = CompactionConfig {
+        l0_compaction_trigger: 2,
+        max_levels: 3,
+        target_file_size: 4 * 1024,
+        ..CompactionConfig::default()
+    };
+    config.fd_config = FdConfig {
+        max_open_sstables: 8,
+        partitions: 2,
+        ..FdConfig::default()
+    };
+
+    let engine = Engine::open(config.clone()).await.unwrap();
+    for index in 0_u32..32 {
+        engine
+            .insert(
+                format!("advanced:{index:04}").as_bytes(),
+                &index.to_le_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+    engine.flush().await.unwrap();
+    let compaction = engine.compact().await.unwrap();
+    assert!(compaction.is_complete());
+    engine.shutdown().await.unwrap();
+    drop(engine);
+
+    let reopened = Engine::open(config).await.unwrap();
+    for index in 0_u32..32 {
+        assert_eq!(
+            reopened
+                .get(format!("advanced:{index:04}").as_bytes())
+                .await
+                .unwrap(),
+            Some(index.to_le_bytes().to_vec())
+        );
+    }
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_wal_constructor_appends_and_recovers_through_the_public_storage_seam() {
+    let directory = TempDir::new().unwrap();
+    let wal = WriteAheadLog::new(directory.path(), WalConfig::durable())
+        .await
         .unwrap();
 
-    let output = result.output_sstable.unwrap();
-    assert_eq!(output.id, 42);
-    assert_eq!(output.path, output_path);
-    assert_eq!(output.entry_count, 32);
-    assert_eq!(result.bytes_written, output.size);
-    assert_eq!(result.live_keys.len(), 32);
-    assert_eq!(result.live_keys.first().unwrap(), b"key-0000");
-    assert_eq!(result.live_keys.last().unwrap(), b"key-0031");
-    assert!(SSTableReader::open(output.path).is_ok());
+    assert_eq!(wal.append(b"direct", b"value").await.unwrap(), 0);
+    wal.flush().await.unwrap();
+    drop(wal);
 
-    let empty_path = sstable_directory.join("43_empty.sst");
-    let empty = compactor
-        .execute(CompactionJob {
-            input_sstables: Vec::new(),
-            output_level: 1,
-            output_path: empty_path.clone(),
-        })
-        .unwrap()
-        .output_sstable
+    let reopened = WriteAheadLog::new(directory.path(), WalConfig::durable())
+        .await
         .unwrap();
-    assert_eq!(empty.id, 43);
-    assert_eq!(empty.path, empty_path);
-    assert_eq!(empty.entry_count, 0);
-    assert!(SSTableReader::open(empty.path).is_ok());
+    let entries = reopened.read_from(0).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].decode_kv(),
+        Some((&b"direct"[..], Some(&b"value"[..])))
+    );
 }
 
 #[tokio::test]

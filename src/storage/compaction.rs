@@ -63,31 +63,6 @@ impl Default for CompactionConfig {
     }
 }
 
-/// Compaction job descriptor
-#[derive(Debug, Clone)]
-pub struct CompactionJob {
-    pub input_sstables: Vec<SSTableManifestEntry>,
-    pub output_level: u32,
-    /// Caller-visible output path used by the deprecated single-output seam.
-    pub output_path: PathBuf,
-}
-
-/// Result of the deprecated single-output compaction execution seam.
-#[derive(Debug, Clone)]
-pub struct CompactionResult {
-    pub input_ids: Vec<u64>,
-    pub output_sstable: Option<SSTableManifestEntry>,
-    pub bytes_read: u64,
-    pub bytes_written: u64,
-    pub entries_merged: u64,
-    pub entries_dropped: u64,
-    /// Tombstone versions among [`Self::entries_dropped`]. Winning tombstones
-    /// remain current versions and are not counted as reclaimed.
-    pub tombstones_dropped: u64,
-    /// Keys that survived compaction (for vector index filtering)
-    pub live_keys: Vec<Vec<u8>>,
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct CompactionSelection {
     pub(super) input_sstables: Vec<SSTableManifestEntry>,
@@ -100,19 +75,12 @@ pub(super) struct CompactionExecution {
     pub(super) output_sstables: Vec<SSTableManifestEntry>,
     pub(super) bytes_read: u64,
     pub(super) bytes_written: u64,
-    entries_merged: u64,
     pub(super) entries_dropped: u64,
     pub(super) tombstones_dropped: u64,
-    live_keys: Vec<Vec<u8>>,
 }
 
 struct CompactionExecutionOptions {
     target_file_size: u64,
-    first_output: Option<CompactionOutputIdentity>,
-    require_output: bool,
-    /// Populate the deprecated low-level result without charging coordinated
-    /// compactions for a key copy that none of their consumers observe.
-    collect_live_keys: bool,
     tombstone_reclamation_frontier: TombstoneReclamationFrontier,
 }
 
@@ -186,24 +154,13 @@ impl TombstoneSequenceCache {
     }
 }
 
-struct CompactionOutputIdentity {
-    id: u64,
-    path: PathBuf,
-    creation: CompactionOutputCreation,
-}
-
-enum CompactionOutputCreation {
-    ClaimUnique,
-    CallerOwned,
-}
-
 struct PendingCompactionOutput {
     id: u64,
     writer: SSTableWriter,
 }
 
 /// Selects and executes the SSTable merge portion of a coordinated compaction.
-pub struct Compactor {
+struct Compactor {
     config: CompactionConfig,
     sstable_config: SSTableConfig,
     data_dir: PathBuf,
@@ -213,7 +170,7 @@ pub struct Compactor {
 }
 
 impl Compactor {
-    pub fn new(
+    fn new(
         config: CompactionConfig,
         sstable_config: SSTableConfig,
         data_dir: PathBuf,
@@ -232,21 +189,6 @@ impl Compactor {
     #[cfg(test)]
     fn exact_projection_count(&self) -> u64 {
         self.exact_projection_counter.load(Ordering::Relaxed)
-    }
-
-    /// Check if compaction is needed and return a legacy single-output job.
-    ///
-    /// New code should use [`crate::Db::compact`]. This adapter preserves the
-    /// pre-0.5 low-level API and allocates its historical caller-visible path;
-    /// coordinator selection remains side-effect free.
-    #[deprecated(note = "use Db::compact for coordinated multi-output compaction")]
-    pub fn pick_compaction(&self, sstables: &[SSTableManifestEntry]) -> Option<CompactionJob> {
-        self.pick_compaction_selection(sstables)
-            .map(|selection| CompactionJob {
-                input_sstables: selection.input_sstables,
-                output_level: selection.output_level,
-                output_path: self.new_sstable_identity().1,
-            })
     }
 
     fn pick_compaction_selection(
@@ -348,58 +290,12 @@ impl Compactor {
         })
     }
 
-    /// Execute one legacy, caller-named, single-output compaction.
-    ///
-    /// This preserves the pre-0.5 low-level API. It does not coordinate with
-    /// [`crate::Db::compact`] or publish a manifest, so new code should use the
-    /// database method instead.
-    #[deprecated(note = "use Db::compact for coordinated multi-output compaction")]
-    pub fn execute(&self, job: CompactionJob) -> Result<CompactionResult> {
-        let output_id = sstable_id_from_path(&job.output_path);
-        let selection = CompactionSelection {
-            input_sstables: job.input_sstables,
-            output_level: job.output_level,
-        };
-        let mut output_attempts = CompactionOutputAttempts::new(Arc::new(Mutex::new(Vec::new())));
-        let execution = self
-            .execute_selection(
-                selection,
-                &mut output_attempts,
-                CompactionExecutionOptions {
-                    target_file_size: u64::MAX,
-                    first_output: Some(CompactionOutputIdentity {
-                        id: output_id,
-                        path: job.output_path,
-                        creation: CompactionOutputCreation::CallerOwned,
-                    }),
-                    require_output: true,
-                    collect_live_keys: true,
-                    tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
-                },
-            )
-            .map_err(|error| Error::Compaction {
-                reason: error.to_string(),
-            })?;
-        output_attempts.mark_manifest_committed();
-        debug_assert!(execution.output_sstables.len() <= 1);
-        Ok(CompactionResult {
-            input_ids: execution.input_ids,
-            output_sstable: execution.output_sstables.into_iter().next(),
-            bytes_read: execution.bytes_read,
-            bytes_written: execution.bytes_written,
-            entries_merged: execution.entries_merged,
-            entries_dropped: execution.entries_dropped,
-            tombstones_dropped: execution.tombstones_dropped,
-            live_keys: execution.live_keys,
-        })
-    }
-
     /// Execute a coordinated compaction selection using streaming merge.
     fn execute_selection(
         &self,
         job: CompactionSelection,
         output_attempts: &mut CompactionOutputAttempts,
-        mut options: CompactionExecutionOptions,
+        options: CompactionExecutionOptions,
     ) -> EngineResult<CompactionExecution> {
         info!(
             "Starting compaction: {} inputs -> L{}",
@@ -441,7 +337,6 @@ impl Compactor {
         }
 
         let mut last_key: Option<Bytes> = None;
-        let mut live_keys: Vec<Vec<u8>> = Vec::new();
         let mut pending_output: Option<PendingCompactionOutput> = None;
         let mut output_sstables = Vec::new();
 
@@ -488,8 +383,7 @@ impl Compactor {
                         output_sstables.push(self.finish_output(job.output_level, completed)?);
                     }
                     if pending_output.is_none() {
-                        pending_output =
-                            Some(self.start_output(output_attempts, &mut options.first_output)?);
+                        pending_output = Some(self.start_output(output_attempts)?);
                     }
                     pending_output
                         .as_mut()
@@ -502,9 +396,6 @@ impl Compactor {
                             .take()
                             .expect("an appended output is present to seal");
                         output_sstables.push(self.finish_output(job.output_level, completed)?);
-                    }
-                    if options.collect_live_keys && entry.value.is_some() {
-                        live_keys.push(entry.key.to_vec());
                     }
                     entries_merged += 1;
                 }
@@ -525,18 +416,10 @@ impl Compactor {
         if let Some(completed) = pending_output {
             output_sstables.push(self.finish_output(job.output_level, completed)?);
         }
-        if output_sstables.is_empty() && options.require_output {
-            let empty = self.start_output(output_attempts, &mut options.first_output)?;
-            output_sstables.push(self.finish_output(job.output_level, empty)?);
-        }
         let bytes_written = output_sstables
             .iter()
             .fold(0_u64, |total, output| total.saturating_add(output.size));
-        if options.require_output {
-            debug_assert_eq!(output_sstables.len(), 1);
-        } else {
-            validate_compaction_outputs(&output_sstables)?;
-        }
+        validate_compaction_outputs(&output_sstables)?;
 
         let input_ids: Vec<u64> = job.input_sstables.iter().map(|s| s.id).collect();
 
@@ -553,30 +436,20 @@ impl Compactor {
             output_sstables,
             bytes_read,
             bytes_written,
-            entries_merged,
             entries_dropped,
             tombstones_dropped,
-            live_keys,
         })
     }
 
     fn start_output(
         &self,
         output_attempts: &mut CompactionOutputAttempts,
-        first_output: &mut Option<CompactionOutputIdentity>,
     ) -> EngineResult<PendingCompactionOutput> {
-        let CompactionOutputIdentity { id, path, creation } = first_output
-            .take()
-            .unwrap_or_else(|| self.new_sstable_identity().into());
-        if matches!(creation, CompactionOutputCreation::ClaimUnique) {
-            output_attempts.claim(path.clone())?;
-        }
+        let (id, path) = self.new_sstable_identity();
+        output_attempts.claim(path.clone())?;
         #[allow(unused_mut)]
         let mut writer =
             SSTableWriter::new(&path, self.sstable_config.clone()).map_err(compaction_error)?;
-        if matches!(creation, CompactionOutputCreation::CallerOwned) {
-            output_attempts.track(path);
-        }
         #[cfg(test)]
         writer.set_exact_projection_counter(Arc::clone(&self.exact_projection_counter));
         Ok(PendingCompactionOutput { id, writer })
@@ -610,19 +483,6 @@ impl Compactor {
         })
     }
 
-    /// Delete old SSTable files after successful compaction
-    pub fn cleanup_inputs(&self, paths: &[PathBuf]) -> Result<()> {
-        for path in paths {
-            if remove_sstable_if_present(path).map_err(|e| Error::Io {
-                message: format!("Failed to delete compacted SSTable: {:?}", path),
-                source: e,
-            })? {
-                debug!("Deleted compacted SSTable: {:?}", path);
-            }
-        }
-        Ok(())
-    }
-
     fn max_level_size(&self, level: u32) -> u64 {
         // L1 = target_file_size * 10, L2 = L1 * 10, etc.
         self.config.target_file_size * self.config.level_size_multiplier.pow(level)
@@ -641,16 +501,6 @@ impl Compactor {
             .join("sstables")
             .join(format!("{}_{}.sst", id, timestamp));
         (id, path)
-    }
-}
-
-impl From<(u64, PathBuf)> for CompactionOutputIdentity {
-    fn from((id, path): (u64, PathBuf)) -> Self {
-        Self {
-            id,
-            path,
-            creation: CompactionOutputCreation::ClaimUnique,
-        }
     }
 }
 
@@ -677,14 +527,6 @@ fn minimum_sstable_tombstone_sequence(path: &std::path::Path) -> EngineResult<Op
 /// iterator boundary explicit and avoid an overflowing `checkpoint + 1`.
 const fn first_wal_replayable_sequence(checkpoint: u64) -> u64 {
     checkpoint
-}
-
-fn sstable_id_from_path(path: &std::path::Path) -> u64 {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .and_then(|stem| stem.split('_').next())
-        .and_then(|id| id.parse().ok())
-        .unwrap_or(0)
 }
 
 /// Remove one SSTable using the shared cleanup policy.
@@ -1315,9 +1157,6 @@ impl CompactionCoordinator {
             &mut output_attempts,
             CompactionExecutionOptions {
                 target_file_size: self.compactor.config.target_file_size,
-                first_output: None,
-                require_output: false,
-                collect_live_keys: false,
                 tombstone_reclamation_frontier,
             },
         );
@@ -1722,10 +1561,6 @@ impl CompactionOutputAttempts {
             })?;
         self.paths.push(path);
         Ok(())
-    }
-
-    fn track(&mut self, path: PathBuf) {
-        self.paths.push(path);
     }
 
     fn produced_bytes(&self) -> u64 {
@@ -2176,16 +2011,12 @@ mod tests {
                 &mut attempts,
                 CompactionExecutionOptions {
                     target_file_size: compactor.config.target_file_size,
-                    first_output: None,
-                    require_output: false,
-                    collect_live_keys: false,
                     tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
                 },
             )
             .unwrap();
         attempts.mark_manifest_committed();
 
-        assert!(result.live_keys.is_empty());
         let output = result.output_sstables.into_iter().next().unwrap();
         assert_eq!((output.min_sequence, output.max_sequence), (20, 20));
         let reader = SSTableReader::open(output.path).unwrap();
@@ -2226,9 +2057,6 @@ mod tests {
                     &mut attempts,
                     CompactionExecutionOptions {
                         target_file_size: compactor.config.target_file_size,
-                        first_output: None,
-                        require_output: false,
-                        collect_live_keys: false,
                         tombstone_reclamation_frontier: frontier,
                     },
                 )
@@ -2319,9 +2147,6 @@ mod tests {
                     &mut attempts,
                     CompactionExecutionOptions {
                         target_file_size: TARGET_SIZE,
-                        first_output: None,
-                        require_output: false,
-                        collect_live_keys: false,
                         tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
                     },
                 )
@@ -2416,9 +2241,6 @@ mod tests {
                     &mut attempts,
                     CompactionExecutionOptions {
                         target_file_size,
-                        first_output: None,
-                        require_output: false,
-                        collect_live_keys: false,
                         tombstone_reclamation_frontier: TombstoneReclamationFrontier::RETAIN_ALL,
                     },
                 )

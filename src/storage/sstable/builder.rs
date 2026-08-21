@@ -108,10 +108,6 @@ impl BlockBuilder {
         }
     }
 
-    pub fn add(&mut self, key: &[u8], value: Option<&[u8]>) -> bool {
-        self.add_versioned(key, value, 0)
-    }
-
     /// Add an entry using the current block format.
     pub fn add_versioned(&mut self, key: &[u8], value: Option<&[u8]>, sequence: u64) -> bool {
         let entry_size = measure_versioned_entry(key, value);
@@ -193,11 +189,6 @@ impl BlockBuilder {
     /// Get the last key in the block
     pub fn last_key(&self) -> Option<Bytes> {
         self.last_key.clone()
-    }
-
-    /// Get current size of the block
-    pub fn size(&self) -> usize {
-        self.buffer.len()
     }
 
     /// Finish building the block and return the data
