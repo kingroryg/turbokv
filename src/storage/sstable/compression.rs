@@ -7,10 +7,15 @@ const MAX_BULK_ZSTD_EXPANSION_RATIO: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+/// Compression tags persisted in SSTable data-block footers.
 pub enum CompressionType {
+    /// Store the block without compression.
     None = 0,
+    /// Zstandard level 3.
     Zstd = 1,
+    /// Raw Snappy framing.
     Snappy = 2,
+    /// LZ4 block encoding with a prepended decoded-size field.
     Lz4 = 3,
 }
 
@@ -31,6 +36,11 @@ impl TryFrom<u8> for CompressionType {
     }
 }
 
+/// Allocates and encodes one uncompressed SSTable block.
+///
+/// The call is synchronous and CPU-bound. `None` still copies the input so the
+/// caller always owns the result. Returns an SSTable error if the selected
+/// compressor rejects the input.
 pub fn compress_block(data: &[u8], compression: CompressionType) -> Result<Vec<u8>> {
     match compression {
         CompressionType::None => Ok(data.to_vec()),
@@ -69,11 +79,14 @@ pub(crate) fn max_compressed_block_size(input_size: usize, compression: Compress
     }
 }
 
-/// Decode a block without imposing a limit below what the existing format can
-/// represent. The format stores no decoded-size bound, so a smaller ceiling
-/// would make previously valid, highly compressible tables unreadable. Codec
-/// declarations are still checked for platform representation and impossible
-/// expansion ratios before decoders can allocate from them.
+/// Decodes one block into a newly allocated buffer.
+///
+/// The call is synchronous and CPU-bound. The format stores no independent
+/// decoded-size bound, so Zstandard frames with unknown, very large, or highly
+/// compressible sizes are decoded incrementally rather than rejected solely by
+/// a fixed ceiling. Codec declarations are still checked for platform
+/// representation and implausible expansion ratios before eager allocation.
+/// Returns an SSTable error for malformed input or decompressor failure.
 pub fn decompress_block(data: &[u8], compression: CompressionType) -> Result<Vec<u8>> {
     match compression {
         CompressionType::None => Ok(data.to_vec()),

@@ -3,8 +3,8 @@
 //! Manages file descriptors to prevent exhaustion under sustained load.
 //! Provides:
 //! - Partitioned LRU pool for SSTable readers (reduces lock contention)
-//! - FD usage monitoring
-//! - Backpressure when approaching limits
+//! - FD usage sampling
+//! - Admission errors when configured descriptor thresholds are reached
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -48,12 +48,19 @@ impl Default for FdConfig {
 /// File descriptor statistics
 #[derive(Debug, Clone, Default)]
 pub struct FdStats {
+    /// Number of readers currently retained by the pool.
     pub open_sstables: usize,
+    /// Successful reader-pool lookups since creation.
     pub cache_hits: u64,
+    /// Reader opens caused by pool misses since creation.
     pub cache_misses: u64,
+    /// Readers evicted from full pool partitions since creation.
     pub evictions: u64,
+    /// Process file-descriptor limit observed when the pool was created.
     pub system_limit: u64,
+    /// Current best-effort count of process file descriptors.
     pub estimated_used: u64,
+    /// Number of independent LRU partitions.
     pub partitions: usize,
 }
 
@@ -81,10 +88,16 @@ pub struct SSTablePool {
 }
 
 impl SSTablePool {
+    /// Create a reader pool without a decompressed block cache.
     pub fn new(config: FdConfig) -> Self {
         Self::with_cache(config, None)
     }
 
+    /// Create a reader pool that shares an optional decompressed block cache.
+    ///
+    /// The effective reader capacity is capped below the sampled process limit.
+    /// Configuration that leaves no usable capacity creates a pass-through pool:
+    /// readers can still be opened but are not retained.
     pub fn with_cache(config: FdConfig, block_cache: Option<Arc<BlockCache>>) -> Self {
         let system_fd_limit = get_fd_limit();
         let max_size = config
@@ -147,7 +160,12 @@ impl SSTablePool {
         &self.partitions[idx]
     }
 
-    /// Get or open an SSTable reader
+    /// Get or synchronously open and memory-map an SSTable reader.
+    ///
+    /// Misses serialize file opening across the pool and can return
+    /// [`Error::Internal`] when descriptor admission is enabled and the sampled
+    /// process use is at its threshold. Format, mmap, and I/O failures are
+    /// returned from [`SSTableReader::open`].
     pub fn get(&self, path: &Path) -> Result<Arc<SSTableReader>> {
         let path_buf = path.to_path_buf();
         let partition = self.partition_for(path);
@@ -195,7 +213,9 @@ impl SSTablePool {
         Ok(reader)
     }
 
-    /// Remove an SSTable from the pool
+    /// Invalidate a path so future lookups cannot reuse its retained reader.
+    ///
+    /// Existing [`Arc`] clones remain usable until their owners drop them.
     pub fn remove(&self, path: &Path) {
         let partition = self.partition_for(path);
         let mut cache = partition.cache.lock();
@@ -205,7 +225,7 @@ impl SSTablePool {
         }
     }
 
-    /// Clear all cached readers
+    /// Drop all pool-owned readers while retaining cumulative counters.
     pub fn clear(&self) {
         for p in &self.partitions {
             p.cache.lock().clear();
@@ -213,7 +233,7 @@ impl SSTablePool {
         self.current_open.store(0, Ordering::Relaxed);
     }
 
-    /// Get current statistics
+    /// Sample current occupancy, process descriptor use, and cumulative counters.
     pub fn stats(&self) -> FdStats {
         let (hits, misses, evictions) = self.partitions.iter().fold((0, 0, 0), |acc, p| {
             (

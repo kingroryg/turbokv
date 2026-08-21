@@ -1,10 +1,10 @@
 //! WAL file handling for TurboKV
 //!
-//! ## Key Optimizations (PRESERVED)
+//! ## Write path
 //!
-//! - **write_entries_batch()** - Vectorized batch write that pre-allocates buffer
-//!   and writes all entries in a single syscall
-//! - **Direct File I/O** - Writes go straight to kernel buffer (no userspace buffering)
+//! - `write_entries_batch` preallocates one buffer and writes a group at once.
+//! - Durable-mode `File` writes bypass a userspace `BufWriter` but still use the
+//!   operating-system page cache; TurboKV does not use `O_DIRECT`.
 //!
 //! ## WAL Entry Format (v4)
 //!

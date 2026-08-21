@@ -21,7 +21,13 @@ use crate::core::error::{Error, Result};
 
 static NEXT_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
-/// SSTable reader
+/// Memory-mapped reader for one immutable SSTable file.
+///
+/// Opening validates the footer, index, and Bloom-filter encoding. Data blocks
+/// are checksummed and decoded lazily by [`get`](Self::get) and
+/// [`iter`](Self::iter), unless the engine uses its internal eager-validation
+/// path during database open. The mapping and any attached cache remain valid
+/// until the reader and all iterators borrowing it are dropped.
 pub struct SSTableReader {
     path: std::path::PathBuf,
     cache_namespace: u64,
@@ -75,7 +81,15 @@ pub(crate) struct SSTableEntry {
 }
 
 impl SSTableReader {
-    /// Open SSTable for reading
+    /// Opens an SSTable for reading.
+    ///
+    /// This synchronous operation opens and memory-maps the complete file, then
+    /// validates its footer, index, and Bloom filter. It does not eagerly read
+    /// or decompress every data block. The mapping consumes virtual address
+    /// space but does not copy the full file into heap memory.
+    ///
+    /// Returns an I/O or SSTable-corruption error if the file cannot be opened,
+    /// mapped, or its eagerly inspected metadata is invalid.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         Self::open_inner(&path).map_err(|error| sstable_file_error(&path, "open", error))
@@ -225,19 +239,34 @@ impl SSTableReader {
         Ok(reader)
     }
 
-    /// Open with block cache
+    /// Opens an SSTable and attaches a shared decompressed-block cache.
+    ///
+    /// Opening has the same synchronous mapping and validation behavior as
+    /// [`open`](Self::open). Cached blocks are namespace-isolated per reader so
+    /// a replacement file at the same path cannot reuse stale cached contents.
     pub fn open_with_cache(path: impl AsRef<Path>, cache: Arc<BlockCache>) -> Result<Self> {
         let mut reader = Self::open(path)?;
         reader.cache = Some(cache);
         Ok(reader)
     }
 
-    /// Set cache after opening
+    /// Attaches or replaces the shared decompressed-block cache.
+    ///
+    /// Existing blocks in either cache are not migrated or cleared. Later
+    /// cache misses allocate decompression output and may evict other entries.
     pub fn set_cache(&mut self, cache: Arc<BlockCache>) {
         self.cache = Some(cache);
     }
 
-    /// Get value by key
+    /// Returns the value for `key`, treating a persisted tombstone as absent.
+    ///
+    /// The lookup is synchronous. It may fault mapped pages, read and verify a
+    /// block, decompress it, and allocate a returned [`Bytes`] handle. Cache
+    /// hits share immutable block storage. An I/O, checksum, compression, or
+    /// encoding error is returned if the selected block cannot be decoded.
+    ///
+    /// This low-level method observes only this table; it does not reconcile
+    /// newer memtable entries or other SSTables.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         Ok(match self.get_entry(key)? {
             Some(SSTableEntry {
@@ -463,7 +492,13 @@ impl SSTableReader {
         Ok(None)
     }
 
-    /// Create iterator over all entries
+    /// Creates a sorted iterator over all entries, including tombstones.
+    ///
+    /// Construction is allocation-free apart from small cursor state. Blocks
+    /// are loaded synchronously and lazily as iteration advances. Each item can
+    /// return an I/O, checksum, compression, or encoding error; after its first
+    /// error the iterator is fused. Keys are copied, while values share
+    /// immutable block storage when the format permits.
     pub fn iter(&self) -> SSTableIterator<'_> {
         SSTableIterator::new(self)
     }

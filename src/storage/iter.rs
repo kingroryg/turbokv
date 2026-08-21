@@ -64,7 +64,8 @@ impl ScanError {
 ///
 /// Calling [`Self::key`] never copies or materializes the value. For frozen
 /// memtables, [`Self::value`] performs the first value clone and caches it. For
-/// SSTables, the guard returns a slice of the already decompressed block.
+/// SSTables, the guard returns a slice of the already decompressed block. The
+/// guard retains its source allocation until dropped.
 pub struct EntryGuard {
     key: Vec<u8>,
     value: GuardValue,
@@ -129,13 +130,13 @@ impl EntryGuard {
         Self { key, value }
     }
 
-    /// Get the key. Keys are decoded while advancing the iterator.
+    /// Borrow the key allocated while the iterator advanced.
     #[inline]
     pub fn key(&self) -> &[u8] {
         &self.key
     }
 
-    /// Get the value, materializing it only when the source requires a copy.
+    /// Borrow the value, materializing and caching one copy for memtable sources.
     #[inline]
     pub fn value(&self) -> &[u8] {
         match &self.value {
@@ -168,7 +169,10 @@ impl EntryGuard {
         }
     }
 
-    /// Consume the guard and return the key-value pair.
+    /// Consume the guard and return its owned key and an owned value.
+    ///
+    /// SSTable-backed values are copied from the retained decompressed block;
+    /// a previously unloaded memtable value is cloned once.
     #[inline]
     pub fn into_pair(self) -> (Vec<u8>, Vec<u8>) {
         let Self { key, value } = self;
@@ -181,7 +185,7 @@ impl EntryGuard {
         self.key
     }
 
-    /// Consume the guard and return the value.
+    /// Consume the guard and return an owned value, allocating when necessary.
     #[inline]
     pub fn into_value(self) -> Vec<u8> {
         materialize_value(self.value)
@@ -216,6 +220,11 @@ fn materialize_value(value: GuardValue) -> Vec<u8> {
 /// Late SSTable checksum or decode failures are returned once and then the
 /// iterator is fused. This is intentionally a fallible item type: an infallible
 /// iterator cannot stream disk blocks without silently hiding late corruption.
+/// Advancing is synchronous and can block on cache locks, mmap page faults,
+/// checksum validation, and decompression. Working memory is proportional to
+/// source count plus at most one decompressed block per active SSTable source.
+/// Dropping the iterator cancels no maintenance; it releases its snapshot
+/// sources and directory-ownership guard.
 pub struct RangeIter {
     sources: Vec<SourceCursor>,
     heap: BinaryHeap<Reverse<HeapEntry>>,
@@ -279,12 +288,12 @@ impl RangeIter {
         }
     }
 
-    /// Count entries while propagating any scan error.
+    /// Count entries synchronously while propagating any scan error.
     pub fn count(mut self) -> std::result::Result<usize, ScanError> {
         self.try_fold(0, |count, entry| entry.map(|_| count + 1))
     }
 
-    /// Collect keys without materializing values.
+    /// Allocate and collect keys without materializing memtable values.
     pub fn keys(mut self) -> std::result::Result<Vec<Vec<u8>>, ScanError> {
         self.try_fold(Vec::new(), |mut keys, entry| {
             keys.push(entry?.into_key());
@@ -292,7 +301,7 @@ impl RangeIter {
         })
     }
 
-    /// Collect key-value pairs.
+    /// Allocate and collect all key-value pairs.
     pub fn collect_pairs(mut self) -> std::result::Result<Vec<ScanEntry>, ScanError> {
         self.try_fold(Vec::new(), |mut pairs, entry| {
             pairs.push(entry?.into_pair());
@@ -300,7 +309,10 @@ impl RangeIter {
         })
     }
 
-    /// Skip entries and take a limited number while preserving scan errors.
+    /// Lazily skip entries and take a limited number while preserving scan errors.
+    ///
+    /// Skipped entries still perform the underlying key/block traversal, but
+    /// their memtable values are not materialized.
     pub fn paginate(self, offset: usize, limit: usize) -> impl Iterator<Item = ScanResult> {
         Paginate {
             inner: self,

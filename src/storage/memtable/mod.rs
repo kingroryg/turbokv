@@ -1,37 +1,23 @@
 //! # MemTable Module
 //!
-//! In-memory key-value storage using a lock-free skip list.
+//! In-memory version storage using concurrent skip lists.
 //!
-//! The MemTable is an in-memory data structure that holds recent writes
-//! before they are flushed to disk as SSTables. It uses a concurrent
-//! skip list for fast, lock-free operations.
+//! The manager assigns engine-wide sequences, optionally stages no-WAL inserts
+//! in per-thread buffers, and keeps the active table plus a FIFO of frozen
+//! generations. A frozen generation remains readable until the engine has
+//! durably installed its SSTable and explicitly completes the flush.
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                        MemTable                             │
-//! ├─────────────────────────────────────────────────────────────┤
-//! │                                                             │
-//! │  ┌─────────────┐    Insert    ┌───────────────────────────┐ │
-//! │  │  Key-Value  │─────────────>│     Skip List             │ │
-//! │  └─────────────┘              │                           │ │
-//! │                               │  Level 3: 8 ---------> 25 │ │
-//! │                               │  Level 2: 3 -> 8 ----> 25 │ │
-//! │                               │  Level 1: 3 -> 8 -> 19->25│ │
-//! │                               │  Level 0: 3->5->8->19->25 │ │
-//! │                               └───────────────────────────┘ │
-//! │                                         │                   │
-//! │                                         ▼                   │
-//! │                               ┌─────────────────┐           │
-//! │                               │   Size Limit    │           │
-//! │                               │   Reached?      │           │
-//! │                               └────────┬────────┘           │
-//! │                                        │ Yes                │
-//! │                                        ▼                    │
-//! │                               ┌─────────────────┐           │
-//! │                               │  Flush to       │           │
-//! │                               │  SSTable        │           │
-//! │                               └─────────────────┘           │
-//! └─────────────────────────────────────────────────────────────┘
+//! no-WAL insert ──> per-thread buffer ─┐
+//! direct/bulk/WAL apply ─────────────┤
+//!                                   ▼
+//!                         active concurrent skip list
+//!                                   │ size/entry limit or explicit freeze
+//!                                   ▼
+//!                     immutable generation FIFO (still readable)
+//!                                   │ engine persists + publishes SSTable
+//!                                   ▼
+//!                            completed and dequeued
 //! ```
 
 mod manager;

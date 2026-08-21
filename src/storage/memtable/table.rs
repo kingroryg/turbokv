@@ -34,8 +34,10 @@ pub type Result<T> = std::result::Result<T, MemTableError>;
 /// MemTable error types
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum MemTableError {
+    /// The generation has been frozen and no longer accepts mutations.
     #[error("MemTable is read-only (being flushed)")]
     ReadOnly,
+    /// The configured byte or entry limit rejects additional mutations.
     #[error("MemTable is full")]
     Full,
 }
@@ -51,10 +53,13 @@ enum MutationResult {
     Applied(Option<PreviousEntry>),
 }
 
-/// In-memory key-value storage backed by a lock-free skip list.
+/// In-memory version storage backed by a concurrent sorted skip list.
 ///
-/// Keys are byte slices that are stored in sorted order for efficient range scans.
-/// Values can be actual data or tombstones (marking deleted keys).
+/// This is a low-level, synchronous component: it does not write a WAL or make
+/// data durable. Mutations copy key and value bytes, while point reads and scans
+/// return owned copies. The table retains one newest version per key and uses
+/// tombstones to represent deletion. Once marked read-only it remains readable
+/// but rejects mutations.
 pub struct MemTable {
     /// Lock-free skip list: key bytes -> entry
     /// Using `Vec<u8>` as key for byte-level ordering
@@ -83,7 +88,7 @@ pub struct MemTable {
 }
 
 impl MemTable {
-    /// Create a new MemTable with the given configuration
+    /// Creates an empty writable table and allocates its concurrent index.
     pub fn new(config: MemTableConfig) -> Self {
         Self {
             data: Arc::new(SkipMap::new()),
@@ -97,9 +102,11 @@ impl MemTable {
         }
     }
 
-    /// Insert a key-value pair
+    /// Copies and inserts a key-value pair.
     ///
-    /// Returns the sequence number assigned to this operation.
+    /// Returns the sequence number assigned to this operation. The synchronous
+    /// call can fail if the table is read-only or cannot accept another entry;
+    /// it provides no persistence on its own.
     #[inline]
     pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<u64> {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -160,9 +167,11 @@ impl MemTable {
         // Overwrite of existing non-tombstone: don't change counts
     }
 
-    /// Delete a key by inserting a tombstone
+    /// Copies `key` and inserts a tombstone.
     ///
-    /// Returns the sequence number assigned to this operation.
+    /// Returns the sequence number assigned to this operation. The synchronous
+    /// call can fail if the table is read-only or cannot accept another entry;
+    /// it provides no persistence on its own.
     #[inline]
     pub fn delete(&self, key: &[u8]) -> Result<u64> {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -278,7 +287,7 @@ impl MemTable {
         hash as usize % MUTATION_LOCK_STRIPES
     }
 
-    /// Get a value by key
+    /// Returns an owned copy of the value for `key`.
     ///
     /// Returns `None` if the key doesn't exist or has been deleted (tombstone).
     #[inline]
@@ -309,9 +318,10 @@ impl MemTable {
         self.data.get(key).map(|e| e.value().clone())
     }
 
-    /// Scan a range of keys
+    /// Materializes the half-open range `[start, end)`.
     ///
-    /// Returns key-value pairs in sorted order. Tombstones are excluded.
+    /// Returns owned key-value pairs in sorted order. Tombstones are excluded,
+    /// and the call allocates memory proportional to the complete result.
     pub fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.data
             .range(start.to_vec()..end.to_vec())
@@ -326,9 +336,10 @@ impl MemTable {
             .collect()
     }
 
-    /// Scan all keys with a given prefix
+    /// Materializes all keys with a given prefix.
     ///
-    /// Returns key-value pairs in sorted order. Tombstones are excluded.
+    /// Returns owned key-value pairs in sorted order. Tombstones are excluded,
+    /// and the call allocates memory proportional to the complete result.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         let start = prefix.to_vec();
         let end = prefix_upper_bound(prefix);
@@ -381,9 +392,10 @@ impl MemTable {
         self.read_only.load(Ordering::Acquire)
     }
 
-    /// Get all entries for flushing to SSTable
+    /// Materializes owned copies of all entries for an SSTable flush.
     ///
-    /// Returns entries in sorted key order (including tombstones).
+    /// Returns entries in sorted key order, including tombstones, and allocates
+    /// memory proportional to the table's complete contents.
     pub fn get_all_entries(&self) -> Vec<(Vec<u8>, MemTableEntry)> {
         self.data
             .iter()
@@ -403,9 +415,10 @@ impl MemTable {
         })
     }
 
-    /// Get all entries as raw key-value pairs (for SSTable writing)
+    /// Materializes all entries as owned raw key-value pairs.
     ///
-    /// Tombstones are included with `None` values.
+    /// Tombstones are included with `None` values. The call allocates memory
+    /// proportional to the table's complete contents.
     pub fn get_all_kv(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         self.data
             .iter()

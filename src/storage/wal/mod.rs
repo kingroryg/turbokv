@@ -1,23 +1,23 @@
 //! # Write-Ahead Log (WAL) for TurboKV
 //!
 //! ## Architecture
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                    Write Path (Group Commit)                    │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │  Writer 1 ──┐                                                   │
-//! │  Writer 2 ──┼──► FIFO ──► Sequence + write ──► Shared fsync     │
-//! │  Writer 3 ──┘                                                   │
-//! └─────────────────────────────────────────────────────────────────┘
+//! ```text
+//! durable: caller ──> sequence + record ──> File write ──> OS page cache ──> ack
+//! paranoid writers ──> bounded FIFO ──> ordered records ──> shared sync_all ──> ack
+//! rotation: full segment ──> sync header/file ──> new active segment + dir sync
+//! recovery: sorted segments ──> checksum/sequence validation ──> repair active tail
+//! ```
 //!
 //! ## File Format (v4)
 //!
 //! - Header: 64 bytes (magic, version, timestamps, sequence range)
 //! - Entries: Header (32B) + Payload (variable)
 //!
-//! ## Zero-Allocation Write Path
+//! ## Allocation-Reusing Write Path
 //!
-//! For maximum throughput, uses thread-local pre-allocated buffers
-//! to avoid per-write heap allocations.
+//! Durable single-record encoding reuses a thread-local buffer. Records larger
+//! than its retained capacity can grow that buffer; paranoid submissions own a
+//! queued payload and response channel until their shared barrier completes.
 
 mod file;
 mod iterator;
@@ -51,8 +51,7 @@ use file::{
 };
 use types::{encode_batch, ENTRY_HEADER_SIZE, ENTRY_RESERVED_SIZE, WAL_HEADER_SIZE};
 
-// Thread-local buffer for zero-allocation WAL writes
-// Pre-allocated to avoid per-write heap allocations
+// Thread-local buffer reused by direct durable WAL writes.
 thread_local! {
     static WAL_ENCODE_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
 }
@@ -265,6 +264,13 @@ impl WalByteAccounting {
     }
 }
 
+/// Segmented write-ahead log with optional ordered group commit.
+///
+/// This low-level type does not acquire the database-directory ownership lock;
+/// direct callers must ensure that exactly one writer owns `wal_dir`. Opening
+/// validates every segment before mutation, repairs only a recoverable tail on
+/// the newest segment, synchronizes retained segments, and starts one Tokio
+/// group-commit task.
 pub struct WriteAheadLog {
     wal_dir: PathBuf,
     config: WalConfig,
@@ -285,6 +291,12 @@ pub struct WriteAheadLog {
 }
 
 impl WriteAheadLog {
+    /// Open or create a WAL directory after validating the configuration.
+    ///
+    /// This allocates segment metadata, performs synchronous file validation
+    /// and repair after async directory discovery, can create/sync files and the
+    /// directory, and spawns a Tokio task. The direct constructor provides no
+    /// inter-process or same-process ownership exclusion.
     pub async fn new(wal_dir: impl AsRef<Path>, config: WalConfig) -> Result<Self> {
         Self::new_inner(wal_dir, config, None, None).await
     }
@@ -391,6 +403,15 @@ impl WriteAheadLog {
         })
     }
 
+    /// Append a put record and return its engine sequence.
+    ///
+    /// Unsynced mode reuses a thread-local encoding buffer and performs blocking
+    /// file I/O on the calling runtime thread; success reaches the OS page cache.
+    /// Synced mode allocates an owned payload, waits for the bounded group-commit
+    /// queue and `File::sync_all`, and may share that barrier with other callers.
+    /// Cancelling after a synced request is queued does not cancel its physical
+    /// append, so the outcome must be treated as indeterminate and recovered by
+    /// sequence/content inspection.
     pub async fn append(&self, key: &[u8], value: &[u8]) -> Result<u64> {
         if self.config.sync_on_write {
             let appended = self
@@ -402,15 +423,15 @@ impl WriteAheadLog {
                 .await?;
             Ok(appended.sequences[0])
         } else {
-            // Non-sync mode (durable): use zero-allocation fast path
+            // Non-sync mode (durable): reuse the thread-local encode buffer.
             self.append_zero_alloc(key, value, EntryType::Data)
         }
     }
 
-    /// Zero-allocation append - uses thread-local buffer to avoid heap allocations
+    /// Allocation-reusing append backed by a thread-local encode buffer.
     ///
-    /// This is the fast path for durable mode (WAL without fsync).
-    /// Eliminates per-write allocations by reusing a thread-local buffer.
+    /// This is the fast path for durable mode (WAL without fsync). Inputs that
+    /// exceed retained capacity can grow the buffer; later calls reuse it.
     #[inline]
     fn append_zero_alloc(&self, key: &[u8], value: &[u8], entry_type: EntryType) -> Result<u64> {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -477,6 +498,10 @@ impl WriteAheadLog {
         })
     }
 
+    /// Append a tombstone record and return its engine sequence.
+    ///
+    /// Durability, blocking, allocation, and cancellation behavior matches
+    /// [`Self::append`].
     pub async fn append_delete(&self, key: &[u8]) -> Result<u64> {
         if self.config.sync_on_write {
             let appended = self
@@ -488,12 +513,12 @@ impl WriteAheadLog {
                 .await?;
             Ok(appended.sequences[0])
         } else {
-            // Non-sync mode: use zero-allocation fast path
+            // Non-sync mode: reuse the thread-local encode buffer.
             self.append_delete_zero_alloc(key)
         }
     }
 
-    /// Zero-allocation delete append
+    /// Allocation-reusing delete append.
     #[inline]
     fn append_delete_zero_alloc(&self, key: &[u8]) -> Result<u64> {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -553,7 +578,9 @@ impl WriteAheadLog {
     ///
     /// In paranoid mode the envelope is one member of a shared commit group;
     /// the group-size limit counts this caller once, regardless of its logical
-    /// operation count.
+    /// operation count. The method allocates the physical envelope and returned
+    /// sequence vector. A valid envelope is recovered atomically; cancellation
+    /// after queueing or writing leaves the caller's outcome indeterminate.
     pub async fn append_batch(&self, entries: &[(&[u8], Option<&[u8]>)]) -> Result<Vec<u64>> {
         Ok(self.append_batch_with_metadata(entries).await?.sequences)
     }
@@ -593,6 +620,17 @@ impl WriteAheadLog {
         })
     }
 
+    /// Synchronize all completed appends and records already written before this barrier.
+    ///
+    /// This finalizes and `File::sync_all`s the active segment and synchronizes
+    /// its directory where supported. In unsynced mode, an append that has
+    /// started encoding but has not yet acquired the active-file lock can land
+    /// after this call and requires a later flush. In paranoid mode, this first
+    /// waits behind an ordered group-commit barrier, so requests already queued
+    /// with that writer are included. File synchronization is blocking on the
+    /// calling runtime thread. Cancelling while waiting for the paranoid barrier
+    /// provides no flush guarantee; after the synchronous section starts, the
+    /// runtime cannot preempt its file and directory synchronization.
     pub async fn flush(&self) -> Result<()> {
         if self.config.sync_on_write {
             self.await_group_commit_barrier().await?;
@@ -605,6 +643,11 @@ impl WriteAheadLog {
         Ok(())
     }
 
+    /// Synchronize, validate, allocate, and return logical entries at or above a sequence.
+    ///
+    /// Entries are deduplicated by sequence and sorted. Physical batches are
+    /// expanded, so memory is proportional to all returned logical mutations.
+    /// Because this calls [`Self::flush`], a read has persistent sync side effects.
     pub async fn read_from(&self, start_sequence: u64) -> Result<Vec<WalEntry>> {
         let mut entries = Vec::new();
         let mut seen = HashSet::new();
@@ -627,10 +670,16 @@ impl WriteAheadLog {
         Ok(entries)
     }
 
+    /// Synchronize the WAL and create a fallible iterator over all logical entries.
     pub async fn iter_entries(&self) -> Result<WalEntryIterator> {
         self.iter_entries_from(0).await
     }
 
+    /// Synchronize the WAL and create a fallible iterator from `start_sequence`.
+    ///
+    /// Construction allocates the segment path list. Iteration opens and reads
+    /// segments synchronously, expands physical batches, and reports corruption
+    /// through each item.
     pub async fn iter_entries_from(&self, start_sequence: u64) -> Result<WalEntryIterator> {
         self.flush().await?;
 
@@ -641,6 +690,13 @@ impl WriteAheadLog {
         WalEntryIterator::new(paths, start_sequence)
     }
 
+    /// Delete inactive segments whose last logical sequence is below the bound.
+    ///
+    /// A segment spanning `up_to_sequence` and the active segment are retained.
+    /// Candidate validation and unlinking are synchronous and race safely with
+    /// rotation. This low-level method does not prove that the caller's database
+    /// checkpoint is durable and does not synchronize the directory after each
+    /// unlink; engine callers invoke it only after manifest installation.
     pub async fn truncate(&self, up_to_sequence: u64) -> Result<()> {
         info!("Truncating WAL up to sequence {}", up_to_sequence);
 
@@ -685,6 +741,10 @@ impl WriteAheadLog {
         Ok(())
     }
 
+    /// Return the exclusive upper bound of all sequences allocated so far.
+    ///
+    /// Allocation can precede a failed or cancelled append, so this is not a
+    /// visibility or durability frontier.
     pub fn current_sequence(&self) -> u64 {
         self.sequence.load(Ordering::SeqCst)
     }

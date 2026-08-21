@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! # TurboKV
 //!
 //! A fast, embedded key-value store with a BTreeMap-like API.

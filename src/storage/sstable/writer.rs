@@ -100,7 +100,13 @@ impl EncodedFooter {
     }
 }
 
-/// SSTable writer
+/// Incremental writer for one immutable, sorted SSTable file.
+///
+/// Entries must be supplied in strictly increasing key order. The writer
+/// buffers a data block and output bytes in memory; [`finish`](Self::finish)
+/// writes the remaining metadata and synchronizes the file before reporting
+/// success. Dropping an unfinished writer can leave a partial file, so engine
+/// callers publish the file only after `finish` succeeds.
 pub struct SSTableWriter {
     path: PathBuf,
     writer: BufWriter<File>,
@@ -123,7 +129,11 @@ pub struct SSTableWriter {
 }
 
 impl SSTableWriter {
-    /// Create new SSTable writer
+    /// Creates a writer, creating or truncating `path` immediately.
+    ///
+    /// The call performs synchronous filesystem I/O and allocates block, index,
+    /// and Bloom-filter builders. It does not make the empty file durable.
+    /// Returns an I/O error if the path cannot be opened for replacement.
     pub fn new(path: impl AsRef<Path>, config: SSTableConfig) -> Result<Self> {
         Self::new_with_format(path, config, SSTABLE_VERSION)
     }
@@ -180,7 +190,14 @@ impl SSTableWriter {
         Self::new_with_format(path, config, SSTABLE_VERSION_V2)
     }
 
-    /// Add key-value pair (`None` represents a tombstone/deletion).
+    /// Adds one key-value pair; `None` records a tombstone.
+    ///
+    /// Keys must be unique and strictly greater than the preceding key. The
+    /// key and value are copied into buffered table storage. A full block may
+    /// be compressed and written synchronously before this call returns, but
+    /// the table is not durable or complete until [`finish`](Self::finish)
+    /// succeeds. Returns an SSTable, compression, or I/O error for invalid
+    /// ordering, oversized entries, encoding failure, or failed output.
     pub fn add(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         self.add_versioned(key, value, 0)
     }
@@ -489,7 +506,19 @@ impl SSTableWriter {
         Ok(())
     }
 
-    /// Finish writing SSTable
+    /// Finishes, flushes, and synchronizes the SSTable file.
+    ///
+    /// This consumes the writer, writes the last data block plus index, Bloom
+    /// filter, and checksummed footer, flushes buffered output, and calls
+    /// `sync_all` on the file. The operation is synchronous and can allocate
+    /// temporary compressed blocks and serialized metadata. Success means the
+    /// file contents have reached the operating system's requested file-sync
+    /// boundary; publication in a manifest and directory-entry durability are
+    /// separate engine operations.
+    ///
+    /// On error, callers must treat the output as incomplete and must not
+    /// publish it. The returned [`SSTableInfo`] uses placeholder id and level
+    /// values for the engine to assign during installation.
     pub fn finish(mut self) -> Result<SSTableInfo> {
         // Flush any remaining data
         self.flush_block()?;

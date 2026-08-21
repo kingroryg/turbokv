@@ -4,7 +4,7 @@
 **A fast, embedded key-value store in Rust**
 
 [![GitHub](https://img.shields.io/badge/repo-GitHub-blue.svg)](https://github.com/kingroryg/turbokv)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE.md)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
 </div>
@@ -24,7 +24,7 @@ TurboKV is a high-performance, embedded key-value database written in Rust. It p
 - **Bloom Filters**: Fast negative lookups
 - **Compression**: LZ4, Snappy, and Zstd support
 
-## Exclusive Directory Ownership
+## Operational and Durability Assumptions
 
 An open TurboKV database exclusively owns its canonicalized data directory.
 Opening the same directory from another `Db` or `Engine`, in the same process
@@ -37,8 +37,35 @@ operating system releases ownership when the database handle closes or the
 process terminates. All programs accessing the directory must honor advisory
 locks, and the underlying filesystem must implement the platform's locking
 semantics. `Db::close` stops background work, flushes pending writes, and then
-releases ownership. `Engine::shutdown(&self)` stops and flushes the engine but
-retains ownership until the still-usable `Engine` is dropped.
+releases that `Db` handle's ownership. A live streaming scan retains an
+ownership guard, so the directory remains locked until the iterator is also
+dropped. `Engine::shutdown(&self)` stops and flushes the engine but retains
+ownership until the still-usable `Engine` and every scan iterator are dropped.
+
+TurboKV uses regular buffered files and memory-mapped SSTables. WAL writes can
+bypass a Rust `BufWriter`, but they still pass through the operating-system page
+cache; TurboKV does not use `O_DIRECT`. Acknowledged `durable()` writes have
+reached that page cache and are intended to survive a database-process crash,
+not an operating-system or power failure. `paranoid()` additionally completes
+`File::sync_all` before acknowledging the containing WAL group. The hardware,
+device controller, kernel, filesystem, and any virtualization layer must honor
+that flush for the barrier to survive power loss; TurboKV cannot verify this.
+
+The data directory must provide coherent memory mapping, atomic same-directory
+rename or replacement, advisory file locking, and the platform's documented
+file-sync behavior. On Unix, TurboKV also synchronizes directories after
+durability-critical entry changes. Rust exposes no portable directory fsync on
+other targets; Windows uses write-through replacement and synchronized files as
+the strongest available ordering. Network, distributed, removable, and
+user-space filesystems require their own validation before production use.
+
+Dropping the last handle releases ownership but is not a clean-shutdown API.
+Use `Db::close` (or `close_with_status`) to stop maintenance and flush pending
+writes before releasing the lock. `Engine::shutdown` is idempotent, stops and
+flushes the engine, but deliberately retains directory ownership until every
+engine handle and scan guard is dropped. Cancelling an async mutation does not
+roll it back: after submission, especially for a grouped paranoid write, its
+outcome can be indeterminate and must be checked or retried idempotently.
 
 ## Development
 
@@ -50,7 +77,7 @@ cargo build --release
 cargo test
 
 # Run the bounded benchmark protocol
-cargo bench --bench benchmarks -- --profile quick
+cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- --profile quick
 
 # Format code
 cargo fmt
@@ -120,10 +147,47 @@ access from multiple tasks.
 
 ## Performance
 
-Historical performance claims have been removed while the deterministic
-production-scale baselines are rebuilt. The current protocol and instructions
-live in [`benchmarks/README.md`](benchmarks/README.md); publish numbers only with
-the corresponding clean-tree JSON evidence artifact.
+The current release evidence is retained as
+[`durability-baseline-current.json`](benchmarks/results/apple-m4-macos-15.3.2/durability-baseline-current.json)
+with a readable companion
+[`durability-baseline-current.txt`](benchmarks/results/apple-m4-macos-15.3.2/durability-baseline-current.txt).
+It was generated from a clean source manifest matching this revision on
+**2026-08-21** after the ingestion, read-path, and compaction work in issues
+#23–#25.
+
+The equivalent `durable` acknowledgement rows return after each engine's WAL
+reaches the OS page cache without an fsync. Sequential fill was noisy enough
+that no winner is claimed; its three-repetition median is reported only inside
+a **0.40–1.60× fjall** evidence bound. Across random fill and overwrite,
+TurboKV delivered **0.50–1.00× fjall's acknowledgement throughput**. In the
+deterministic 50/50 mixed read/overwrite workload, TurboKV delivered
+**1.20–2.50× fjall's acknowledgement throughput**. These deliberately
+conservative median bounds are checked against the retained artifact; its JSON
+contains exact rates, latency percentiles, population CV, and every raw
+repetition. Cells with high CV are noisy observations, not stable predictions.
+
+No cross-engine claim uses the report's “fully settled” timings. Settlement
+forces each engine's own flush and compaction APIs, whose rewrite policies are
+not equivalent: fjall's major compaction can rewrite data when TurboKV's
+pressure-based compaction correctly reports no work. Those timings remain
+useful within one engine but cannot establish that TurboKV is faster than
+fjall.
+
+Provenance: Apple M4 (`Mac16,1`), 32 GiB RAM, 10 logical CPUs, aarch64; macOS
+15.3.2 build 24D81; APFS; `rustc 1.88.0 (6b00bc388 2025-06-23)`. Each workload
+used 1,000 deterministic 20-byte keys and 400-byte values, three repetitions,
+one caller, one-entry writes, WAL enabled, 64 MiB memtables, compression off,
+block cache zero, and an uncleared OS page cache; scan and recovery settings
+were five passes/cycles with seed `0x545552424f4b5604`. The machine was required
+to be otherwise idle, but power, thermal state, and background load were
+operator-controlled rather than enforced. Exact command:
+
+```console
+cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- --profile release --confirm-release --machine "Apple M4 (Mac16,1), 32 GiB, macOS 15.3.2" --output ../target/issue-28-release
+```
+
+See [`benchmarks/README.md`](benchmarks/README.md) for the complete equivalence,
+workload, settlement, storage-accounting, and rerun protocol.
 
 
 ## API Reference

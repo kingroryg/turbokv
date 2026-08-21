@@ -116,11 +116,14 @@ impl CachedBlock {
 /// Cache key identifying a specific block in an SSTable
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct CacheKey {
+    /// Process-local namespace for the opened SSTable reader.
     pub file_id: u64,
+    /// Byte offset of the encoded block within that SSTable.
     pub block_offset: u64,
 }
 
 impl CacheKey {
+    /// Identify one block within one opened-reader namespace.
     pub fn new(file_id: u64, block_offset: u64) -> Self {
         Self {
             file_id,
@@ -147,11 +150,15 @@ pub struct BlockCache {
 /// Cache statistics
 #[derive(Debug, Clone, Default)]
 pub struct CacheStats {
+    /// Number of currently retained blocks.
     pub entries: usize,
     /// Retained payload and parsed-layout bytes.
     pub size_bytes: u64,
+    /// Successful lookups since this cache was created.
     pub hits: u64,
+    /// Unsuccessful lookups since this cache was created.
     pub misses: u64,
+    /// `hits / (hits + misses)`, or zero before any lookup.
     pub hit_rate: f64,
 }
 
@@ -162,7 +169,12 @@ impl BlockCache {
         Self::with_shards(max_size_bytes, 16)
     }
 
-    /// Create cache with custom shard count (must be power of 2)
+    /// Create a cache with a custom power-of-two shard count.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `num_shards` is zero or is not a power of two. A zero byte
+    /// budget creates shards that retain no blocks.
     pub fn with_shards(max_size_bytes: usize, num_shards: usize) -> Self {
         assert!(
             num_shards.is_power_of_two(),
@@ -203,7 +215,7 @@ impl BlockCache {
         &self.shards[idx]
     }
 
-    /// Get a block from cache
+    /// Clone the shared bytes for a cached block and update hit/miss counters.
     #[inline]
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
         self.get_cached(key, false).map(|block| block.data)
@@ -229,7 +241,9 @@ impl BlockCache {
         }
     }
 
-    /// Insert a block into cache
+    /// Insert shared block bytes, evicting least-recently-used entries as needed.
+    ///
+    /// Empty blocks and blocks larger than their shard budget are ignored.
     #[inline]
     pub fn insert(&self, key: CacheKey, value: Bytes) {
         self.insert_cached(key, CachedBlock::raw(value));
@@ -273,7 +287,7 @@ impl BlockCache {
         }
     }
 
-    /// Remove a block from cache (e.g., when SSTable is deleted)
+    /// Remove a block if present.
     pub fn remove(&self, key: &CacheKey) {
         let shard = self.shard_for(key);
         let mut lru = shard.lru.lock();
@@ -284,7 +298,7 @@ impl BlockCache {
         }
     }
 
-    /// Clear all entries
+    /// Clear all blocks while retaining cumulative hit/miss counters.
     pub fn clear(&self) {
         for shard in &self.shards {
             let mut lru = shard.lru.lock();
@@ -293,7 +307,7 @@ impl BlockCache {
         }
     }
 
-    /// Get cache statistics
+    /// Sample current occupancy and cumulative hit/miss counters.
     pub fn stats(&self) -> CacheStats {
         let mut stats = CacheStats::default();
 

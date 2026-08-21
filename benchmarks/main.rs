@@ -237,7 +237,7 @@ fn protocol_settings() -> Protocol {
         settled_boundary:
             "acknowledgement followed by synchronous forced flush and two manual compaction drains for mutation workloads",
         recovery_boundary:
-            "time to reopen a WAL-only database; verification is after and excluded from the timed reopen",
+            "time to hand off in-process directory ownership and reopen a WAL-only database; verification is after and excluded from the timed reopen",
         common: CommonSettings {
             wal_enabled: true,
             batch_size: 1,
