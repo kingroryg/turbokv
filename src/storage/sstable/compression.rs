@@ -2,6 +2,9 @@ use std::io::Read;
 
 use crate::core::error::{Error, Result};
 
+const MAX_BULK_ZSTD_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BULK_ZSTD_EXPANSION_RATIO: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CompressionType {
@@ -32,7 +35,7 @@ pub fn compress_block(data: &[u8], compression: CompressionType) -> Result<Vec<u
     match compression {
         CompressionType::None => Ok(data.to_vec()),
         CompressionType::Zstd => {
-            let compressed = zstd::encode_all(data, 3).map_err(|e| Error::SSTable {
+            let compressed = zstd::bulk::compress(data, 3).map_err(|e| Error::SSTable {
                 message: format!("Zstd compression failed: {}", e),
                 source: None,
             })?;
@@ -76,13 +79,23 @@ pub fn decompress_block(data: &[u8], compression: CompressionType) -> Result<Vec
         CompressionType::None => Ok(data.to_vec()),
         CompressionType::Zstd => {
             if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(data) {
-                usize::try_from(size).map_err(|_| Error::SSTable {
+                let size = usize::try_from(size).map_err(|_| Error::SSTable {
                     message: format!(
                         "Zstd declared block size {size} cannot be represented on this platform"
                     ),
                     source: None,
                 })?;
+                if bulk_zstd_size_if_safe(data.len(), size).is_some() {
+                    return zstd::bulk::decompress(data, size).map_err(|e| Error::SSTable {
+                        message: format!("Zstd decompression failed: {e}"),
+                        source: None,
+                    });
+                }
             }
+            // Unknown, very large, or unusually compressible declared sizes
+            // use the incremental decoder. This avoids a hostile eager
+            // allocation while retaining compatibility with valid old frames
+            // of any decoded size or compression ratio.
             let mut decoder =
                 zstd::stream::read::Decoder::new(data).map_err(|e| Error::SSTable {
                     message: format!("Zstd decompression failed: {}", e),
@@ -132,6 +145,14 @@ pub fn decompress_block(data: &[u8], compression: CompressionType) -> Result<Vec
     }
 }
 
+fn bulk_zstd_size_if_safe(payload_size: usize, declared_size: usize) -> Option<usize> {
+    let plausible_for_bulk = payload_size
+        .saturating_mul(MAX_BULK_ZSTD_EXPANSION_RATIO)
+        .saturating_add(64);
+    (declared_size <= MAX_BULK_ZSTD_DECOMPRESSED_BYTES && declared_size <= plausible_for_bulk)
+        .then_some(declared_size)
+}
+
 fn reject_implausible_decompression(
     declared_size: usize,
     payload_size: usize,
@@ -174,6 +195,8 @@ fn compressed_type_strategy() -> impl proptest::strategy::Strategy<Value = Compr
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use proptest::prelude::*;
 
     use super::*;
@@ -276,6 +299,85 @@ mod tests {
             );
         }
         assert!(decompress_block(&[0; 16], CompressionType::Zstd).is_err());
+    }
+
+    #[test]
+    fn zstd_bulk_frames_and_legacy_stream_frames_both_round_trip() {
+        let data = (0..32 * 1024)
+            .map(|offset| (offset * 31 + offset / 7) as u8)
+            .collect::<Vec<_>>();
+
+        let bulk = compress_block(&data, CompressionType::Zstd).unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&bulk).unwrap(),
+            Some(data.len() as u64)
+        );
+        assert_eq!(
+            bulk_zstd_size_if_safe(bulk.len(), data.len()),
+            Some(data.len())
+        );
+        assert_eq!(
+            decompress_block(&bulk, CompressionType::Zstd).unwrap(),
+            data
+        );
+        assert_eq!(
+            zstd::decode_all(bulk.as_slice()).unwrap(),
+            data,
+            "legacy streaming readers must accept new bulk frames"
+        );
+
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&data).unwrap();
+        let legacy = encoder.finish().unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&legacy).unwrap(),
+            None
+        );
+        assert_eq!(
+            decompress_block(&legacy, CompressionType::Zstd).unwrap(),
+            data
+        );
+    }
+
+    #[test]
+    fn zstd_high_ratio_and_hostile_declared_sizes_avoid_bulk_allocation() {
+        let highly_compressible = vec![b'a'; 1024 * 1024];
+        let compressed = compress_block(&highly_compressible, CompressionType::Zstd).unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&compressed).unwrap(),
+            Some(highly_compressible.len() as u64)
+        );
+        assert_eq!(
+            bulk_zstd_size_if_safe(compressed.len(), highly_compressible.len()),
+            None
+        );
+        assert_eq!(
+            decompress_block(&compressed, CompressionType::Zstd).unwrap(),
+            highly_compressible
+        );
+
+        let small = compress_block(b"small", CompressionType::Zstd).unwrap();
+        assert_eq!(small[4] & 0x20, 0x20, "bulk frame is single-segment");
+        let original_header_bytes = 6;
+        let hostile_size = (MAX_BULK_ZSTD_DECOMPRESSED_BYTES as u64) + 1;
+        let mut hostile = Vec::with_capacity(small.len() + 7);
+        hostile.extend_from_slice(&small[..4]);
+        // Eight-byte frame-content-size field plus single-segment flag.
+        hostile.push(0xe0);
+        hostile.extend_from_slice(&hostile_size.to_le_bytes());
+        hostile.extend_from_slice(&small[original_header_bytes..]);
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&hostile).unwrap(),
+            Some(hostile_size)
+        );
+        assert_eq!(
+            bulk_zstd_size_if_safe(hostile.len(), hostile_size as usize),
+            None
+        );
+        let result = std::panic::catch_unwind(|| decompress_block(&hostile, CompressionType::Zstd));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_err());
     }
 
     #[test]

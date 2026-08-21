@@ -574,7 +574,16 @@ pub struct DbStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::sstable::{CompressionType, SSTableConfig};
     use tempfile::TempDir;
+
+    #[test]
+    fn compression_defaults_consistently_select_lz4() {
+        assert_eq!(Compression::default(), Compression::Lz4);
+        assert_eq!(DbConfig::default().compression, Compression::Lz4);
+        assert_eq!(DbOptions::default().compression, Compression::Lz4);
+        assert_eq!(SSTableConfig::default().compression, CompressionType::Lz4);
+    }
 
     #[tokio::test]
     async fn test_basic_operations() {
