@@ -30,10 +30,6 @@ use crate::storage::version::VersionOrder;
 
 /// Thread-local write buffer size (number of entries before flush to main memtable)
 const THREAD_LOCAL_BUFFER_SIZE: usize = 64;
-/// Shared key-lock stripes keep same-key conditional updates atomic without
-/// serializing independent writes or allocating one lock per key.
-const MUTATION_LOCK_STRIPES: usize = 65_536;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ImmutableGenerationId(usize);
 
@@ -63,9 +59,6 @@ type BufferRegistry = Mutex<HashMap<RegistryKey, Arc<Mutex<Vec<BufferEntry>>>>>;
 /// Shared registry of all thread-local buffers for cross-thread flushing
 static BUFFER_REGISTRY: std::sync::LazyLock<BufferRegistry> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-static MUTATION_LOCKS: std::sync::LazyLock<Box<[Mutex<()>]>> =
-    std::sync::LazyLock::new(|| (0..MUTATION_LOCK_STRIPES).map(|_| Mutex::new(())).collect());
 
 /// Manages active and immutable memtables
 pub struct MemTableManager {
@@ -140,10 +133,9 @@ impl MemTableManager {
         sequence: u64,
     ) -> Result<()> {
         self.observe_sequence(sequence);
-        let _mutation = self.lock_key(key);
         for _ in 0..5 {
             let active = self.active.read();
-            match active.insert_with_sequence_prelocked(key, value, sequence) {
+            match active.insert_with_sequence(key, value, sequence) {
                 Ok(()) => return Ok(()),
                 Err(MemTableError::Full) => {
                     drop(active);
@@ -241,12 +233,14 @@ impl MemTableManager {
         sequences: &[u64],
     ) -> Result<()> {
         debug_assert_eq!(entries.len(), sequences.len());
-        let _mutations = self.lock_key_slices(entries.iter().map(|(key, _)| *key));
         for &sequence in sequences {
             self.observe_sequence(sequence);
         }
 
         let active = self.active.read();
+        // Keep the complete batch under a sorted set of table-owned mutation
+        // locks so its replacements and physical counters publish together.
+        let _mutations = active.lock_mutations(entries.iter().map(|(key, _)| *key));
         if active.is_read_only() {
             return Err(MemTableError::ReadOnly);
         }
@@ -266,10 +260,14 @@ impl MemTableManager {
 
     /// Flush thread-local buffer to main memtable
     fn flush_buffer(&self, entries: &[BufferEntry]) -> Result<()> {
-        let _mutations = self.lock_keys(entries);
         let mut start_idx = 0;
         for _ in 0..5 {
             let active = self.active.read();
+            let mutations = active.lock_mutations(
+                entries[start_idx..]
+                    .iter()
+                    .map(|entry| entry.key.as_slice()),
+            );
 
             // Try to insert remaining entries
             let mut success = true;
@@ -294,6 +292,7 @@ impl MemTableManager {
             }
 
             // Rotation needed
+            drop(mutations);
             drop(active);
             self.rotate_memtable()?;
         }
@@ -339,10 +338,9 @@ impl MemTableManager {
     /// Apply a tombstone using a sequence assigned by the engine or WAL.
     pub(crate) fn delete_with_sequence(&self, key: &[u8], sequence: u64) -> Result<()> {
         self.observe_sequence(sequence);
-        let _mutation = self.lock_key(key);
         for _ in 0..5 {
             let active = self.active.read();
-            match active.delete_with_sequence_prelocked(key, sequence) {
+            match active.delete_with_sequence(key, sequence) {
                 Ok(()) => return Ok(()),
                 Err(MemTableError::Full) => {
                     drop(active);
@@ -561,38 +559,6 @@ impl MemTableManager {
         // sampler can observe this handoff as complete.
         self.buffered_versions
             .fetch_sub(entries.len() as u64, Ordering::Release);
-    }
-
-    fn lock_key(&self, key: &[u8]) -> parking_lot::MutexGuard<'static, ()> {
-        MUTATION_LOCKS[self.lock_index(key)].lock()
-    }
-
-    fn lock_keys(&self, entries: &[BufferEntry]) -> Vec<parking_lot::MutexGuard<'static, ()>> {
-        self.lock_key_slices(entries.iter().map(|entry| entry.key.as_slice()))
-    }
-
-    fn lock_key_slices<'a>(
-        &self,
-        keys: impl Iterator<Item = &'a [u8]>,
-    ) -> Vec<parking_lot::MutexGuard<'static, ()>> {
-        let mut indices: Vec<_> = keys.map(|key| self.lock_index(key)).collect();
-        indices.sort_unstable();
-        indices.dedup();
-        indices
-            .into_iter()
-            .map(|index| MUTATION_LOCKS[index].lock())
-            .collect()
-    }
-
-    fn lock_index(&self, key: &[u8]) -> usize {
-        // FNV-1a is sufficient for lock striping and avoids constructing a
-        // stateful hasher on every mutation.
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ self.id;
-        for byte in key {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash as usize % MUTATION_LOCK_STRIPES
     }
 
     fn merge_entries(&self, include: impl Fn(&[u8]) -> bool) -> Vec<(Vec<u8>, MemTableEntry)> {
@@ -815,6 +781,69 @@ mod tests {
         // Should be able to find all entries
         for i in 0..12 {
             assert!(manager.get(format!("key{}", i).as_bytes()).is_some());
+        }
+    }
+
+    #[test]
+    fn raw_and_managed_same_key_races_keep_newest_sequence_and_accounting() {
+        const ROUNDS: u64 = 128;
+        for managed_as_batch in [false, true] {
+            let key: &'static [u8] = if managed_as_batch {
+                b"batched"
+            } else {
+                b"single"
+            };
+            let manager = Arc::new(MemTableManager::new(test_config()));
+            let table = manager.active.read().clone();
+
+            for round in 0..ROUNDS {
+                let older_sequence = round * 2;
+                let newest_sequence = older_sequence + 1;
+                let start = Arc::new(std::sync::Barrier::new(3));
+                let managed_writer = {
+                    let manager = Arc::clone(&manager);
+                    let start = Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        if managed_as_batch {
+                            manager
+                                .apply_batch_with_sequences(
+                                    &[(key, Some(b"older".as_slice()))],
+                                    &[older_sequence],
+                                )
+                                .unwrap();
+                        } else {
+                            manager
+                                .insert_with_sequence(key, b"older", older_sequence)
+                                .unwrap();
+                        }
+                    })
+                };
+                let raw_writer = {
+                    let table = Arc::clone(&table);
+                    let start = Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        table
+                            .insert_with_sequence(key, b"newest", newest_sequence)
+                            .unwrap();
+                    })
+                };
+                start.wait();
+                managed_writer.join().unwrap();
+                raw_writer.join().unwrap();
+
+                let entry = manager.get_entry(key).unwrap();
+                assert_eq!(entry.sequence, newest_sequence);
+                assert_eq!(entry.value.as_deref(), Some(b"newest".as_slice()));
+                let stats = manager.stats();
+                assert_eq!(stats.active.entry_count, 1);
+                assert_eq!(stats.active.tombstone_count, 0);
+                assert_eq!(
+                    stats.active.size_bytes,
+                    estimated_memtable_entry_size(key, Some(b"newest"))
+                );
+            }
         }
     }
 
