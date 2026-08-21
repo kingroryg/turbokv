@@ -1,10 +1,9 @@
 //! SSTable reader implementation
 
-use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
-use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -20,9 +19,12 @@ use super::{
 };
 use crate::core::error::{Error, Result};
 
+static NEXT_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+
 /// SSTable reader
 pub struct SSTableReader {
-    file_id: u64,
+    path: std::path::PathBuf,
+    cache_namespace: u64,
     mmap: Mmap,
     format_version: u32,
     metadata_offset: u64,
@@ -76,8 +78,13 @@ impl SSTableReader {
     /// Open SSTable for reading
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = File::open(&path)?;
-        let file_size = file.metadata()?.len();
+        Self::open_inner(&path).map_err(|error| sstable_file_error(&path, "open", error))
+    }
+
+    fn open_inner(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        let metadata = file.metadata()?;
+        let file_size = metadata.len();
 
         if file_size < FOOTER_SIZE as u64 {
             return Err(sstable_corruption("file is shorter than its footer"));
@@ -184,13 +191,21 @@ impl SSTableReader {
             None
         };
 
-        // Compute file_id from path hash
-        let mut hasher = DefaultHasher::new();
-        path.hash(&mut hasher);
-        let file_id = hasher.finish();
+        // Each opened reader owns a process-unique cache namespace. Compaction
+        // can retire a path while an older pinned reader remains alive; a
+        // replacement reader must never consume that reader's blocks, even on
+        // filesystems where identity metadata is unavailable or too coarse.
+        let cache_namespace = NEXT_CACHE_NAMESPACE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| Error::ResourceExhausted {
+                resource: "SSTable block-cache namespace space".to_string(),
+            })?;
 
         Ok(Self {
-            file_id,
+            path: path.to_path_buf(),
+            cache_namespace,
             mmap,
             format_version: version,
             metadata_offset: index_offset,
@@ -202,8 +217,11 @@ impl SSTableReader {
 
     /// Open and eagerly validate every data block and acceleration structure.
     pub(crate) fn open_validated(path: impl AsRef<Path>) -> Result<Self> {
-        let reader = Self::open(path)?;
-        reader.validate_contents()?;
+        let path = path.as_ref().to_path_buf();
+        let reader = Self::open(&path)?;
+        reader
+            .validate_contents()
+            .map_err(|error| sstable_file_error(&path, "validated contents", error))?;
         Ok(reader)
     }
 
@@ -236,6 +254,11 @@ impl SSTableReader {
 
     /// Get raw SSTable entry by key, preserving tombstones.
     pub(crate) fn get_entry(&self, key: &[u8]) -> Result<Option<SSTableEntry>> {
+        self.get_entry_inner(key)
+            .map_err(|error| self.file_error("data block entry", error))
+    }
+
+    fn get_entry_inner(&self, key: &[u8]) -> Result<Option<SSTableEntry>> {
         // Check bloom filter first
         if let Some(ref bloom) = self.bloom_filter {
             if !bloom.contains(key) {
@@ -250,7 +273,7 @@ impl SSTableReader {
         };
 
         // Read and decompress block
-        let block_data = self.read_block_shared(block_info.offset, block_info.size)?;
+        let block_data = self.read_block_shared_inner(block_info.offset, block_info.size)?;
 
         // Search within block
         self.search_block_entry(&block_data, key)
@@ -261,13 +284,18 @@ impl SSTableReader {
     /// Cache hits clone only a `Bytes` handle. On a miss, the decompressor's
     /// output allocation becomes the cached block without another full copy.
     pub(crate) fn read_block_shared(&self, offset: u64, size: u32) -> Result<Bytes> {
+        self.read_block_shared_inner(offset, size)
+            .map_err(|error| self.file_error("data block", error))
+    }
+
+    fn read_block_shared_inner(&self, offset: u64, size: u32) -> Result<Bytes> {
         if size < 5 {
             return Err(Error::SSTable {
                 message: "Block size is smaller than its footer".to_string(),
                 source: None,
             });
         }
-        let cache_key = CacheKey::new(self.file_id, offset);
+        let cache_key = CacheKey::new(self.cache_namespace, offset);
 
         // Check cache first
         if let Some(ref cache) = self.cache {
@@ -448,6 +476,10 @@ impl SSTableReader {
         self.format_version
     }
 
+    pub(crate) fn file_error(&self, context: &str, error: Error) -> Error {
+        sstable_file_error(&self.path, context, error)
+    }
+
     /// Deserialize bloom filter from raw data
     fn deserialize_bloom_filter(data: &[u8]) -> Result<BloomFilter> {
         if data.len() < 12 {
@@ -603,6 +635,26 @@ fn sstable_corruption(message: &str) -> Error {
     }
 }
 
+fn sstable_file_error(path: &Path, context: &str, error: Error) -> Error {
+    match error {
+        Error::SSTable { message, source } => Error::SSTable {
+            message: format!("{} [{context}]: {message}", path.display()),
+            source,
+        },
+        Error::Io { message, source } => Error::Io {
+            message: format!("SSTable {} [{context}]: {message}", path.display()),
+            source,
+        },
+        Error::ResourceExhausted { resource } => Error::ResourceExhausted {
+            resource: format!("{resource} while opening {} [{context}]", path.display()),
+        },
+        other => Error::SSTable {
+            message: format!("{} [{context}]: {other}", path.display()),
+            source: None,
+        },
+    }
+}
+
 fn remaining_index_bytes(reader: &Cursor<&[u8]>) -> usize {
     reader
         .get_ref()
@@ -630,12 +682,14 @@ fn read_index_u64(reader: &mut Cursor<&[u8]>, field: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
 
     use super::*;
     use crate::storage::cache::BlockCache;
     use crate::storage::sstable::{CompressionType, SSTableConfig, SSTableWriter};
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     fn uncompressed_config() -> SSTableConfig {
@@ -643,6 +697,151 @@ mod tests {
             compression: CompressionType::None,
             ..SSTableConfig::default()
         }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        #[test]
+        fn arbitrary_sorted_entries_round_trip_through_points_bloom_index_and_streaming(
+            entries in prop::collection::btree_map(
+                prop::collection::vec(any::<u8>(), 0..32),
+                prop::option::of(prop::collection::vec(any::<u8>(), 0..512)),
+                1..64,
+            ),
+            compression in super::super::compression::compression_type_strategy(),
+        ) {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join(format!("property-{compression:?}.sst"));
+            let mut writer = SSTableWriter::new(
+                &path,
+                SSTableConfig {
+                    block_size: 128,
+                    compression,
+                    ..SSTableConfig::default()
+                },
+            )
+            .unwrap();
+            for (index, (key, value)) in entries.iter().enumerate() {
+                writer
+                    .add_versioned(key, value.as_deref(), index as u64 + 1)
+                    .unwrap();
+            }
+            let info = writer.finish().unwrap();
+            prop_assert_eq!(info.entry_count as usize, entries.len());
+
+            let reader = SSTableReader::open_validated(&path).unwrap();
+            let bloom = reader.bloom_filter.as_ref().unwrap();
+            for (index, (key, expected)) in entries.iter().enumerate() {
+                prop_assert!(bloom.contains(key), "compression={compression:?}, key={key:?}");
+                let actual = reader.get_entry(key).unwrap().unwrap();
+                prop_assert_eq!(actual.sequence, Some(index as u64 + 1));
+                match (&actual.value, expected) {
+                    (SSTableValue::Value(actual), Some(expected)) => {
+                        prop_assert_eq!(actual.as_ref(), expected.as_slice());
+                    }
+                    (SSTableValue::Tombstone, None) => {}
+                    _ => prop_assert!(false, "compression={compression:?}, key={key:?}"),
+                }
+            }
+
+            let actual = reader
+                .iter()
+                .map(|entry| entry.map(|(key, value)| (key.to_vec(), value.map(|value| value.to_vec()))))
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            let expected = entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            prop_assert_eq!(actual, expected, "compression={:?}", compression);
+
+            let definite_negative = (0..4_096_u64)
+                .map(u64::to_le_bytes)
+                .find(|candidate| !entries.contains_key(candidate.as_slice()) && !bloom.contains(candidate));
+            prop_assert!(definite_negative.is_some(), "compression={compression:?}");
+            prop_assert!(reader.get(&definite_negative.unwrap()).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn large_binary_values_cross_the_configured_block_size_for_every_codec() {
+        let directory = TempDir::new().unwrap();
+        let mut value = (0..1024 * 1024)
+            .map(|offset| (offset * 131 + offset / 17) as u8)
+            .collect::<Vec<_>>();
+        value[0] = 0;
+        *value.last_mut().unwrap() = 0xff;
+
+        for compression in [
+            CompressionType::None,
+            CompressionType::Zstd,
+            CompressionType::Snappy,
+            CompressionType::Lz4,
+        ] {
+            let path = directory.path().join(format!("large-{compression:?}.sst"));
+            let mut writer = SSTableWriter::new(
+                &path,
+                SSTableConfig {
+                    block_size: 64,
+                    compression,
+                    ..SSTableConfig::default()
+                },
+            )
+            .unwrap();
+            writer
+                .add_versioned(b"large\0\xff", Some(&value), 9)
+                .unwrap();
+            writer.finish().unwrap();
+
+            let reader = SSTableReader::open_validated(&path).unwrap();
+            assert_eq!(
+                reader.get(b"large\0\xff").unwrap().unwrap().as_ref(),
+                value,
+                "compression={compression:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_block_index_seeks_exact_keys_and_gaps() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("multi-block.sst");
+        let mut writer = SSTableWriter::new(
+            &path,
+            SSTableConfig {
+                block_size: 96,
+                compression: CompressionType::None,
+                ..SSTableConfig::default()
+            },
+        )
+        .unwrap();
+        let entries = (0..128)
+            .map(|index| {
+                (
+                    format!("{:04}", index * 2).into_bytes(),
+                    vec![index as u8; 37],
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (index, (key, value)) in entries.iter().enumerate() {
+            writer
+                .add_versioned(key, Some(value), index as u64 + 1)
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let reader = SSTableReader::open_validated(&path).unwrap();
+        assert!(reader.index.entries().len() > 32);
+        for (index, (key, value)) in entries.iter().enumerate() {
+            assert_eq!(reader.get(key).unwrap().unwrap().as_ref(), value);
+            let gap = format!("{:04}", index * 2 + 1);
+            assert!(reader.get(gap.as_bytes()).unwrap().is_none(), "gap={gap}");
+            assert!(reader.index.find_block(key).is_some(), "key={key:?}");
+        }
+        assert!(reader.get(b"9999").unwrap().is_none());
+        assert!(reader.index.find_block(b"9999").is_none());
+        assert_eq!(reader.iter().count(), entries.len());
     }
 
     #[test]

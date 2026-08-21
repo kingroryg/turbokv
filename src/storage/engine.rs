@@ -704,6 +704,7 @@ impl Engine {
             Arc::clone(&next_sstable_id),
             Arc::downgrade(&directory_lock),
             Arc::clone(&sstables),
+            Arc::clone(&sstable_pool),
             Arc::clone(&manifest),
             TombstoneReclamationSources::new(
                 Arc::clone(&memtable_manager),
@@ -6855,7 +6856,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pinned_readers_survive_compaction_unlink_without_holding_the_live_list_lock() {
+    async fn pinned_readers_survive_compaction_while_retired_pool_entries_are_invalidated() {
         let directory = TempDir::new().unwrap();
         let mut config = isolated_config(directory.path(), false);
         config.block_cache_size = 0;
@@ -6885,6 +6886,11 @@ mod tests {
             .iter()
             .map(|table| table.path.clone())
             .collect();
+        assert_eq!(
+            engine.get(b"pin:0000").await.unwrap(),
+            Some(b"value-1-0000".to_vec())
+        );
+        assert_eq!(engine.sstable_pool.stats().open_sstables, 2);
         let iterator = engine.scan_prefix_iter(b"pin:").await.unwrap();
 
         tokio::time::timeout(Duration::from_secs(2), engine.compact())
@@ -6892,6 +6898,12 @@ mod tests {
             .expect("iterator retained the global SSTable list lock")
             .unwrap();
         assert!(input_paths.iter().all(|path| !path.exists()));
+        assert_eq!(engine.sstable_pool.stats().open_sstables, 0);
+        assert_eq!(
+            engine.get(b"pin:0000").await.unwrap(),
+            Some(b"value-1-0000".to_vec())
+        );
+        assert_eq!(engine.sstable_pool.stats().open_sstables, 1);
         let pairs = iterator.collect_pairs().unwrap();
         assert_eq!(pairs.len(), 200);
         assert!(pairs

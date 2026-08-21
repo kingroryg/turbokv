@@ -317,13 +317,13 @@ fn truncated_fixed_headers_have_component_specific_errors() {
 
     let sstable_path = directory.path().join("table.sst");
     fs::write(&sstable_path, vec![0_u8; 39]).unwrap();
-    assert_eq!(
-        SSTableReader::open(&sstable_path)
-            .err()
-            .expect("truncated SSTable must fail")
-            .to_string(),
-        "SSTable error: SSTable corruption: file is shorter than its footer"
-    );
+    let error = SSTableReader::open(&sstable_path)
+        .err()
+        .expect("truncated SSTable must fail")
+        .to_string();
+    assert!(error.contains(&sstable_path.display().to_string()));
+    assert!(error.contains("[open]"));
+    assert!(error.contains("file is shorter than its footer"));
 }
 
 #[test]
@@ -769,6 +769,10 @@ async fn every_sstable_component_corruption_is_deterministic_and_nonmutating() {
             assert!(
                 message.contains(expected_fragment),
                 "{component}: {message}"
+            );
+            assert!(
+                message.contains(&table.display().to_string()),
+                "{component}: affected file missing from {message}"
             );
             if let Some(first_message) = &first_message {
                 assert_eq!(&message, first_message, "{component}");

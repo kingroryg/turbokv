@@ -190,16 +190,37 @@ impl SSTableWriter {
         value: Option<&[u8]>,
         sequence: u64,
     ) -> Result<()> {
-        // Update min/max keys
-        if self.min_key.is_none() {
-            self.min_key = Some(Bytes::copy_from_slice(key));
-        }
-        self.max_key = Some(Bytes::copy_from_slice(key));
-        self.min_sequence = Some(self.min_sequence.map_or(sequence, |min| min.min(sequence)));
-        self.max_sequence = Some(self.max_sequence.map_or(sequence, |max| max.max(sequence)));
+        self.add_versioned_with_length_limit(key, value, sequence, u32::MAX as usize)
+    }
 
-        // Add to bloom filter
-        self.bloom_filter.insert(key);
+    fn add_versioned_with_length_limit(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        sequence: u64,
+        length_limit: usize,
+    ) -> Result<()> {
+        if self
+            .max_key
+            .as_ref()
+            .is_some_and(|previous| previous.as_ref() >= key)
+        {
+            return Err(Error::SSTable {
+                message: "SSTable keys must be added in strictly increasing order".to_string(),
+                source: None,
+            });
+        }
+
+        for (field, length) in [("key", key.len()), ("value", value.map_or(0, <[u8]>::len))] {
+            if length > length_limit {
+                return Err(Error::SSTable {
+                    message: format!(
+                        "SSTable entry {field} length {length} exceeds encoded limit {length_limit}"
+                    ),
+                    source: None,
+                });
+            }
+        }
 
         // Add to current block
         if !self.add_to_current_block(key, value, sequence) {
@@ -214,6 +235,16 @@ impl SSTableWriter {
                 });
             }
         }
+
+        // Metadata changes only after every fallible validation and write step
+        // for this entry has succeeded.
+        if self.min_key.is_none() {
+            self.min_key = Some(Bytes::copy_from_slice(key));
+        }
+        self.max_key = Some(Bytes::copy_from_slice(key));
+        self.min_sequence = Some(self.min_sequence.map_or(sequence, |min| min.min(sequence)));
+        self.max_sequence = Some(self.max_sequence.map_or(sequence, |max| max.max(sequence)));
+        self.bloom_filter.insert(key);
 
         self.entry_count += 1;
         if value.is_none() {
@@ -567,7 +598,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::storage::sstable::CompressionType;
+    use crate::storage::sstable::{CompressionType, SSTableReader};
 
     fn entry(index: usize) -> (Vec<u8>, Option<Vec<u8>>, u64) {
         let key = vec![index as u8, 0, 0xff, (index * 17) as u8];
@@ -614,5 +645,71 @@ mod tests {
                 assert_eq!(writer.finish().unwrap().file_size, projected);
             }
         }
+    }
+
+    #[test]
+    fn writer_rejects_duplicate_and_descending_keys_before_mutating_the_table() {
+        let directory = TempDir::new().unwrap();
+        for (case, rejected) in [
+            ("duplicate", b"b".as_slice()),
+            ("descending", b"a".as_slice()),
+        ] {
+            let path = directory.path().join(format!("{case}.sst"));
+            let mut writer = SSTableWriter::new(
+                &path,
+                SSTableConfig {
+                    compression: CompressionType::None,
+                    ..SSTableConfig::default()
+                },
+            )
+            .unwrap();
+            writer.add(b"b", Some(b"retained")).unwrap();
+            let error = writer.add(rejected, Some(b"rejected")).unwrap_err();
+            assert!(
+                error.to_string().contains("strictly increasing"),
+                "case={case}: {error}"
+            );
+            writer.add(b"c", Some(b"after-error")).unwrap();
+            let info = writer.finish().unwrap();
+            assert_eq!(info.entry_count, 2, "case={case}");
+
+            let reader = SSTableReader::open(&path).unwrap();
+            assert_eq!(reader.get(b"b").unwrap().unwrap(), b"retained"[..]);
+            if rejected != b"b" {
+                assert!(reader.get(rejected).unwrap().is_none(), "case={case}");
+            }
+            assert_eq!(reader.get(b"c").unwrap().unwrap(), b"after-error"[..]);
+        }
+    }
+
+    #[test]
+    fn writer_length_validation_precedes_metadata_mutation() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("length-validation.sst");
+        let mut writer = SSTableWriter::new(
+            &path,
+            SSTableConfig {
+                compression: CompressionType::None,
+                ..SSTableConfig::default()
+            },
+        )
+        .unwrap();
+        writer.add_versioned(b"a", Some(b"kept"), 10).unwrap();
+
+        let error = writer
+            .add_versioned_with_length_limit(b"b", Some(b"rejected"), 1, 4)
+            .unwrap_err();
+        assert!(error.to_string().contains("value length"), "{error}");
+
+        writer.add_versioned(b"c", Some(b"after"), 20).unwrap();
+        let info = writer.finish().unwrap();
+        assert_eq!(info.entry_count, 2);
+        assert_eq!((info.min_key, info.max_key), (b"a".to_vec(), b"c".to_vec()));
+        assert_eq!((info.min_sequence, info.max_sequence), (10, 20));
+
+        let reader = SSTableReader::open(&path).unwrap();
+        assert_eq!(reader.get(b"a").unwrap().unwrap(), b"kept"[..]);
+        assert!(reader.get(b"b").unwrap().is_none());
+        assert_eq!(reader.get(b"c").unwrap().unwrap(), b"after"[..]);
     }
 }

@@ -29,6 +29,7 @@ use crate::core::{CompactionResult as PublicCompactionResult, MaintenanceOrigin}
 
 use super::directory_lock::DirectoryLock;
 use super::engine::{Result as EngineResult, SstableStatistics, StorageError};
+use super::fd::SSTablePool;
 use super::maintenance::{MaintenanceHealth, MaintenanceOperation};
 use super::manifest::{sync_directory, Manifest, SSTableManifestEntry};
 use super::memtable::MemTableManager;
@@ -803,6 +804,7 @@ pub(super) struct CompactionCoordinator {
     data_dir: PathBuf,
     directory_lock: Weak<DirectoryLock>,
     sstables: Arc<AsyncRwLock<Vec<SSTableInfo>>>,
+    sstable_pool: Arc<SSTablePool>,
     manifest: Arc<AsyncMutex<Manifest>>,
     tombstone_reclamation_sources: TombstoneReclamationSources,
     tombstone_sequence_cache: Arc<Mutex<TombstoneSequenceCache>>,
@@ -903,6 +905,7 @@ impl CompactionCoordinator {
         next_sstable_id: Arc<AtomicU64>,
         directory_lock: Weak<DirectoryLock>,
         sstables: Arc<AsyncRwLock<Vec<SSTableInfo>>>,
+        sstable_pool: Arc<SSTablePool>,
         manifest: Arc<AsyncMutex<Manifest>>,
         tombstone_reclamation_sources: TombstoneReclamationSources,
         sstable_stats: Arc<SstableStatistics>,
@@ -918,6 +921,7 @@ impl CompactionCoordinator {
             data_dir,
             directory_lock,
             sstables,
+            sstable_pool,
             manifest,
             tombstone_reclamation_sources,
             tombstone_sequence_cache: Arc::new(Mutex::new(TombstoneSequenceCache::default())),
@@ -1435,6 +1439,13 @@ impl CompactionCoordinator {
                 .all(|id| live.iter().any(|table| table.id == *id)));
             self.sstable_stats
                 .publish_compaction(&mut live, &input_sstables, &result);
+        }
+
+        // Publication is the retirement boundary for pooled input readers.
+        // Existing scans retain their own `Arc`s, while future lookups can
+        // only populate the pool from the replacement live-file set.
+        for path in &input_paths {
+            self.sstable_pool.remove(path);
         }
 
         if inputs_are_safe_to_unlink {
