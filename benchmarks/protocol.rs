@@ -16,6 +16,8 @@ pub enum Durability {
 
 impl Durability {
     pub const ALL: [Self; 2] = [Self::Durable, Self::Paranoid];
+    pub const DURABLE_ONLY: [Self; 1] = [Self::Durable];
+    pub const PARANOID_ONLY: [Self; 1] = [Self::Paranoid];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -24,18 +26,18 @@ impl Durability {
         }
     }
 
-    pub const fn acknowledgement_policy(self) -> AcknowledgementPolicy {
+    pub const fn acknowledgement_boundary(self) -> AcknowledgementBoundary {
         match self {
-            Self::Durable => AcknowledgementPolicy::WalInOsCache,
-            Self::Paranoid => AcknowledgementPolicy::WalFsync,
+            Self::Durable => AcknowledgementBoundary::ProcessCrashRecoverable,
+            Self::Paranoid => AcknowledgementBoundary::PowerLossDurable,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AcknowledgementPolicy {
-    WalInOsCache,
-    WalFsync,
+pub enum AcknowledgementBoundary {
+    ProcessCrashRecoverable,
+    PowerLossDurable,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -43,6 +45,7 @@ pub enum AcknowledgementPolicy {
 pub enum Profile {
     Quick,
     Release,
+    Paranoid,
 }
 
 impl Profile {
@@ -50,8 +53,9 @@ impl Profile {
         match value {
             "quick" => Ok(Self::Quick),
             "release" => Ok(Self::Release),
+            "paranoid" => Ok(Self::Paranoid),
             _ => Err(format!(
-                "unknown profile {value:?}; expected quick or release"
+                "unknown profile {value:?}; expected quick, release, or paranoid"
             )),
         }
     }
@@ -67,6 +71,14 @@ impl Profile {
                 seed: SEED,
             },
             Self::Release => WorkloadConfig {
+                keys: 200_000,
+                value_bytes: 400,
+                repetitions: 3,
+                scan_passes: 5,
+                recovery_cycles: 5,
+                seed: SEED,
+            },
+            Self::Paranoid => WorkloadConfig {
                 keys: 1_000,
                 value_bytes: 400,
                 repetitions: 3,
@@ -77,10 +89,23 @@ impl Profile {
         }
     }
 
+    pub const fn durabilities(self) -> &'static [Durability] {
+        match self {
+            Self::Quick => &Durability::ALL,
+            Self::Release => &Durability::DURABLE_ONLY,
+            Self::Paranoid => &Durability::PARANOID_ONLY,
+        }
+    }
+
+    const fn requires_release_controls(self) -> bool {
+        matches!(self, Self::Release | Self::Paranoid)
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Quick => "quick",
             Self::Release => "release",
+            Self::Paranoid => "paranoid",
         }
     }
 }
@@ -131,14 +156,16 @@ impl Cli {
                 _ => return Err(format!("unknown argument {arg:?}\n{}", usage())),
             }
         }
-        if profile == Profile::Release && !confirm_release {
+        if profile.requires_release_controls() && !confirm_release {
             return Err(
-                "the release profile performs repeated durable and sync-per-write runs; rerun with --confirm-release"
+                "release and paranoid profiles perform repeated persistence workloads; rerun with --confirm-release"
                     .to_string(),
             );
         }
-        if profile == Profile::Release && machine.is_none() {
-            return Err("release benchmarks require a stable name via --machine".to_string());
+        if profile.requires_release_controls() && machine.is_none() {
+            return Err(
+                "release and paranoid benchmarks require a stable name via --machine".to_string(),
+            );
         }
         Ok(Self {
             profile,
@@ -149,7 +176,7 @@ impl Cli {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- --profile quick|release [--output DIR] [--machine NAME] [--confirm-release]"
+    "usage: cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- --profile quick|release|paranoid [--output DIR] [--machine NAME] [--confirm-release]"
 }
 
 pub fn percentile(sorted_values: &[u64], percentile: u32) -> u64 {
@@ -161,9 +188,9 @@ pub fn percentile(sorted_values: &[u64], percentile: u32) -> u64 {
 }
 
 pub fn ensure_release_reproducible(profile: Profile, git_dirty: bool) -> Result<(), String> {
-    if profile == Profile::Release && git_dirty {
+    if profile.requires_release_controls() && git_dirty {
         return Err(
-            "release benchmarks require a clean Git worktree so the recorded commit identifies the measured source"
+            "release and paranoid benchmarks require a clean Git worktree so the recorded commit identifies the measured source"
                 .to_string(),
         );
     }

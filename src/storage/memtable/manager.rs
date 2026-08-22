@@ -25,6 +25,7 @@ use tracing::info;
 use super::table::{MemTable, MemTableError, Result};
 use super::types::{
     estimated_memtable_entry_size, MemTableConfig, MemTableEntry, MemTableManagerStats,
+    MemTableStats,
 };
 use crate::storage::version::VersionOrder;
 
@@ -261,10 +262,13 @@ impl MemTableManager {
         if active.is_read_only() {
             return Err(MemTableError::ReadOnly);
         }
+        let timestamp = std::time::Instant::now();
         for ((key, value), &sequence) in entries.iter().zip(sequences) {
             match value {
-                Some(value) => active.insert_batch_entry_prelocked(key, value, sequence),
-                None => active.delete_batch_entry_prelocked(key, sequence),
+                Some(value) => {
+                    active.insert_batch_entry_prelocked(key, value, sequence, timestamp);
+                }
+                None => active.delete_batch_entry_prelocked(key, sequence, timestamp),
             }
         }
         let should_rotate = active.should_flush();
@@ -401,7 +405,7 @@ impl MemTableManager {
         for (generation_rank, table) in self.immutable.read().iter().enumerate() {
             if let Some(entry) = table.get_entry(key) {
                 let generation_rank = generation_rank as u64;
-                if newest.as_ref().map_or(true, |(current, current_rank)| {
+                if newest.as_ref().is_none_or(|(current, current_rank)| {
                     memory_entry_is_newer(&entry, generation_rank, current, *current_rank)
                 }) {
                     newest = Some((entry, generation_rank));
@@ -547,7 +551,7 @@ impl MemTableManager {
         self.immutable
             .read()
             .iter()
-            .filter(|table| excluded.map_or(true, |excluded| !Arc::ptr_eq(table, excluded)))
+            .filter(|table| excluded.is_none_or(|excluded| !Arc::ptr_eq(table, excluded)))
             .filter_map(|table| table.sequence_bounds().map(|(min, _)| min))
             .chain(active_min)
             .min()
@@ -606,7 +610,7 @@ impl MemTableManager {
         let mut merge_table = |table: &MemTable, generation_rank: u64| {
             for (key, entry) in table.get_all_entries() {
                 if include(&key)
-                    && merged.get(&key).map_or(true, |(current, current_rank)| {
+                    && merged.get(&key).is_none_or(|(current, current_rank)| {
                         memory_entry_is_newer(&entry, generation_rank, current, *current_rank)
                     })
                 {
@@ -630,18 +634,27 @@ impl MemTableManager {
     /// The synchronous sample can block briefly on buffer/table locks and is
     /// not a transactional snapshot with concurrent mutations.
     pub fn stats(&self) -> MemTableManagerStats {
+        self.sample_stats(MemTable::stats)
+    }
+
+    /// Samples constant-time counters for engine monitoring.
+    pub(crate) fn counter_stats(&self) -> MemTableManagerStats {
+        self.sample_stats(MemTable::counter_stats)
+    }
+
+    fn sample_stats(&self, sample_table: fn(&MemTable) -> MemTableStats) -> MemTableManagerStats {
         // Ordinary buffered inserts publish only atomics. This shared lock
         // coordinates sampling with the less frequent batched handoff into the
         // active table, never with the per-insert fast path.
         let _handoff = self.buffer_handoff.read();
         let buffered_versions = self.buffered_versions.load(Ordering::Acquire);
         let buffered_bytes = self.buffered_bytes.load(Ordering::Relaxed);
-        let active_stats = self.active.read().stats();
+        let active_stats = sample_table(&self.active.read());
         let immutable_stats: Vec<_> = self
             .immutable
             .read()
             .iter()
-            .map(|table| table.stats())
+            .map(|table| sample_table(table))
             .collect();
 
         MemTableManagerStats {

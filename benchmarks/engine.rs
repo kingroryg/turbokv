@@ -1,41 +1,38 @@
-use crate::protocol::{AcknowledgementPolicy, Durability, MEMTABLE_BYTES};
+use crate::protocol::{AcknowledgementBoundary, Durability, MEMTABLE_BYTES};
 use fjall::{
     CompressionType as FjallCompression, Config as FjallConfig, Keyspace, PartitionCreateOptions,
     PartitionHandle, PersistMode,
 };
-use rocksdb::statistics::Ticker;
-use rocksdb::{
-    BlockBasedOptions, DBCompressionType, Direction, FlushOptions, IteratorMode,
-    Options as RocksOptions, WriteOptions, DB,
+use redb::{
+    Database as RedbDatabase, Durability as RedbDurability, ReadableTableMetadata, TableDefinition,
 };
 use serde::Serialize;
-use std::cell::RefCell;
-use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::MetadataExt;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use turbokv::{Engine, PhysicalStats, StorageConfig, StorageError, WalConfig};
 
 pub type DynError = Box<dyn std::error::Error>;
 
-const ROCKS_MAX_TOTAL_WAL_BYTES: u64 = 1024 * 1024 * 1024;
+const REDB_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bench");
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineName {
     TurboKv,
     Fjall,
-    RocksDb,
+    Redb,
 }
 
 impl EngineName {
-    pub const ALL: [Self; 3] = [Self::TurboKv, Self::Fjall, Self::RocksDb];
+    pub const ALL: [Self; 3] = [Self::TurboKv, Self::Fjall, Self::Redb];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TurboKv => "turbokv",
             Self::Fjall => "fjall",
-            Self::RocksDb => "rocksdb",
+            Self::Redb => "redb",
         }
     }
 }
@@ -79,85 +76,41 @@ struct FjallState {
     acknowledgement_persist_mode: PersistMode,
 }
 
-struct RocksState {
-    db: DB,
-    options: RocksOptions,
-    write_options: WriteOptions,
+struct RedbState {
+    db: Mutex<RedbDatabase>,
     path: PathBuf,
-    full_sync_after_put: bool,
-    active_wal: RefCell<Option<PinnedWal>>,
+    commit_durability: RedbDurability,
+    full_sync_after_commit: bool,
 }
 
-struct PinnedWal {
-    path: PathBuf,
-    file: File,
-    device: u64,
-    inode: u64,
-    synced_len: u64,
-}
-
-impl RocksState {
-    fn sync_active_wal_with_full_barrier(&self) -> Result<(), DynError> {
-        if self.active_wal.borrow().is_none() {
-            let wal_path = fs::read_dir(&self.path)?
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
-                .max()
-                .ok_or("RocksDB acknowledged a write without an active WAL file")?;
-            let wal = OpenOptions::new().read(true).write(true).open(&wal_path)?;
-            let metadata = wal.metadata()?;
-            self.active_wal.replace(Some(PinnedWal {
-                path: wal_path,
-                file: wal,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                synced_len: 0,
-            }));
-        }
-        let mut active_wal = self.active_wal.borrow_mut();
-        let wal = active_wal.as_mut().expect("active WAL was initialized");
-        let handle_metadata = wal.file.metadata()?;
-        let path_metadata = wal.path.metadata()?;
-        if handle_metadata.dev() != wal.device
-            || handle_metadata.ino() != wal.inode
-            || path_metadata.dev() != wal.device
-            || path_metadata.ino() != wal.inode
-        {
-            return Err("RocksDB rotated or replaced the pinned WAL during a write epoch".into());
-        }
-        if handle_metadata.len() <= wal.synced_len {
-            return Err("RocksDB WAL did not grow after flush_wal(false); refusing to claim a full-sync acknowledgement".into());
-        }
-        wal.file.sync_all()?;
-        wal.synced_len = handle_metadata.len();
-        Ok(())
+impl RedbState {
+    fn lock(&self) -> Result<MutexGuard<'_, RedbDatabase>, DynError> {
+        self.db
+            .lock()
+            .map_err(|_| "redb database mutex was poisoned".into())
     }
 
-    fn forget_active_wal(&self) {
-        self.active_wal.replace(None);
-    }
-
-    fn full_sync_database_files(&self) -> Result<(), DynError> {
-        for entry in fs::read_dir(&self.path)? {
-            let path = entry?.path();
-            if path.is_file() {
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(path)?
-                    .sync_all()?;
-            }
-        }
+    fn sync_file(&self) -> Result<(), DynError> {
         File::open(&self.path)?.sync_all()?;
         Ok(())
     }
 }
 
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), DynError> {
+    File::open(path.parent().ok_or("redb path has no parent directory")?)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), DynError> {
+    Ok(())
+}
+
 enum State {
     Turbo(Box<Engine>),
     Fjall(FjallState),
-    Rocks(Box<RocksState>),
+    Redb(RedbState),
 }
 
 pub struct Database {
@@ -183,27 +136,27 @@ impl Database {
 
     pub async fn reopen(&mut self) -> Result<(), DynError> {
         self.state.take();
-        let handoff_started = Instant::now();
-        loop {
-            match open_state(self.name, self.durability, &self.path).await {
-                Ok(state) => {
-                    self.state = Some(state);
-                    break;
-                }
-                Err(error)
-                    if self.name == EngineName::TurboKv
-                        && handoff_started.elapsed() < Duration::from_secs(5)
-                        && matches!(
-                            error.downcast_ref::<StorageError>(),
-                            Some(StorageError::DirectoryLocked { .. })
-                        ) =>
-                {
-                    tokio::task::yield_now().await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        self.state = Some(open_state_after_handoff(self.name, self.durability, &self.path).await?);
         Ok(())
+    }
+
+    /// Open after this benchmark deliberately dropped an earlier handle.
+    ///
+    /// `TurboKV` background work may briefly retain directory ownership after
+    /// `Engine` drop. Setup/recovery handoff waits for that same-process owner;
+    /// ordinary benchmark opens retain the product's immediate contention
+    /// error contract through [`Self::open`].
+    pub async fn open_after_handoff(
+        name: EngineName,
+        durability: Durability,
+        path: &Path,
+    ) -> Result<Self, DynError> {
+        Ok(Self {
+            name,
+            durability,
+            path: path.to_path_buf(),
+            state: Some(open_state_after_handoff(name, durability, path).await?),
+        })
     }
 
     pub fn drop_without_settlement(&mut self) {
@@ -217,11 +170,17 @@ impl Database {
                 state.partition.insert(key, value)?;
                 state.keyspace.persist(state.acknowledgement_persist_mode)?;
             }
-            State::Rocks(state) => {
-                state.db.put_opt(key, value, &state.write_options)?;
-                state.db.flush_wal(false)?;
-                if state.full_sync_after_put {
-                    state.sync_active_wal_with_full_barrier()?;
+            State::Redb(state) => {
+                let db = state.lock()?;
+                let mut transaction = db.begin_write()?;
+                transaction.set_durability(state.commit_durability);
+                {
+                    let mut table = transaction.open_table(REDB_TABLE)?;
+                    table.insert(key, value)?;
+                }
+                transaction.commit()?;
+                if state.full_sync_after_commit {
+                    state.sync_file()?;
                 }
             }
         }
@@ -232,7 +191,12 @@ impl Database {
         let value = match self.state()? {
             State::Turbo(engine) => engine.get(key).await?,
             State::Fjall(state) => state.partition.get(key)?.map(|value| value.to_vec()),
-            State::Rocks(state) => state.db.get(key)?,
+            State::Redb(state) => {
+                let db = state.lock()?;
+                let transaction = db.begin_read()?;
+                let table = transaction.open_table(REDB_TABLE)?;
+                table.get(key)?.map(|value| value.value().to_vec())
+            }
         };
         Ok(value)
     }
@@ -256,14 +220,14 @@ impl Database {
                     checksum ^= checksum_pair(&key, &value);
                 }
             }
-            State::Rocks(state) => {
-                for entry in state
-                    .db
-                    .iterator(IteratorMode::From(b"", Direction::Forward))
-                {
+            State::Redb(state) => {
+                let db = state.lock()?;
+                let transaction = db.begin_read()?;
+                let table = transaction.open_table(REDB_TABLE)?;
+                for entry in table.range::<&[u8]>(..)? {
                     let (key, value) = entry?;
                     count += 1;
-                    checksum ^= checksum_pair(&key, &value);
+                    checksum ^= checksum_pair(key.value(), value.value());
                 }
             }
         }
@@ -277,13 +241,12 @@ impl Database {
                 state.keyspace.persist(PersistMode::SyncAll)?;
                 state.partition.rotate_memtable_and_wait()?;
             }
-            State::Rocks(state) => {
-                state.db.flush_wal(true)?;
-                let mut options = FlushOptions::default();
-                options.set_wait(true);
-                state.db.flush_opt(&options)?;
-                state.forget_active_wal();
-                state.full_sync_database_files()?;
+            State::Redb(state) => {
+                let db = state.lock()?;
+                let mut transaction = db.begin_write()?;
+                transaction.set_durability(RedbDurability::Immediate);
+                transaction.commit()?;
+                state.sync_file()?;
             }
         }
         Ok(())
@@ -295,9 +258,9 @@ impl Database {
                 engine.compact().await?;
             }
             State::Fjall(state) => state.partition.major_compact()?,
-            State::Rocks(state) => {
-                state.db.compact_range::<&[u8], &[u8]>(None, None);
-                state.full_sync_database_files()?;
+            State::Redb(state) => {
+                state.lock()?.compact()?;
+                state.sync_file()?;
             }
         }
         Ok(())
@@ -322,7 +285,11 @@ impl Database {
         let keys = match self.state()? {
             State::Turbo(engine) => engine.logical_stats().await?.live_keys,
             State::Fjall(state) => u64::try_from(state.partition.len()?)?,
-            State::Rocks(_) => self.scan_all().await?.0,
+            State::Redb(state) => {
+                let db = state.lock()?;
+                let transaction = db.begin_read()?;
+                transaction.open_table(REDB_TABLE)?.len()?
+            }
         };
         Ok(keys)
     }
@@ -330,17 +297,7 @@ impl Database {
     pub fn counters(&self) -> Result<StorageCounters, DynError> {
         let counters = match self.state()? {
             State::Turbo(engine) => turbo_counters(&engine.physical_stats()),
-            State::Fjall(_) => StorageCounters::default(),
-            State::Rocks(state) => StorageCounters {
-                wal_bytes_written: Some(state.options.get_ticker_count(Ticker::WalFileBytes)),
-                flush_bytes_written: Some(state.options.get_ticker_count(Ticker::FlushWriteBytes)),
-                compaction_bytes_read: Some(
-                    state.options.get_ticker_count(Ticker::CompactReadBytes),
-                ),
-                compaction_bytes_written: Some(
-                    state.options.get_ticker_count(Ticker::CompactWriteBytes),
-                ),
-            },
+            State::Fjall(_) | State::Redb(_) => StorageCounters::default(),
         };
         Ok(counters)
     }
@@ -366,13 +323,17 @@ async fn open_state(
 ) -> Result<State, DynError> {
     match name {
         EngineName::TurboKv => {
-            let mut config = match durability.acknowledgement_policy() {
-                AcknowledgementPolicy::WalInOsCache => StorageConfig::durable(path.to_path_buf()),
-                AcknowledgementPolicy::WalFsync => StorageConfig::paranoid(path.to_path_buf()),
+            let mut config = match durability.acknowledgement_boundary() {
+                AcknowledgementBoundary::ProcessCrashRecoverable => {
+                    StorageConfig::durable(path.to_path_buf())
+                }
+                AcknowledgementBoundary::PowerLossDurable => {
+                    StorageConfig::paranoid(path.to_path_buf())
+                }
             };
-            config.wal_config = match durability.acknowledgement_policy() {
-                AcknowledgementPolicy::WalInOsCache => WalConfig::durable(),
-                AcknowledgementPolicy::WalFsync => WalConfig::paranoid()
+            config.wal_config = match durability.acknowledgement_boundary() {
+                AcknowledgementBoundary::ProcessCrashRecoverable => WalConfig::durable(),
+                AcknowledgementBoundary::PowerLossDurable => WalConfig::paranoid()
                     .with_group_commit_delay(Duration::ZERO)
                     .with_max_group_size(1),
             };
@@ -397,9 +358,9 @@ async fn open_state(
                     .manual_journal_persist(true)
                     .max_memtable_size(MEMTABLE_BYTES as u32),
             )?;
-            let acknowledgement_persist_mode = match durability.acknowledgement_policy() {
-                AcknowledgementPolicy::WalInOsCache => PersistMode::Buffer,
-                AcknowledgementPolicy::WalFsync => PersistMode::SyncAll,
+            let acknowledgement_persist_mode = match durability.acknowledgement_boundary() {
+                AcknowledgementBoundary::ProcessCrashRecoverable => PersistMode::Buffer,
+                AcknowledgementBoundary::PowerLossDurable => PersistMode::SyncAll,
             };
             Ok(State::Fjall(FjallState {
                 keyspace,
@@ -407,33 +368,58 @@ async fn open_state(
                 acknowledgement_persist_mode,
             }))
         }
-        EngineName::RocksDb => {
-            let mut options = RocksOptions::default();
-            options.create_if_missing(true);
-            options.set_compression_type(DBCompressionType::None);
-            options.set_write_buffer_size(MEMTABLE_BYTES);
-            options.set_max_total_wal_size(ROCKS_MAX_TOTAL_WAL_BYTES);
-            options.set_max_background_jobs(1);
-            options.set_disable_auto_compactions(true);
-            options.set_use_fsync(true);
-            options.enable_statistics();
-            options.set_stats_dump_period_sec(0);
-            let mut table = BlockBasedOptions::default();
-            table.disable_cache();
-            options.set_block_based_table_factory(&table);
-            let db = DB::open(&options, path)?;
-            let mut write_options = WriteOptions::default();
-            let full_sync = durability.acknowledgement_policy() == AcknowledgementPolicy::WalFsync;
-            write_options.set_sync(false);
-            write_options.disable_wal(false);
-            Ok(State::Rocks(Box::new(RocksState {
-                db,
-                options,
-                write_options,
-                path: path.to_path_buf(),
-                full_sync_after_put: full_sync,
-                active_wal: RefCell::new(None),
-            })))
+        EngineName::Redb => {
+            fs::create_dir_all(path)?;
+            let database_path = path.join("bench.redb");
+            let initialize_table = !database_path.exists();
+            let mut builder = RedbDatabase::builder();
+            builder.set_cache_size(0);
+            let db = builder.create(&database_path)?;
+            if initialize_table {
+                let mut transaction = db.begin_write()?;
+                transaction.set_durability(RedbDurability::Immediate);
+                transaction.open_table(REDB_TABLE)?;
+                transaction.commit()?;
+                File::open(&database_path)?.sync_all()?;
+                sync_parent_directory(&database_path)?;
+            }
+            let (commit_durability, full_sync_after_commit) =
+                match durability.acknowledgement_boundary() {
+                    AcknowledgementBoundary::ProcessCrashRecoverable => {
+                        (RedbDurability::Eventual, false)
+                    }
+                    AcknowledgementBoundary::PowerLossDurable => (RedbDurability::Immediate, true),
+                };
+            Ok(State::Redb(RedbState {
+                db: Mutex::new(db),
+                path: database_path,
+                commit_durability,
+                full_sync_after_commit,
+            }))
+        }
+    }
+}
+
+async fn open_state_after_handoff(
+    name: EngineName,
+    durability: Durability,
+    path: &Path,
+) -> Result<State, DynError> {
+    let handoff_started = Instant::now();
+    loop {
+        match open_state(name, durability, path).await {
+            Ok(state) => return Ok(state),
+            Err(error)
+                if name == EngineName::TurboKv
+                    && handoff_started.elapsed() < Duration::from_secs(5)
+                    && matches!(
+                        error.downcast_ref::<StorageError>(),
+                        Some(StorageError::DirectoryLocked { .. })
+                    ) =>
+            {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error),
         }
     }
 }

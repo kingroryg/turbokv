@@ -134,6 +134,10 @@ impl SSTableWriter {
     /// The call performs synchronous filesystem I/O and allocates block, index,
     /// and Bloom-filter builders. It does not make the empty file durable.
     /// Returns an I/O error if the path cannot be opened for replacement.
+    /// This low-level constructor does not acquire `.turbokv.lock`; direct
+    /// callers must exclusively own the containing database directory and must
+    /// not target a path managed by a live [`Db`](crate::Db) or
+    /// [`Engine`](crate::storage::engine::Engine).
     pub fn new(path: impl AsRef<Path>, config: SSTableConfig) -> Result<Self> {
         Self::new_with_format(path, config, SSTABLE_VERSION)
     }

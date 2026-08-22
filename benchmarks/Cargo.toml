@@ -9,12 +9,12 @@ autobenches = false
 
 [dependencies]
 fjall = "=2.11.2"
-rocksdb = { version = "=0.22.0", default-features = false }
+redb = "=2.6.3"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.148"
 tempfile = "=3.24.0"
 tokio = { version = "=1.49.0", features = ["macros", "rt-multi-thread", "time"] }
-turbokv = { path = "..", version = "=0.5.0" }
+turbokv = { path = "..", version = "=0.6.0" }
 
 [[bench]]
 name = "benchmarks"
@@ -26,8 +26,16 @@ name = "benchmark_protocol"
 path = "protocol_tests.rs"
 
 [[test]]
+name = "adapter_contract"
+path = "adapter_tests.rs"
+
+[[test]]
 name = "published_claims"
 path = "published_claims.rs"
+
+[[test]]
+name = "human_report"
+path = "human_report_tests.rs"
 
 [lints.rust]
 unsafe_code = "forbid"

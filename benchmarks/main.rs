@@ -46,6 +46,7 @@ struct Protocol {
     acknowledgement_boundary: &'static str,
     settled_boundary: &'static str,
     recovery_boundary: &'static str,
+    production_scale_rule: &'static str,
     common: CommonSettings,
     os_page_cache: &'static str,
     mixed_read_percent: u32,
@@ -54,7 +55,7 @@ struct Protocol {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct CommonSettings {
-    wal_enabled: bool,
+    durable_storage_enabled: bool,
     batch_size: u32,
     concurrency: u32,
     key_bytes: usize,
@@ -74,7 +75,7 @@ struct DurabilityClass {
 struct EngineSettings {
     engine: EngineName,
     version: &'static str,
-    wal: &'static str,
+    storage_model: &'static str,
     acknowledgement_modes: Vec<EngineDurabilitySettings>,
     settlement: &'static str,
     automatic_flush_workers: &'static str,
@@ -131,6 +132,7 @@ struct Summary {
 
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
+    workloads::run_crash_child_if_requested().await?;
     let cli = match Cli::parse(env::args().skip(1)) {
         Ok(cli) => cli,
         Err(message) => {
@@ -162,12 +164,12 @@ async fn run(profile: Profile, environment: Environment) -> Result<Report, DynEr
     let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let dataset = profile.defaults();
     let mut results = Vec::with_capacity(
-        Durability::ALL.len()
+        profile.durabilities().len()
             * dataset.repetitions as usize
             * Workload::ALL.len()
             * EngineName::ALL.len(),
     );
-    for (durability_index, durability) in Durability::ALL.into_iter().enumerate() {
+    for (durability_index, &durability) in profile.durabilities().iter().enumerate() {
         for repetition in 1..=dataset.repetitions {
             for (workload_index, workload) in Workload::ALL.into_iter().enumerate() {
                 let rotation = (durability_index + repetition as usize - 1 + workload_index)
@@ -188,13 +190,13 @@ async fn run(profile: Profile, environment: Environment) -> Result<Report, DynEr
             }
         }
     }
-    let summaries = summaries(&results);
+    let summaries = summaries(&results, profile.durabilities());
     Ok(Report {
-        schema_version: 4,
+        schema_version: 6,
         generated_unix_seconds,
         profile,
         dataset,
-        protocol: protocol_settings(),
+        protocol: protocol_settings(profile),
         engine_settings: engine_settings(),
         counter_availability: counter_availability(),
         environment,
@@ -206,24 +208,28 @@ async fn run(profile: Profile, environment: Environment) -> Result<Report, DynEr
     })
 }
 
-fn protocol_settings() -> Protocol {
+fn protocol_settings(profile: Profile) -> Protocol {
     Protocol {
-        durability_classes: vec![
-            DurabilityClass {
-                durability: Durability::Durable,
-                acknowledgement:
-                    "the mutation's WAL bytes have been flushed from engine/process buffering to the operating-system page cache; no fsync is performed",
-                comparison_rule:
-                    "process-crash durability only; compare throughput only with other durable rows",
-            },
-            DurabilityClass {
-                durability: Durability::Paranoid,
-                acknowledgement:
-                    "the mutation's WAL bytes have crossed a macOS full-storage synchronization barrier before acknowledgement",
-                comparison_rule:
-                    "power-loss-oriented full-sync boundary; compare throughput only with other paranoid rows",
-            },
-        ],
+        durability_classes: profile
+            .durabilities()
+            .iter()
+            .map(|durability| match durability {
+                Durability::Durable => DurabilityClass {
+                    durability: *durability,
+                    acknowledgement:
+                        "the engine's acknowledged recovery state has reached its named non-full-sync operating-system persistence boundary",
+                    comparison_rule:
+                        "process-crash durability only; compare throughput only with other durable rows",
+                },
+                Durability::Paranoid => DurabilityClass {
+                    durability: *durability,
+                    acknowledgement:
+                        "the engine's acknowledged recovery state has crossed a macOS full-storage synchronization barrier",
+                    comparison_rule:
+                        "power-loss-oriented full-sync boundary; compare throughput only with other paranoid rows",
+                },
+            })
+            .collect(),
         workloads: Workload::ALL
             .into_iter()
             .map(Workload::as_str)
@@ -237,9 +243,11 @@ fn protocol_settings() -> Protocol {
         settled_boundary:
             "acknowledgement followed by synchronous forced flush and two manual compaction drains for mutation workloads",
         recovery_boundary:
-            "time to hand off in-process directory ownership and reopen a WAL-only database; verification is after and excluded from the timed reopen",
+            "time to reopen after a subprocess acknowledged a marker and exited without running database destructors; post-open marker verification is excluded",
+        production_scale_rule:
+            "release durable logical key-plus-value bytes exceed the configured LSM memtable; quick and paranoid profiles are explicitly bounded and are not production-scale ingest evidence",
         common: CommonSettings {
-            wal_enabled: true,
+            durable_storage_enabled: true,
             batch_size: 1,
             concurrency: 1,
             key_bytes: KEY_BYTES,
@@ -257,14 +265,15 @@ fn engine_settings() -> Vec<EngineSettings> {
     vec![
         EngineSettings {
             engine: EngineName::TurboKv,
-            version: "0.5.0 (path source measured at report git commit)",
-            wal: "enabled; one record per mutation",
+            version: "0.6.0 (path source measured at report git commit)",
+            storage_model: "write-ahead log; one record per mutation",
             acknowledgement_modes: vec![
                 EngineDurabilitySettings {
                     durability: Durability::Durable,
                     acknowledgement:
-                        "StorageConfig/WalConfig::durable; direct WAL write with sync_on_write=false",
-                    conservative_difference: "none",
+                        "StorageConfig/WalConfig::durable; committed v5 record through a physically reserved shared WAL mapping, with ordered file-write fallback, and sync_on_write=false",
+                    conservative_difference:
+                        "TurboKV reserves active-WAL capacity in bounded chunks; unsupported allocation APIs retain the ordered-write path",
                 },
                 EngineDurabilitySettings {
                     durability: Durability::Paranoid,
@@ -284,7 +293,7 @@ fn engine_settings() -> Vec<EngineSettings> {
         EngineSettings {
             engine: EngineName::Fjall,
             version: "fjall 2.11.2",
-            wal: "manual journal persistence enabled on keyspace and partition",
+            storage_model: "write-ahead journal; manual persistence enabled on keyspace and partition",
             acknowledgement_modes: vec![
                 EngineDurabilitySettings {
                     durability: Durability::Durable,
@@ -301,38 +310,39 @@ fn engine_settings() -> Vec<EngineSettings> {
                         "full-sync call is keyspace-wide; the benchmark has one partition and one caller",
                 },
             ],
-            settlement: "SyncAll, rotate_memtable_and_wait, major_compact",
+            settlement:
+                "SyncAll, rotate_memtable_and_wait, then two major_compact calls",
             automatic_flush_workers: "one",
             automatic_compaction_workers: "zero; all compaction is explicit and foreground",
             differences:
                 "manual compaction has no public byte counters in the pinned version",
         },
         EngineSettings {
-            engine: EngineName::RocksDb,
-            version: "rust-rocksdb 0.22.0; native RocksDB 8.10.0",
-            wal: "enabled (disable_wal=false); one Put per mutation",
+            engine: EngineName::Redb,
+            version: "redb 2.6.3",
+            storage_model: "copy-on-write B-tree; one transaction per mutation",
             acknowledgement_modes: vec![
                 EngineDurabilitySettings {
                     durability: Durability::Durable,
                     acknowledgement:
-                        "WriteOptions::sync=false followed by DB::flush_wal(false), moving WAL bytes from RocksDB buffering to OS buffers without fsync",
-                    conservative_difference: "none",
+                        "one write transaction committed with redb Durability::Eventual",
+                    conservative_difference:
+                        "redb has no exact buffer-only durability level; Eventual queues persistence and is a conservative, potentially stronger boundary than TurboKV durable mode",
                 },
                 EngineDurabilitySettings {
                     durability: Durability::Paranoid,
                     acknowledgement:
-                        "WriteOptions::sync=false followed by DB::flush_wal(false), then Rust File::sync_all on a pinned and identity/size-validated active WAL",
+                        "one write transaction committed with redb Durability::Immediate, followed by Rust File::sync_all on the database file",
                     conservative_difference:
-                        "the adapter seam is necessary because bundled RocksDB 8.10.0 omits HAVE_FULLFSYNC on Darwin; a 64 MiB write buffer and 1 GiB max total WAL size prevent automatic rotation within the bounded write epoch, and any pinned-file identity or growth anomaly aborts the run",
+                        "redb commits a complete copy-on-write transaction rather than a WAL-only mutation; the extra full-file barrier preserves the benchmark's macOS power-loss boundary",
                 },
             ],
             settlement:
-                "FlushWAL(sync=true), blocking Flush, and manual full-range compaction, with Rust File::sync_all applied to every regular database file and the database directory after each blocking maintenance call",
-            automatic_flush_workers: "one shared maximum background job",
-            automatic_compaction_workers:
-                "zero automatic compaction; manual compaction uses the one shared background job",
+                "empty Immediate transaction, then two Database::compact calls, each followed by Rust File::sync_all",
+            automatic_flush_workers: "none; commits write copy-on-write pages directly",
+            automatic_compaction_workers: "none; compaction is explicit and foreground",
             differences:
-                "use_fsync=true remains configured, but both acknowledgement and settlement add explicit Rust full-sync adapter seams because the native Darwin build has the weaker fsync",
+                "pure-Rust copy-on-write B-tree with single-writer transactions, not an LSM; compression and memtables are not applicable, and the configurable cache is disabled",
         },
     ]
 }
@@ -357,23 +367,21 @@ fn counter_availability() -> Vec<CounterAvailability> {
             amplification: "unavailable because component byte counters are unavailable; JSON null",
         },
         CounterAvailability {
-            engine: EngineName::RocksDb,
+            engine: EngineName::Redb,
             disk_bytes: "recursive exact file length at measurement boundary",
-            wal_bytes: "exact RocksDB WalFileBytes ticker delta",
-            flush_bytes: "exact RocksDB FlushWriteBytes ticker delta",
-            compaction_bytes: "exact RocksDB CompactReadBytes/CompactWriteBytes ticker deltas",
-            amplification:
-                "WAL + flush output + compaction output divided by timed logical mutation bytes",
+            wal_bytes: "unavailable in redb 2.6.3 public API; JSON null",
+            flush_bytes: "unavailable because redb writes copy-on-write pages at commit; JSON null",
+            compaction_bytes: "unavailable in redb 2.6.3 public API; JSON null",
+            amplification: "unavailable because component byte counters are unavailable; JSON null",
         },
     ]
 }
 
 fn direct_dependencies() -> BTreeMap<String, String> {
     [
-        ("turbokv", "0.5.0 path"),
+        ("turbokv", "0.6.0 path"),
         ("fjall", "2.11.2"),
-        ("rocksdb", "0.22.0"),
-        ("native-rocksdb", "8.10.0"),
+        ("redb", "2.6.3"),
         ("serde", "1.0.228"),
         ("serde_json", "1.0.148"),
         ("tempfile", "3.24.0"),
@@ -384,11 +392,11 @@ fn direct_dependencies() -> BTreeMap<String, String> {
     .collect()
 }
 
-fn summaries(results: &[Measurement]) -> Vec<Summary> {
+fn summaries(results: &[Measurement], durabilities: &[Durability]) -> Vec<Summary> {
     let mut output =
-        Vec::with_capacity(EngineName::ALL.len() * Durability::ALL.len() * Workload::ALL.len());
+        Vec::with_capacity(EngineName::ALL.len() * durabilities.len() * Workload::ALL.len());
     for engine in EngineName::ALL {
-        for durability in Durability::ALL {
+        for &durability in durabilities {
             for workload in Workload::ALL {
                 let matching = results
                     .iter()
@@ -498,7 +506,7 @@ fn git_blob_hash(content: &str) -> Result<String, DynError> {
 
 fn human_report(report: &Report) -> String {
     let mut output = format!(
-        "TurboKV durability-equivalent baseline protocol v{} ({})\ncommit: {}{}\nsource manifest git hash: {}\nmachine: {} / {} / {} / {} bytes RAM\nenvironment: {} / {} / {} CPUs / filesystem {} / {}\ndataset: {} keys, {}-byte keys, {}-byte values, seed {:#x}, {} repetition(s)\nequivalence: WAL {}; durable and paranoid classes reported separately; compression {}; block cache {} bytes; batch {}; concurrency {}; memtable {} bytes\nbenchmark Cargo.lock fnv1a64: {}\n\n",
+        "TurboKV durability-equivalent baseline protocol v{} ({})\ncommit: {}{}\nsource manifest git hash: {}\nmachine: {} / {} / {} / {} bytes RAM\nenvironment: {} / {} / {} CPUs / filesystem {} / {}\ndataset: {} keys, {}-byte keys, {}-byte values, seed {:#x}, {} repetition(s)\nequivalence: durable storage; durable and paranoid classes reported separately; compression {} where applicable; configured block cache {} bytes; batch {}; concurrency {}; LSM memtable {} bytes (redb uses a copy-on-write B-tree)\nbenchmark Cargo.lock fnv1a64: {}\n\n",
         report.schema_version,
         report.profile.as_str(),
         report.environment.git_commit,
@@ -518,11 +526,6 @@ fn human_report(report: &Report) -> String {
         report.dataset.value_bytes,
         report.dataset.seed,
         report.dataset.repetitions,
-        if report.protocol.common.wal_enabled {
-            "on"
-        } else {
-            "off"
-        },
         report.protocol.common.compression,
         report.protocol.common.block_cache_bytes,
         report.protocol.common.batch_size,
@@ -530,6 +533,12 @@ fn human_report(report: &Report) -> String {
         report.protocol.common.memtable_bytes,
         report.benchmark_lock_fnv1a64,
     );
+    output.push_str("resolved dependencies (benchmark Cargo.lock):\n");
+    for (name, versions) in &report.resolved_dependencies {
+        writeln!(output, "  {name}: {}", versions.join(", "))
+            .expect("writing to a String cannot fail");
+    }
+    output.push('\n');
     output.push_str("engine    mode      workload          run  ack ops/s  settled ops/s  p50 ns  p95 ns  p99 ns  max ns  disk bytes  wal bytes  flush bytes  compact r/w\n");
     for result in &report.results {
         writeln!(
@@ -550,6 +559,23 @@ fn human_report(report: &Report) -> String {
             optional(result.flush_bytes_written),
             optional(result.compaction_bytes_read),
             optional(result.compaction_bytes_written),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    output.push_str("\nstorage accounting\n");
+    output.push_str("engine    mode      workload          run  logical mutation bytes  logical live bytes  write amp  disk amp\n");
+    for result in &report.results {
+        writeln!(
+            output,
+            "{:<9} {:<9} {:<17} {:>3} {:>23} {:>19} {:>10} {:>9}",
+            result.engine.as_str(),
+            result.durability.as_str(),
+            result.workload.as_str(),
+            result.repetition,
+            result.logical_mutation_bytes,
+            result.logical_live_bytes,
+            optional_ratio(result.write_amplification),
+            optional_ratio(result.disk_amplification),
         )
         .expect("writing to a String cannot fail");
     }
@@ -581,4 +607,8 @@ fn human_report(report: &Report) -> String {
 
 fn optional(value: Option<u64>) -> String {
     value.map_or_else(|| "-".to_string(), |value| value.to_string())
+}
+
+fn optional_ratio(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| format!("{value:.6}"))
 }
