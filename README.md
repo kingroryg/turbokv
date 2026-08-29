@@ -106,25 +106,26 @@ shutdown contract.
 
 ## Benchmarks
 
-This historical retained release benchmark compares only Rust-native embedded stores:
-TurboKV 0.5.0, fjall 2.11.2, and redb 2.6.3. The table reports median durable
-single-key acknowledgement throughput from three repetitions; higher is
-better.
+The retained benchmark used TurboKV 0.5.0, fjall 2.11.2, and redb 2.6.3. It
+measured durable mode (`DbOptions::durable()` for TurboKV) over three
+repetitions. The table reports median single-key acknowledgement throughput;
+higher is better.
 
-| Workload | TurboKV ops/s | fjall ops/s | redb ops/s | TurboKV / fjall |
-|---|---:|---:|---:|---:|
-| Sequential fill | 653,814 | 651,383 | 1,559 | 1.004× |
-| Random fill | 852,667 | 423,708 | 1,935 | 2.012× |
-| Overwrite | 791,618 | 454,874 | 1,795 | 1.740× |
+| Workload | Mode | TurboKV ops/s | fjall ops/s | redb ops/s | TurboKV / fjall |
+|---|---|---:|---:|---:|---:|
+| Sequential fill | Durable | 653,814 | 651,383 | 1,559 | 1.004× |
+| Random fill | Durable | 852,667 | 423,708 | 1,935 | 2.012× |
+| Overwrite | Durable | 791,618 | 454,874 | 1,795 | 1.740× |
 
 Protocol: 200,000 deterministic 20-byte keys, 400-byte values (84 MB logical
 input, above the 64 MiB memtable), one caller, one-entry transactions,
 compression and block cache disabled, and an uncleared OS page cache. Each
-engine acknowledges its documented process-crash-durable operating-system
-persistence boundary. Cross-engine settled timings are not compared.
+engine returns only after reaching its documented process-crash recovery
+boundary. Cross-engine settled timings are not compared.
 
-These numbers were measured before the final production-readiness documentation
-and portability changes; they are retained evidence, not a current-HEAD run.
+These results predate the 0.6.0 release and are not measurements of the current
+commit.
+
 Measured on 2026-08-28 with an Apple M4 (`Mac16,1`), 32 GiB RAM, macOS 15.3.2
 (24D81), APFS, and rustc 1.88.0. Sequential-fill dispersion was high, so treat
 the near-tie as noise rather than a stable advantage. Exact raw repetitions,
