@@ -80,8 +80,19 @@ Runnable examples:
 | Preset | Acknowledgement boundary | Use case |
 |---|---|---|
 | `DbOptions::fast()` | In-memory visibility; no WAL | Caches and reproducible data |
-| `DbOptions::durable()` | Appended to the WAL without a per-write sync | Process-crash recovery; recommended default |
+| `DbOptions::durable()` | Appended to the WAL without a per-write sync | Process-crash recovery with periodic power-loss checkpoints; recommended default |
 | `DbOptions::paranoid()` | WAL group completed `sync_all` before return | Strongest mode, subject to filesystem/device guarantees |
+
+Durable does not leave the WAL unsynchronized forever. A successful explicit or
+background memtable flush and a clean close synchronize it; rotating a full WAL
+segment also synchronizes the finalized segment. With the defaults, the
+memtable rotates at approximately 64 MiB, the background task checks for
+immutable memtables every 60 seconds, and a WAL segment rotates at 1 GiB.
+These checkpoints let older writes survive a power loss when the filesystem and
+device honor the sync, but they do **not** impose an exact 64 MiB loss bound:
+flush is asynchronous, memory accounting is approximate, and a large mutation
+can cross a threshold. Use Paranoid when every successful acknowledgement must
+cross a storage sync barrier.
 
 One open `Db` or `Engine` exclusively owns its data directory. Use `close()` or
 `close_with_status()` for a clean shutdown; dropping a handle is not a clean
