@@ -32,7 +32,7 @@ fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
         let ratio = turbo / fjall;
         assert!(ratio.is_finite() && ratio > 0.0, "invalid {workload} ratio");
         let row = format!(
-            "| {label} | {} | {} | {} | {ratio:.3}× |",
+            "| {label} | Durable | {} | {} | {} | {ratio:.3}× |",
             grouped_integer(turbo),
             grouped_integer(fjall),
             grouped_integer(redb),
@@ -45,8 +45,8 @@ fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
         .all(|workload| acknowledgement_ratio(&report, workload) > 1.0));
     assert!(README.contains("Cross-engine settled timings are not compared"));
     assert!(README.contains("Sequential-fill dispersion was high"));
-    assert!(README.contains("historical retained release benchmark"));
-    assert!(README.contains("not a current-HEAD run"));
+    assert!(README.contains("The retained benchmark used TurboKV 0.5.0"));
+    assert!(README.contains("These results predate the 0.6.0 release"));
 }
 
 #[test]
