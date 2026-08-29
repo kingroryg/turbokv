@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added `Db::take` and `Engine::take`, which atomically return and remove the
+  newest live value. Missing keys do not reserve a sequence or write a
+  redundant tombstone, and concurrent mutations order wholly before or after
+  the operation.
+
 ## 0.6.0 - 2026-08-28
 
 ### Production readiness

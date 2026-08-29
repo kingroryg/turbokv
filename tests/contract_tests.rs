@@ -27,6 +27,55 @@ fn durability_modes() -> [(&'static str, DbOptions); 3] {
     ]
 }
 
+enum TakeRaceMutation {
+    Insert(Vec<u8>),
+    Remove,
+    Batch(Vec<u8>),
+}
+
+async fn race_take_with_mutation(
+    db: &Arc<Db>,
+    key: &[u8],
+    old_value: &[u8],
+    mutation: TakeRaceMutation,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    db.insert(key, old_value).await.unwrap();
+
+    let key = key.to_vec();
+    let take_key = key.clone();
+    let final_key = key.clone();
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let taker = {
+        let db = Arc::clone(db);
+        let start = Arc::clone(&start);
+        tokio::spawn(async move {
+            start.wait().await;
+            db.take(take_key).await.unwrap()
+        })
+    };
+    let writer = {
+        let db = Arc::clone(db);
+        let start = Arc::clone(&start);
+        tokio::spawn(async move {
+            start.wait().await;
+            match mutation {
+                TakeRaceMutation::Insert(value) => db.insert(key, value).await.unwrap(),
+                TakeRaceMutation::Remove => db.remove(key).await.unwrap(),
+                TakeRaceMutation::Batch(value) => {
+                    let mut batch = WriteBatch::new();
+                    batch.put(key, value);
+                    db.write_batch(&batch).await.unwrap();
+                }
+            }
+        })
+    };
+    start.wait().await;
+
+    let taken = taker.await.unwrap();
+    writer.await.unwrap();
+    (taken, db.get(final_key).await.unwrap())
+}
+
 fn wait_until_ready(child: &mut Child, marker: &str, context: &str) {
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout);
@@ -587,6 +636,177 @@ async fn acknowledged_mutations_are_immediately_visible_in_every_mode() {
             None,
             "{mode}: an acknowledged delete must be visible"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn atomic_take_returns_and_removes_each_value_exactly_once_in_every_mode() {
+    const CALLERS: usize = 16;
+    let temp = TempDir::new().unwrap();
+
+    for (mode, options) in durability_modes() {
+        let database_path = temp.path().join(mode);
+        let db = Arc::new(
+            Db::open_with_options(&database_path, options)
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(db.take(b"missing").await.unwrap(), None, "{mode}");
+
+        db.insert(b"empty", []).await.unwrap();
+        assert_eq!(
+            db.take(b"empty").await.unwrap(),
+            Some(Vec::new()),
+            "{mode}: an empty value must remain distinct from absence"
+        );
+        assert_eq!(db.take(b"empty").await.unwrap(), None, "{mode}");
+
+        db.insert(b"raced", b"one winner").await.unwrap();
+        let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut callers = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let db = Arc::clone(&db);
+            let start = Arc::clone(&start);
+            callers.push(tokio::spawn(async move {
+                start.wait().await;
+                db.take(b"raced").await.unwrap()
+            }));
+        }
+        start.wait().await;
+
+        let mut returned = Vec::new();
+        for caller in callers {
+            if let Some(value) = caller.await.unwrap() {
+                returned.push(value);
+            }
+        }
+        assert_eq!(returned, [b"one winner".to_vec()], "{mode}");
+        assert_eq!(db.get(b"raced").await.unwrap(), None, "{mode}");
+
+        db.insert(b"sstable", b"persisted value").await.unwrap();
+        db.flush().await.unwrap();
+        assert_eq!(
+            db.take(b"sstable").await.unwrap(),
+            Some(b"persisted value".to_vec()),
+            "{mode}: take must resolve values outside the active memtable"
+        );
+        assert_eq!(db.get(b"sstable").await.unwrap(), None, "{mode}");
+
+        Arc::try_unwrap(db)
+            .unwrap_or_else(|_| panic!("{mode}: all take callers must release the database"))
+            .close()
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn atomic_take_orders_wholly_before_or_after_an_atomic_batch() {
+    let temp = TempDir::new().unwrap();
+    for (mode, options) in durability_modes() {
+        let db = Arc::new(
+            Db::open_with_options(temp.path().join(mode), options)
+                .await
+                .unwrap(),
+        );
+
+        for iteration in 0..8 {
+            let old = format!("old:{iteration}").into_bytes();
+            let new = format!("new:{iteration}").into_bytes();
+            let (taken, final_value) = race_take_with_mutation(
+                &db,
+                b"ordered",
+                &old,
+                TakeRaceMutation::Batch(new.clone()),
+            )
+            .await;
+            assert!(
+                (taken == Some(old.clone()) && final_value == Some(new.clone()))
+                    || (taken == Some(new) && final_value.is_none()),
+                "{mode} iteration {iteration}: take and batch exposed a partial ordering: taken={taken:?}, final={final_value:?}"
+            );
+        }
+        Arc::try_unwrap(db)
+            .unwrap_or_else(|_| panic!("{mode}: batch race retained the database"))
+            .close()
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn atomic_take_orders_wholly_before_or_after_insert_and_remove() {
+    let temp = TempDir::new().unwrap();
+
+    for (mode, options) in durability_modes() {
+        let db = Arc::new(
+            Db::open_with_options(temp.path().join(mode), options)
+                .await
+                .unwrap(),
+        );
+        for iteration in 0..8 {
+            let old = format!("old:{iteration}").into_bytes();
+            let new = format!("new:{iteration}").into_bytes();
+            let (taken, final_value) = race_take_with_mutation(
+                &db,
+                b"insert-race",
+                &old,
+                TakeRaceMutation::Insert(new.clone()),
+            )
+            .await;
+            assert!(
+                (taken == Some(old.clone()) && final_value == Some(new.clone()))
+                    || (taken == Some(new) && final_value.is_none()),
+                "{mode} iteration {iteration}: take and insert exposed a partial ordering: taken={taken:?}, final={final_value:?}"
+            );
+            let (taken, final_value) =
+                race_take_with_mutation(&db, b"remove-race", &old, TakeRaceMutation::Remove).await;
+            assert!(
+                taken == Some(old.clone()) || taken.is_none(),
+                "{mode} iteration {iteration}: take returned an impossible value: {taken:?}"
+            );
+            assert_eq!(final_value, None, "{mode}");
+        }
+        Arc::try_unwrap(db)
+            .unwrap_or_else(|_| panic!("{mode}: mutation race retained the database"))
+            .close()
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn wal_backed_take_recovers_its_tombstone_after_unclean_drop() {
+    let temp = TempDir::new().unwrap();
+
+    for (mode, options) in [
+        ("durable", DbOptions::durable()),
+        ("paranoid", DbOptions::paranoid()),
+    ] {
+        let database_path = temp.path().join(mode);
+        let db = Db::open_with_options(&database_path, options.clone())
+            .await
+            .unwrap();
+        db.insert(b"taken", b"before").await.unwrap();
+        db.flush().await.unwrap();
+        db.close().await.unwrap();
+
+        let reopened = Db::open_with_options(&database_path, options.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.take(b"taken").await.unwrap(),
+            Some(b"before".to_vec())
+        );
+        drop(reopened);
+
+        let recovered = Db::open_with_options(&database_path, options)
+            .await
+            .unwrap();
+        assert_eq!(recovered.get(b"taken").await.unwrap(), None, "{mode}");
+        assert_eq!(recovered.take(b"taken").await.unwrap(), None, "{mode}");
+        recovered.close().await.unwrap();
     }
 }
 
