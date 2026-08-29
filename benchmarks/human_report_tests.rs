@@ -45,13 +45,13 @@ mod tests {
             }
         };
         let report = Report {
-            schema_version: 7,
+            schema_version: 8,
             generated_unix_seconds: 1,
             profile: Profile::Quick,
             dataset: Profile::Quick.defaults(),
             protocol: protocol_settings(Profile::Quick),
-            engine_settings: engine_settings(),
-            counter_availability: counter_availability(),
+            engine_settings: engine_settings(&EngineName::ALL),
+            counter_availability: counter_availability(&EngineName::ALL),
             environment: Environment {
                 machine_name: "fixture".to_string(),
                 cpu: "fixture-cpu".to_string(),

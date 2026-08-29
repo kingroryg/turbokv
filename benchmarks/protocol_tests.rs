@@ -63,6 +63,18 @@ fn release_requires_explicit_confirmation_and_machine_name() {
     ])
     .unwrap();
     assert_eq!(ingest.profile, Profile::Ingest);
+
+    let modes = Cli::parse([
+        "--profile".into(),
+        "modes".into(),
+        "--confirm-release".into(),
+        "--machine".into(),
+        "Apple M4 reference".into(),
+    ])
+    .unwrap();
+    assert_eq!(modes.profile, Profile::Modes);
+    assert!(modes.profile.turbokv_only());
+    assert!(!Profile::Ingest.turbokv_only());
 }
 
 #[test]
@@ -76,6 +88,13 @@ fn release_is_production_scale_durable_and_paranoid_is_explicitly_bounded() {
     assert_eq!(ingest, release);
     assert_eq!(Profile::Ingest.durabilities(), [Durability::Durable]);
 
+    let modes = Profile::Modes.defaults();
+    assert_eq!(modes, release);
+    assert_eq!(
+        Profile::Modes.durabilities(),
+        [Durability::Fast, Durability::Durable, Durability::Paranoid]
+    );
+
     let paranoid = Profile::Paranoid.defaults();
     let paranoid_logical_bytes = paranoid.keys * (KEY_BYTES + paranoid.value_bytes) as u64;
     assert!(paranoid_logical_bytes < MEMTABLE_BYTES as u64);
@@ -85,6 +104,11 @@ fn release_is_production_scale_durable_and_paranoid_is_explicitly_bounded() {
 #[test]
 fn durability_classes_select_distinct_acknowledgement_boundaries() {
     assert_eq!(Durability::ALL, [Durability::Durable, Durability::Paranoid]);
+    assert_eq!(Durability::Fast.as_str(), "fast");
+    assert_eq!(
+        Durability::Fast.acknowledgement_boundary(),
+        AcknowledgementBoundary::InMemory
+    );
     assert_eq!(Durability::Durable.as_str(), "durable");
     assert_eq!(
         Durability::Durable.acknowledgement_boundary(),
@@ -132,6 +156,8 @@ fn release_requires_a_clean_source_tree() {
     assert!(ensure_release_reproducible(Profile::Quick, true).is_ok());
     assert!(ensure_release_reproducible(Profile::Ingest, false).is_ok());
     assert!(ensure_release_reproducible(Profile::Ingest, true).is_err());
+    assert!(ensure_release_reproducible(Profile::Modes, false).is_ok());
+    assert!(ensure_release_reproducible(Profile::Modes, true).is_err());
     assert!(ensure_release_reproducible(Profile::Release, false).is_ok());
     assert!(ensure_release_reproducible(Profile::Release, true).is_err());
     assert!(ensure_release_reproducible(Profile::Paranoid, false).is_ok());

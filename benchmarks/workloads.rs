@@ -389,6 +389,7 @@ pub async fn run_crash_child_if_requested() -> Result<(), DynError> {
         _ => return Err("invalid crash-child engine".into()),
     };
     let durability = match env::var(CRASH_CHILD_DURABILITY)?.as_str() {
+        "fast" => Durability::Fast,
         "durable" => Durability::Durable,
         "paranoid" => Durability::Paranoid,
         _ => return Err("invalid crash-child durability".into()),

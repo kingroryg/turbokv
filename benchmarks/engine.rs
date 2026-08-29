@@ -361,19 +361,20 @@ async fn open_state(
 ) -> Result<State, DynError> {
     match name {
         EngineName::TurboKv => {
-            let mut config = match durability.acknowledgement_boundary() {
-                AcknowledgementBoundary::ProcessCrashRecoverable => {
-                    StorageConfig::durable(path.to_path_buf())
+            let mut config = match durability {
+                Durability::Fast => StorageConfig::fast(path.to_path_buf()),
+                Durability::Durable => {
+                    let mut config = StorageConfig::durable(path.to_path_buf());
+                    config.wal_config = WalConfig::durable();
+                    config
                 }
-                AcknowledgementBoundary::PowerLossDurable => {
-                    StorageConfig::paranoid(path.to_path_buf())
+                Durability::Paranoid => {
+                    let mut config = StorageConfig::paranoid(path.to_path_buf());
+                    config.wal_config = WalConfig::paranoid()
+                        .with_group_commit_delay(Duration::ZERO)
+                        .with_max_group_size(1);
+                    config
                 }
-            };
-            config.wal_config = match durability.acknowledgement_boundary() {
-                AcknowledgementBoundary::ProcessCrashRecoverable => WalConfig::durable(),
-                AcknowledgementBoundary::PowerLossDurable => WalConfig::paranoid()
-                    .with_group_commit_delay(Duration::ZERO)
-                    .with_max_group_size(1),
             };
             config.memtable_config.max_size = MEMTABLE_BYTES;
             config.block_cache_size = 0;
@@ -383,6 +384,13 @@ async fn open_state(
             Ok(State::Turbo(Box::new(Engine::open(config).await?)))
         }
         EngineName::Fjall => {
+            let acknowledgement_persist_mode = match durability.acknowledgement_boundary() {
+                AcknowledgementBoundary::InMemory => {
+                    return Err("fast mode is TurboKV-only".into());
+                }
+                AcknowledgementBoundary::ProcessCrashRecoverable => PersistMode::Buffer,
+                AcknowledgementBoundary::PowerLossDurable => PersistMode::SyncAll,
+            };
             let keyspace = FjallConfig::new(path)
                 .manual_journal_persist(true)
                 .flush_workers(1)
@@ -396,10 +404,6 @@ async fn open_state(
                     .manual_journal_persist(true)
                     .max_memtable_size(MEMTABLE_BYTES as u32),
             )?;
-            let acknowledgement_persist_mode = match durability.acknowledgement_boundary() {
-                AcknowledgementBoundary::ProcessCrashRecoverable => PersistMode::Buffer,
-                AcknowledgementBoundary::PowerLossDurable => PersistMode::SyncAll,
-            };
             Ok(State::Fjall(FjallState {
                 keyspace,
                 partition,
@@ -407,6 +411,16 @@ async fn open_state(
             }))
         }
         EngineName::Redb => {
+            let (commit_durability, full_sync_after_commit) =
+                match durability.acknowledgement_boundary() {
+                    AcknowledgementBoundary::InMemory => {
+                        return Err("fast mode is TurboKV-only".into());
+                    }
+                    AcknowledgementBoundary::ProcessCrashRecoverable => {
+                        (RedbDurability::Eventual, false)
+                    }
+                    AcknowledgementBoundary::PowerLossDurable => (RedbDurability::Immediate, true),
+                };
             fs::create_dir_all(path)?;
             let database_path = path.join("bench.redb");
             let initialize_table = !database_path.exists();
@@ -421,13 +435,6 @@ async fn open_state(
                 File::open(&database_path)?.sync_all()?;
                 sync_parent_directory(&database_path)?;
             }
-            let (commit_durability, full_sync_after_commit) =
-                match durability.acknowledgement_boundary() {
-                    AcknowledgementBoundary::ProcessCrashRecoverable => {
-                        (RedbDurability::Eventual, false)
-                    }
-                    AcknowledgementBoundary::PowerLossDurable => (RedbDurability::Immediate, true),
-                };
             Ok(State::Redb(RedbState {
                 db: Mutex::new(db),
                 path: database_path,

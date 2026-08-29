@@ -50,6 +50,17 @@ cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- \
 Throughput for batch workloads is inserted keys per second. Their latency
 samples are complete atomic batch commits, not individual keys.
 
+The modes profile measures the same production-scale ingest matrix for TurboKV
+alone in Fast, Durable, and Paranoid mode. It emits 45 measurements (3 modes ×
+5 workloads × 3 repetitions) and is the source for the three TurboKV columns
+in the root README:
+
+```console
+cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- \
+  --profile modes --confirm-release \
+  --machine "Apple M4 (Mac16,1), 32 GiB, macOS 15.3.2"
+```
+
 The release profile is the complete production-scale durable comparison. It uses
 200,000 keys, three repetitions, five scan passes, and five recovery
 reopens. Its 84,000,000 logical key/value bytes exceed the common 64 MiB
@@ -106,6 +117,8 @@ page cache. Compression is disabled where the engine supports it. TurboKV and
 fjall use a 64 MiB memtable; redb is a copy-on-write B-tree and has no memtable.
 Results carry a durability key and must only be compared within that class:
 
+- `fast`: TurboKV publishes to memory without a WAL. It is a TurboKV-only
+  performance baseline and is not comparable to persistent engine rows.
 - `durable`: acknowledgement means the engine's recovery state reached its
   named non-full-sync operating-system persistence boundary. This protects
   against process failure but does not promise power-loss survival.

@@ -10,17 +10,20 @@ pub const KEY_BYTES: usize = 20;
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Durability {
+    Fast,
     Durable,
     Paranoid,
 }
 
 impl Durability {
     pub const ALL: [Self; 2] = [Self::Durable, Self::Paranoid];
+    pub const TURBOKV_MODES: [Self; 3] = [Self::Fast, Self::Durable, Self::Paranoid];
     pub const DURABLE_ONLY: [Self; 1] = [Self::Durable];
     pub const PARANOID_ONLY: [Self; 1] = [Self::Paranoid];
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Fast => "fast",
             Self::Durable => "durable",
             Self::Paranoid => "paranoid",
         }
@@ -28,6 +31,7 @@ impl Durability {
 
     pub const fn acknowledgement_boundary(self) -> AcknowledgementBoundary {
         match self {
+            Self::Fast => AcknowledgementBoundary::InMemory,
             Self::Durable => AcknowledgementBoundary::ProcessCrashRecoverable,
             Self::Paranoid => AcknowledgementBoundary::PowerLossDurable,
         }
@@ -36,6 +40,7 @@ impl Durability {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcknowledgementBoundary {
+    InMemory,
     ProcessCrashRecoverable,
     PowerLossDurable,
 }
@@ -45,6 +50,7 @@ pub enum AcknowledgementBoundary {
 pub enum Profile {
     Quick,
     Ingest,
+    Modes,
     Release,
     Paranoid,
 }
@@ -54,10 +60,11 @@ impl Profile {
         match value {
             "quick" => Ok(Self::Quick),
             "ingest" => Ok(Self::Ingest),
+            "modes" => Ok(Self::Modes),
             "release" => Ok(Self::Release),
             "paranoid" => Ok(Self::Paranoid),
             _ => Err(format!(
-                "unknown profile {value:?}; expected quick, ingest, release, or paranoid"
+                "unknown profile {value:?}; expected quick, ingest, modes, release, or paranoid"
             )),
         }
     }
@@ -72,7 +79,7 @@ impl Profile {
                 recovery_cycles: 3,
                 seed: SEED,
             },
-            Self::Ingest | Self::Release => WorkloadConfig {
+            Self::Ingest | Self::Modes | Self::Release => WorkloadConfig {
                 keys: 200_000,
                 value_bytes: 400,
                 repetitions: 3,
@@ -95,18 +102,27 @@ impl Profile {
         match self {
             Self::Quick => &Durability::ALL,
             Self::Ingest | Self::Release => &Durability::DURABLE_ONLY,
+            Self::Modes => &Durability::TURBOKV_MODES,
             Self::Paranoid => &Durability::PARANOID_ONLY,
         }
     }
 
+    pub const fn turbokv_only(self) -> bool {
+        matches!(self, Self::Modes)
+    }
+
     const fn requires_release_controls(self) -> bool {
-        matches!(self, Self::Ingest | Self::Release | Self::Paranoid)
+        matches!(
+            self,
+            Self::Ingest | Self::Modes | Self::Release | Self::Paranoid
+        )
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Quick => "quick",
             Self::Ingest => "ingest",
+            Self::Modes => "modes",
             Self::Release => "release",
             Self::Paranoid => "paranoid",
         }
@@ -161,13 +177,13 @@ impl Cli {
         }
         if profile.requires_release_controls() && !confirm_release {
             return Err(
-                "release and paranoid profiles perform repeated persistence workloads; rerun with --confirm-release"
+                "ingest, modes, release, and paranoid profiles perform repeated persistence workloads; rerun with --confirm-release"
                     .to_string(),
             );
         }
         if profile.requires_release_controls() && machine.is_none() {
             return Err(
-                "release and paranoid benchmarks require a stable name via --machine".to_string(),
+                "ingest, modes, release, and paranoid benchmarks require a stable name via --machine".to_string(),
             );
         }
         Ok(Self {
@@ -179,7 +195,7 @@ impl Cli {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- --profile quick|ingest|release|paranoid [--output DIR] [--machine NAME] [--confirm-release]"
+    "usage: cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- --profile quick|ingest|modes|release|paranoid [--output DIR] [--machine NAME] [--confirm-release]"
 }
 
 pub fn percentile(sorted_values: &[u64], percentile: u32) -> u64 {
@@ -193,7 +209,7 @@ pub fn percentile(sorted_values: &[u64], percentile: u32) -> u64 {
 pub fn ensure_release_reproducible(profile: Profile, git_dirty: bool) -> Result<(), String> {
     if profile.requires_release_controls() && git_dirty {
         return Err(
-            "release and paranoid benchmarks require a clean Git worktree so the recorded commit identifies the measured source"
+            "ingest, modes, release, and paranoid benchmarks require a clean Git worktree so the recorded commit identifies the measured source"
                 .to_string(),
         );
     }

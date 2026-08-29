@@ -41,6 +41,7 @@ struct Protocol {
     durability_classes: Vec<DurabilityClass>,
     workloads: Vec<&'static str>,
     workload_order: &'static str,
+    durability_order: &'static str,
     engine_order: &'static str,
     setup_boundary: &'static str,
     acknowledgement_boundary: &'static str,
@@ -165,19 +166,25 @@ async fn run(profile: Profile, environment: Environment) -> Result<Report, DynEr
     let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let dataset = profile.defaults();
     let workloads = profile_workloads(profile);
+    let engines = profile_engines(profile);
     let mut results = Vec::with_capacity(
         profile.durabilities().len()
             * dataset.repetitions as usize
             * workloads.len()
-            * EngineName::ALL.len(),
+            * engines.len(),
     );
-    for (durability_index, &durability) in profile.durabilities().iter().enumerate() {
-        for repetition in 1..=dataset.repetitions {
-            for (workload_index, &workload) in workloads.iter().enumerate() {
-                let rotation = (durability_index + repetition as usize - 1 + workload_index)
-                    % EngineName::ALL.len();
-                for offset in 0..EngineName::ALL.len() {
-                    let engine = EngineName::ALL[(rotation + offset) % EngineName::ALL.len()];
+    for repetition in 1..=dataset.repetitions {
+        for (workload_index, &workload) in workloads.iter().enumerate() {
+            let durability_rotation =
+                (repetition as usize - 1 + workload_index) % profile.durabilities().len();
+            for durability_offset in 0..profile.durabilities().len() {
+                let durability_index =
+                    (durability_rotation + durability_offset) % profile.durabilities().len();
+                let durability = profile.durabilities()[durability_index];
+                let rotation =
+                    (durability_index + repetition as usize - 1 + workload_index) % engines.len();
+                for offset in 0..engines.len() {
+                    let engine = engines[(rotation + offset) % engines.len()];
                     println!(
                         "run {repetition}/{}: {} / {} / {}",
                         dataset.repetitions,
@@ -192,15 +199,15 @@ async fn run(profile: Profile, environment: Environment) -> Result<Report, DynEr
             }
         }
     }
-    let summaries = summaries(&results, profile.durabilities(), workloads);
+    let summaries = summaries(&results, engines, profile.durabilities(), workloads);
     Ok(Report {
-        schema_version: 7,
+        schema_version: 8,
         generated_unix_seconds,
         profile,
         dataset,
         protocol: protocol_settings(profile),
-        engine_settings: engine_settings(),
-        counter_availability: counter_availability(),
+        engine_settings: engine_settings(engines),
+        counter_availability: counter_availability(engines),
         environment,
         direct_dependencies: direct_dependencies(),
         resolved_dependencies: locked_package_versions(BENCHMARK_LOCKFILE),
@@ -216,6 +223,13 @@ fn protocol_settings(profile: Profile) -> Protocol {
             .durabilities()
             .iter()
             .map(|durability| match durability {
+                Durability::Fast => DurabilityClass {
+                    durability: *durability,
+                    acknowledgement:
+                        "the mutation is published to the in-memory table without a write-ahead log",
+                    comparison_rule:
+                        "TurboKV-only no-WAL baseline; do not compare it with persistent rows",
+                },
                 Durability::Durable => DurabilityClass {
                     durability: *durability,
                     acknowledgement:
@@ -238,6 +252,7 @@ fn protocol_settings(profile: Profile) -> Protocol {
             .map(Workload::as_str)
             .collect(),
         workload_order: "fixed documented order",
+        durability_order: "deterministic Latin rotation by workload and repetition",
         engine_order: "deterministic Latin rotation by workload and repetition",
         setup_boundary:
             "dataset preparation and prerequisite settlement are excluded from measured workload time",
@@ -248,7 +263,7 @@ fn protocol_settings(profile: Profile) -> Protocol {
         recovery_boundary:
             "time to reopen after a subprocess acknowledged a marker and exited without running database destructors; post-open marker verification is excluded",
         production_scale_rule:
-            "ingest and release durable logical key-plus-value bytes exceed the configured LSM memtable; quick and paranoid profiles are explicitly bounded and are not production-scale ingest evidence",
+            "ingest, modes, and release logical key-plus-value bytes exceed the configured LSM memtable; quick and paranoid profiles are explicitly bounded",
         common: CommonSettings {
             durable_storage_enabled: true,
             single_key_batch_size: 1,
@@ -265,13 +280,20 @@ fn protocol_settings(profile: Profile) -> Protocol {
     }
 }
 
-fn engine_settings() -> Vec<EngineSettings> {
+fn engine_settings(engines: &[EngineName]) -> Vec<EngineSettings> {
     vec![
         EngineSettings {
             engine: EngineName::TurboKv,
             version: "0.6.0 (path source measured at report git commit)",
-            storage_model: "write-ahead log; one record per mutation",
+            storage_model: "memtable with an optional write-ahead log",
             acknowledgement_modes: vec![
+                EngineDurabilitySettings {
+                    durability: Durability::Fast,
+                    acknowledgement:
+                        "StorageConfig::fast; publication to the memtable without a write-ahead log",
+                    conservative_difference:
+                        "process termination can lose acknowledged writes that have not completed settlement",
+                },
                 EngineDurabilitySettings {
                     durability: Durability::Durable,
                     acknowledgement:
@@ -349,9 +371,12 @@ fn engine_settings() -> Vec<EngineSettings> {
                 "pure-Rust copy-on-write B-tree with single-writer transactions, not an LSM; compression and memtables are not applicable, and the configurable cache is disabled",
         },
     ]
+    .into_iter()
+    .filter(|settings| engines.contains(&settings.engine))
+    .collect()
 }
 
-fn counter_availability() -> Vec<CounterAvailability> {
+fn counter_availability(engines: &[EngineName]) -> Vec<CounterAvailability> {
     vec![
         CounterAvailability {
             engine: EngineName::TurboKv,
@@ -379,6 +404,9 @@ fn counter_availability() -> Vec<CounterAvailability> {
             amplification: "unavailable because component byte counters are unavailable; JSON null",
         },
     ]
+    .into_iter()
+    .filter(|availability| engines.contains(&availability.engine))
+    .collect()
 }
 
 fn direct_dependencies() -> BTreeMap<String, String> {
@@ -398,12 +426,12 @@ fn direct_dependencies() -> BTreeMap<String, String> {
 
 fn summaries(
     results: &[Measurement],
+    engines: &[EngineName],
     durabilities: &[Durability],
     workloads: &[Workload],
 ) -> Vec<Summary> {
-    let mut output =
-        Vec::with_capacity(EngineName::ALL.len() * durabilities.len() * workloads.len());
-    for engine in EngineName::ALL {
+    let mut output = Vec::with_capacity(engines.len() * durabilities.len() * workloads.len());
+    for &engine in engines {
         for &durability in durabilities {
             for &workload in workloads {
                 let matching = results
@@ -439,8 +467,16 @@ fn summaries(
 
 const fn profile_workloads(profile: Profile) -> &'static [Workload] {
     match profile {
-        Profile::Ingest => &Workload::INGEST,
+        Profile::Ingest | Profile::Modes => &Workload::INGEST,
         Profile::Quick | Profile::Release | Profile::Paranoid => &Workload::ALL,
+    }
+}
+
+const fn profile_engines(profile: Profile) -> &'static [EngineName] {
+    if profile.turbokv_only() {
+        &[EngineName::TurboKv]
+    } else {
+        &EngineName::ALL
     }
 }
 
