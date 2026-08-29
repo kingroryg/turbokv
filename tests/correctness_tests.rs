@@ -1,7 +1,7 @@
 //! Crash-recovery and correctness integration tests for TurboKV.
 //!
 //! These tests exercise the database through the public `Db` API,
-//! covering tombstone semantics, flush/reopen durability, batch
+//! covering tombstone and atomic-take semantics, flush/reopen durability, batch
 //! writes, range/prefix scans with deletions, compaction, and stats.
 
 use std::collections::BTreeMap;
@@ -53,13 +53,18 @@ async fn run_seeded_mutation_mix(options: DbOptions, mut seed: u64) {
         .unwrap();
     expected.insert(b"mix:05".to_vec(), b"buffered-before-flush".to_vec());
     db.flush().await.unwrap();
+    db.insert(b"mix:06", b"buffered-before-take").await.unwrap();
+    assert_eq!(
+        db.take(b"mix:06").await.unwrap(),
+        Some(b"buffered-before-take".to_vec())
+    );
 
     for step in 0..240_u64 {
         let random = seeded_next(&mut seed);
         let key_index = (random >> 8) % 24;
         let key = format!("mix:{key_index:02}").into_bytes();
         let value = format!("value:{step:03}:{random:016x}").into_bytes();
-        match random % 7 {
+        match random % 8 {
             0 => {
                 db.insert(&key, &value).await.unwrap();
                 expected.insert(key, value);
@@ -101,6 +106,10 @@ async fn run_seeded_mutation_mix(options: DbOptions, mut seed: u64) {
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect();
                 assert_eq!(actual, modeled);
+            }
+            6 => {
+                let modeled = expected.remove(&key);
+                assert_eq!(db.take(&key).await.unwrap(), modeled);
             }
             _ => db.flush().await.unwrap(),
         }

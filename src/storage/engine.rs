@@ -882,30 +882,84 @@ impl Engine {
     pub async fn delete(&self, key: &[u8]) -> Result<()> {
         self.maybe_stall_writes().await;
         let _mutation = self.mutation_barrier.read().await;
-
-        // Write to WAL first (if enabled)
-        if let Some(ref wal) = self.wal {
-            let mut pending =
-                PendingWalApplication::new(&self.unapplied_wal_sequences, wal.current_sequence());
-            let sequence = wal.append_delete(key).await?;
-            #[cfg(test)]
-            super::failpoints::check(
-                &self.config.data_dir,
-                super::failpoints::PersistenceBoundary::Wal,
-            )?;
-            let _publication = self.batch_visibility.read().await;
-            self.memtable_manager
-                .delete_with_sequence(key, sequence)
-                .map_err(StorageError::MemTable)?;
-            pending.disarm();
+        let application = self.prepare_tombstone(key).await?;
+        let _publication = if application.requires_publication_gate() {
+            Some(self.batch_visibility.read().await)
         } else {
+            None
+        };
+        self.publish_tombstone(key, application)
+    }
+
+    /// Return the newest live value and publish its tombstone atomically.
+    ///
+    /// The exclusive mutation barrier orders the value resolution and deletion
+    /// wholly before or after every insert, delete, bulk write, and atomic
+    /// batch. This avoids adding coordination to ordinary mutations, at the
+    /// cost of blocking unrelated writers while this call reads SSTables. A
+    /// missing or already-deleted key returns `None` without allocating a
+    /// sequence or writing another tombstone.
+    ///
+    /// A present value is copied before its tombstone reaches the configured
+    /// durability point. SSTable read errors happen before mutation. Errors or
+    /// cancellation after a WAL append have the same indeterminate recovery
+    /// outcome as [`Self::delete`].
+    pub async fn take(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.maybe_stall_writes().await;
+        let _mutation = self.mutation_barrier.write().await;
+
+        if self.wal.is_none() {
             self.memtable_manager
-                .delete(key)
+                .flush_thread_local()
                 .map_err(StorageError::MemTable)?;
         }
+        let newest = self
+            .memtable_manager
+            .get_entry(key)
+            .map(VersionedValue::from_memtable);
+        let Some(previous) = self.resolve_point_value(key, newest).await? else {
+            return Ok(None);
+        };
 
+        let application = self.prepare_tombstone(key).await?;
+        self.publish_tombstone(key, application)?;
+        Ok(Some(previous))
+    }
+
+    async fn prepare_tombstone(&self, key: &[u8]) -> Result<TombstoneApplication<'_>> {
+        let Some(wal) = &self.wal else {
+            return Ok(TombstoneApplication::Memory);
+        };
+        let pending =
+            PendingWalApplication::new(&self.unapplied_wal_sequences, wal.current_sequence());
+        let sequence = wal.append_delete(key).await?;
+        #[cfg(test)]
+        super::failpoints::check(
+            &self.config.data_dir,
+            super::failpoints::PersistenceBoundary::Wal,
+        )?;
+        Ok(TombstoneApplication::Wal { sequence, pending })
+    }
+
+    fn publish_tombstone(
+        &self,
+        key: &[u8],
+        mut application: TombstoneApplication<'_>,
+    ) -> Result<()> {
+        match &mut application {
+            TombstoneApplication::Memory => {
+                self.memtable_manager
+                    .delete(key)
+                    .map_err(StorageError::MemTable)?;
+            }
+            TombstoneApplication::Wal { sequence, pending } => {
+                self.memtable_manager
+                    .delete_with_sequence(key, *sequence)
+                    .map_err(StorageError::MemTable)?;
+                pending.disarm();
+            }
+        }
         self.record_logical_bytes_ingested(payload_bytes(key, None));
-
         Ok(())
     }
 
@@ -917,11 +971,19 @@ impl Engine {
     /// is allocated as `Vec<u8>`; corruption and I/O are returned. Cancellation
     /// changes no logical data but can update caches or drain no-WAL buffers.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut newest = self
+        let newest = self
             .snapshot_memtable(|manager| manager.get_entry(key))
             .await?
             .map(VersionedValue::from_memtable);
 
+        self.resolve_point_value(key, newest).await
+    }
+
+    async fn resolve_point_value(
+        &self,
+        key: &[u8],
+        mut newest: Option<VersionedValue>,
+    ) -> Result<Option<Vec<u8>>> {
         // Resolve all physical copies by sequence; physical list order is not
         // a version order after reopen or compaction.
         for source in self.pin_sstables(|_| true).await? {
@@ -2203,6 +2265,20 @@ fn retain_newest(current: &mut Option<VersionedValue>, candidate: VersionedValue
         .is_none_or(|entry| candidate.is_newer_than(entry))
     {
         *current = Some(candidate);
+    }
+}
+
+enum TombstoneApplication<'a> {
+    Memory,
+    Wal {
+        sequence: u64,
+        pending: PendingWalApplication<'a>,
+    },
+}
+
+impl TombstoneApplication<'_> {
+    fn requires_publication_gate(&self) -> bool {
+        matches!(self, Self::Wal { .. })
     }
 }
 
@@ -4015,6 +4091,174 @@ mod tests {
         assert_eq!(engine.logical_stats().await.unwrap().live_keys, 2);
 
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn absent_and_repeated_take_reserve_no_sequence_or_physical_tombstone() {
+        for wal_enabled in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let engine = Engine::open(isolated_config(directory.path(), wal_enabled))
+                .await
+                .unwrap();
+            let sequence_before = engine.memtable_manager.current_sequence();
+            let wal_sequence_before = engine.wal.as_ref().map(|wal| wal.current_sequence());
+            let stats_before = engine.physical_stats();
+
+            assert_eq!(engine.take(b"absent").await.unwrap(), None);
+
+            assert_eq!(engine.memtable_manager.current_sequence(), sequence_before);
+            assert_eq!(
+                engine.wal.as_ref().map(|wal| wal.current_sequence()),
+                wal_sequence_before
+            );
+            let stats_after = engine.physical_stats();
+            assert_eq!(
+                stats_after.memtables.active_versions,
+                stats_before.memtables.active_versions
+            );
+            assert_eq!(
+                stats_after.memtables.tombstones,
+                stats_before.memtables.tombstones
+            );
+            assert_eq!(
+                stats_after.amplification.logical_bytes_ingested_since_open,
+                stats_before.amplification.logical_bytes_ingested_since_open
+            );
+
+            engine.insert(b"present", b"value").await.unwrap();
+            assert_eq!(
+                engine.take(b"present").await.unwrap(),
+                Some(b"value".to_vec())
+            );
+            let sequence_after_delete = engine.memtable_manager.current_sequence();
+            let wal_sequence_after_delete = engine.wal.as_ref().map(|wal| wal.current_sequence());
+            let stats_after_delete = engine.physical_stats();
+            assert_eq!(stats_after_delete.memtables.tombstones, 1);
+
+            assert_eq!(engine.take(b"present").await.unwrap(), None);
+            assert_eq!(
+                engine.memtable_manager.current_sequence(),
+                sequence_after_delete
+            );
+            assert_eq!(
+                engine.wal.as_ref().map(|wal| wal.current_sequence()),
+                wal_sequence_after_delete
+            );
+            let stats_after_repeat = engine.physical_stats();
+            assert_eq!(
+                stats_after_repeat.memtables.tombstones,
+                stats_after_delete.memtables.tombstones
+            );
+            assert_eq!(
+                stats_after_repeat
+                    .amplification
+                    .logical_bytes_ingested_since_open,
+                stats_after_delete
+                    .amplification
+                    .logical_bytes_ingested_since_open
+            );
+            engine.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn take_resolves_a_value_held_only_in_an_immutable_memtable() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(isolated_config(directory.path(), false))
+            .await
+            .unwrap();
+        engine.insert(b"immutable:take", b"value").await.unwrap();
+        engine.flush_write_buffers().unwrap();
+        engine.memtable_manager.force_rotate().unwrap();
+        assert_eq!(engine.memtable_manager.immutable_count(), 1);
+
+        assert_eq!(
+            engine.take(b"immutable:take").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(engine.get(b"immutable:take").await.unwrap(), None);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn take_reports_sstable_corruption_before_reserving_its_tombstone() {
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let directory = TempDir::new().unwrap();
+        let mut config = isolated_config(directory.path(), true);
+        config.block_cache_size = 0;
+        config.sstable_config = SSTableConfig {
+            block_size: 512,
+            compression: super::super::sstable::CompressionType::None,
+            ..SSTableConfig::default()
+        };
+        let engine = Engine::open(config).await.unwrap();
+        engine.insert(b"corrupt:take", b"value").await.unwrap();
+        engine.flush().await.unwrap();
+
+        let path = engine.sstables.read().await[0].path.clone();
+        let reader = SSTableReader::open(&path).unwrap();
+        let block_offset = reader.index().entries()[0].block_offset;
+        drop(reader);
+        let sequence_before = engine.memtable_manager.current_sequence();
+        let wal_sequence_before = engine.wal.as_ref().unwrap().current_sequence();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(block_offset)).unwrap();
+        let mut original = [0_u8; 1];
+        file.read_exact(&mut original).unwrap();
+        let corrupted = [original[0] ^ 0x80];
+        file.seek(SeekFrom::Start(block_offset)).unwrap();
+        file.write_all(&corrupted).unwrap();
+        file.sync_all().unwrap();
+
+        assert!(matches!(
+            engine.take(b"corrupt:take").await,
+            Err(StorageError::SSTable(_))
+        ));
+        assert_eq!(engine.memtable_manager.current_sequence(), sequence_before);
+        assert_eq!(
+            engine.wal.as_ref().unwrap().current_sequence(),
+            wal_sequence_before
+        );
+
+        file.seek(SeekFrom::Start(block_offset)).unwrap();
+        file.write_all(&original).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(
+            engine.take(b"corrupt:take").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn take_failure_after_wal_append_recovers_the_indeterminate_tombstone() {
+        let directory = TempDir::new().unwrap();
+        let config = isolated_config(directory.path(), true);
+        let engine = Engine::open(config.clone()).await.unwrap();
+        engine.insert(b"failed:take", b"value").await.unwrap();
+        engine.flush().await.unwrap();
+        let failure = super::super::failpoints::arm(
+            directory.path(),
+            super::super::failpoints::PersistenceBoundary::Wal,
+        );
+
+        assert!(engine.take(b"failed:take").await.is_err());
+        failure.assert_hit();
+        assert_eq!(
+            engine.get(b"failed:take").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+        drop(engine);
+
+        let reopened = Engine::open(config).await.unwrap();
+        assert_eq!(reopened.get(b"failed:take").await.unwrap(), None);
+        reopened.shutdown().await.unwrap();
     }
 
     #[tokio::test]

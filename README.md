@@ -124,6 +124,7 @@ compression. Their public fields can be adjusted before opening:
 | `insert_many(entries)` | Any iterator of `(key, value)` pairs | `Result<()>`. Copies the full iterator and applies entries in order; the last duplicate key wins. This is a bulk API, not one atomic visibility transition. |
 | `get(key)` | Byte-like key | `Result<Option<Vec<u8>>>`. Returns `None` for missing or deleted keys and `Some(Vec::new())` for a stored empty value. |
 | `remove(key)` | Byte-like key | `Result<()>`. Writes a tombstone; deleting a missing key is allowed. |
+| `take(key)` | Byte-like key | `Result<Option<Vec<u8>>>`. Atomically returns and removes the latest value; a missing key returns `None` without writing a tombstone. It serializes mutations while resolving the value. |
 | `contains_key(key)` | Byte-like key | `Result<bool>`. Resolves the same state as `get` and currently incurs its value allocation. |
 | `write_batch(batch)` | `&WriteBatch` | `Result<()>`. Publishes all operations atomically; readers see either the state before the batch or the complete batch. The last operation for a duplicate key wins. |
 

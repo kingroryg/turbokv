@@ -28,7 +28,7 @@
 //!     println!("Got: {:?}", String::from_utf8_lossy(&value));
 //! }
 //!
-//! db.remove(b"hello").await?;
+//! assert_eq!(db.take(b"hello").await?, Some(b"world".to_vec()));
 //!
 //! for (key, value) in db.range(b"a", b"z").await? {
 //!     println!("{:?} -> {:?}", key, value);

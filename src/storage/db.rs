@@ -379,6 +379,24 @@ impl Db {
         Ok(())
     }
 
+    /// Atomically return and remove the latest value for a key.
+    ///
+    /// `Some(value)` means that exact previously visible value was removed;
+    /// stored empty values return `Some(Vec::new())`. A missing or already
+    /// deleted key returns `None` without writing another tombstone. Concurrent
+    /// inserts, removals, batches, and other takes order wholly before or after
+    /// this operation, so racing takes cannot both return the same value.
+    ///
+    /// A present value is copied and its tombstone reaches the selected
+    /// durability point before success. Resolving a value can perform blocking
+    /// mmap reads and decompression, and this operation blocks unrelated
+    /// mutations while doing so. SSTable errors happen before mutation. An
+    /// error or cancellation after a WAL append has an indeterminate outcome;
+    /// inspect the key or reopen before retrying.
+    pub async fn take<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<Vec<u8>>> {
+        Ok(self.engine.take(key.as_ref()).await?)
+    }
+
     /// Check whether the latest acknowledged version is a live value.
     ///
     /// This currently resolves through [`Self::get`], including its blocking

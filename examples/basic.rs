@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.insert(b"language", b"rust").await?;
     assert_eq!(db.get(b"language").await?, Some(b"rust".to_vec()));
 
-    db.remove(b"language").await?;
+    assert_eq!(db.take(b"language").await?, Some(b"rust".to_vec()));
     assert_eq!(db.get(b"language").await?, None);
 
     db.close().await?;

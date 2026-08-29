@@ -116,7 +116,7 @@ async fn run_generated_model(mode: ModelMode, seed: u64, steps: u64) {
         let context = model_context(mode, seed, steps, step);
         let key_index = rng.gen_range(0..MODEL_KEYSPACE);
         let key = model_key(key_index);
-        match rng.gen_range(0..10) {
+        match rng.gen_range(0..11) {
             0..=2 => {
                 let value = generated_value(&mut rng, step);
                 db.insert(&key, &value)
@@ -173,10 +173,18 @@ async fn run_generated_model(mode: ModelMode, seed: u64, steps: u64) {
                 .flush()
                 .await
                 .unwrap_or_else(|error| panic!("{context}: flush failed: {error}")),
-            _ => {
+            9 => {
                 db.compact()
                     .await
                     .unwrap_or_else(|error| panic!("{context}: compaction failed: {error}"));
+            }
+            _ => {
+                let modeled = expected.remove(&key);
+                let actual = db
+                    .take(&key)
+                    .await
+                    .unwrap_or_else(|error| panic!("{context}: take failed: {error}"));
+                assert_eq!(actual, modeled, "{context}: take result diverged");
             }
         }
 
