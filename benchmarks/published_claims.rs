@@ -18,7 +18,12 @@ fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
         .collect::<Vec<_>>();
     assert_eq!(
         headings,
-        ["## Installation", "## Quick start", "## API breakdown", "## Benchmarks"]
+        [
+            "## Installation",
+            "## Quick start",
+            "## API breakdown",
+            "## Benchmarks"
+        ]
     );
 
     for (workload, label) in [
@@ -26,7 +31,12 @@ fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
         ("random_fill", "Random fill"),
         ("overwrite", "Overwrite"),
     ] {
-        let turbo = median(&report, "turbo_kv", workload, "acknowledgement_ops_per_second");
+        let turbo = median(
+            &report,
+            "turbo_kv",
+            workload,
+            "acknowledgement_ops_per_second",
+        );
         let fjall = median(&report, "fjall", workload, "acknowledgement_ops_per_second");
         let redb = median(&report, "redb", workload, "acknowledgement_ops_per_second");
         let ratio = turbo / fjall;
@@ -37,7 +47,10 @@ fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
             grouped_integer(fjall),
             grouped_integer(redb),
         );
-        assert!(README.contains(&row), "README is missing benchmark row: {row}");
+        assert!(
+            README.contains(&row),
+            "README is missing benchmark row: {row}"
+        );
     }
 
     assert!(REQUIRED_DURABLE_INGEST
@@ -60,7 +73,10 @@ fn retained_release_evidence_matches_the_documented_protocol() {
     assert_eq!(report["schema_version"], 6);
     assert_eq!(report["profile"], "release");
     assert_eq!(environment["git_dirty"], false);
-    assert_eq!(environment["git_commit"], "f95a7872e84db029acc3a769d62f59bdb4c1ccb8");
+    assert_eq!(
+        environment["git_commit"],
+        "f95a7872e84db029acc3a769d62f59bdb4c1ccb8"
+    );
     assert_eq!(
         environment["source_manifest_scope"],
         "bytewise path-sorted `mode type blob_oid<TAB>path` records from `git ls-tree -r --full-tree HEAD`, excluding only paths under benchmarks/results/, joined with LF and terminated by LF"
@@ -140,9 +156,8 @@ fn retained_release_evidence_matches_the_documented_protocol() {
         );
     }
     assert!(BENCHMARK_README.contains("seed `0x545552424f4b5604`"));
-    assert!(BENCHMARK_README.contains(
-        "cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks --"
-    ));
+    assert!(BENCHMARK_README
+        .contains("cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks --"));
 }
 
 fn grouped_integer(value: f64) -> String {

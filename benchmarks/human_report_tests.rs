@@ -45,7 +45,7 @@ mod tests {
             }
         };
         let report = Report {
-            schema_version: 6,
+            schema_version: 7,
             generated_unix_seconds: 1,
             profile: Profile::Quick,
             dataset: Profile::Quick.defaults(),
@@ -101,6 +101,14 @@ mod tests {
         assert_eq!(json["results"][0]["disk_amplification"], 2.139_034);
         assert!(json["results"][1]["write_amplification"].is_null());
         assert!(json["results"][1]["disk_amplification"].is_null());
+        assert_eq!(
+            serde_json::to_value(Workload::SequentialBatch100).unwrap(),
+            "sequential_batch_100"
+        );
+        assert_eq!(
+            serde_json::to_value(Workload::SequentialBatch1000).unwrap(),
+            "sequential_batch_1000"
+        );
 
         let human = human_report(&report);
         assert!(human.contains("resolved dependencies (benchmark Cargo.lock):"));

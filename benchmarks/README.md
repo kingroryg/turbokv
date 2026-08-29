@@ -37,14 +37,29 @@ cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- \
   --profile quick
 ```
 
-The release profile is the production-scale durable comparison. It uses
+The ingest profile is the focused production-scale table used by the root
+README. It runs the three single-key mutation shapes plus sequential atomic
+batches of 100 and 1,000 keys, for 45 measurements (3 engines × 1 durable
+class × 5 workloads × 3 repetitions):
+
+```console
+cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- \
+  --profile ingest --confirm-release \
+  --machine "Apple M4 (Mac16,1), 32 GiB, macOS 15.3.2"
+```
+
+Throughput for batch workloads is inserted keys per second. Their latency
+samples are complete atomic batch commits, not individual keys.
+
+The release profile is the complete production-scale durable comparison. It uses
 200,000 keys, three repetitions, five scan passes, and five recovery
 reopens. Its 84,000,000 logical key/value bytes exceed the common 64 MiB
 memtable, crossing the in-memory generation boundary and making the settlement
-phase persist more data than one configured memtable. Automatic maintenance is
+phase persists more data than one configured memtable. Automatic maintenance is
 still deferred by the equivalence contract, so acknowledgement rows do not
 claim background-flush or backpressure throughput. The profile emits 81 raw
-measurements (3 engines × 1 durable class × 9 workloads × 3 repetitions).
+measurements plus 18 atomic-batch measurements (3 engines × 1 durable class ×
+11 workloads × 3 repetitions).
 Release runs require both an explicit acknowledgement and a stable machine
 name, and refuse a dirty tracked Git worktree:
 
@@ -57,7 +72,7 @@ cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- \
 Power-loss-oriented single-write measurements are intentionally separate and
 bounded: an fsync per acknowledgement is governed primarily by storage sync
 latency and does not need to overflow the memtable to measure that boundary.
-The paranoid profile uses 1,000 keys and emits the same 81-cell workload matrix
+The paranoid profile uses 1,000 keys and emits the same 99-cell workload matrix
 for only the paranoid durability class:
 
 ```console
@@ -103,7 +118,7 @@ Results carry a durability key and must only be compared within that class:
 |---|---|---|---|
 | Durable acknowledgement | durable WAL, `sync_on_write=false`, committed v5 record through a physically reserved shared mapping or ordered-write fallback | insert then keyspace-wide `PersistMode::Buffer` | one write transaction committed with `Durability::Eventual` |
 | Paranoid acknowledgement | paranoid WAL, group size 1, delay 0, Rust `File::sync_all` | insert then keyspace-wide `PersistMode::SyncAll` | one write transaction committed with `Durability::Immediate`, then Rust `File::sync_all` on the database file |
-| Write batch / callers | 1 / 1 | 1 / 1 | 1 / 1 |
+| Write batch / callers | 1, 100, or 1,000 / 1 | 1, 100, or 1,000 / 1 | 1, 100, or 1,000 / 1 |
 | Compression / block cache | none / 0 | none / 0 | not applicable / 0 |
 | Memtable | 64 MiB | 64 MiB | not applicable (copy-on-write B-tree) |
 | Maintenance workers | one flush task and one compaction task | one flush worker, zero compaction workers | none |

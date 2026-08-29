@@ -45,6 +45,31 @@ async fn redb_adapter_recovers_scans_settles_and_reopens() {
 }
 
 #[tokio::test]
+async fn every_adapter_commits_atomic_insert_batches() {
+    let keys = vec![
+        b"batch-a".to_vec(),
+        b"batch-b".to_vec(),
+        b"batch-c".to_vec(),
+    ];
+    for engine in engine::EngineName::ALL {
+        let directory = tempfile::tempdir().unwrap();
+        let database = engine::Database::open(engine, Durability::Durable, directory.path())
+            .await
+            .unwrap();
+        database.put_batch(&keys, b"value").await.unwrap();
+        for key in &keys {
+            assert_eq!(
+                database.get(key).await.unwrap(),
+                Some(b"value".to_vec()),
+                "{} lost a committed batch key",
+                engine.as_str()
+            );
+        }
+        database.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn turbo_paranoid_drop_hands_directory_to_the_next_opener() {
     let directory = tempfile::tempdir().unwrap();
     let mut database = engine::Database::open(

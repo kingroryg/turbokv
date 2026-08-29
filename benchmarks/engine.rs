@@ -1,7 +1,7 @@
 use crate::protocol::{AcknowledgementBoundary, Durability, MEMTABLE_BYTES};
 use fjall::{
-    CompressionType as FjallCompression, Config as FjallConfig, Keyspace, PartitionCreateOptions,
-    PartitionHandle, PersistMode,
+    Batch as FjallBatch, CompressionType as FjallCompression, Config as FjallConfig, Keyspace,
+    PartitionCreateOptions, PartitionHandle, PersistMode,
 };
 use redb::{
     Database as RedbDatabase, Durability as RedbDurability, ReadableTableMetadata, TableDefinition,
@@ -11,7 +11,9 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use turbokv::{Engine, PhysicalStats, StorageConfig, StorageError, WalConfig};
+use turbokv::{
+    Engine, PhysicalStats, StorageConfig, StorageError, WalConfig, WriteBatch as TurboWriteBatch,
+};
 
 pub type DynError = Box<dyn std::error::Error>;
 
@@ -177,6 +179,42 @@ impl Database {
                 {
                     let mut table = transaction.open_table(REDB_TABLE)?;
                     table.insert(key, value)?;
+                }
+                transaction.commit()?;
+                if state.full_sync_after_commit {
+                    state.sync_file()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn put_batch(&self, keys: &[Vec<u8>], value: &[u8]) -> Result<(), DynError> {
+        match self.state()? {
+            State::Turbo(engine) => {
+                let mut batch = TurboWriteBatch::with_capacity(keys.len());
+                for key in keys {
+                    batch.put(key, value);
+                }
+                engine.write_batch(&batch).await?;
+            }
+            State::Fjall(state) => {
+                let mut batch = FjallBatch::with_capacity(state.keyspace.clone(), keys.len())
+                    .durability(Some(state.acknowledgement_persist_mode));
+                for key in keys {
+                    batch.insert(&state.partition, key.as_slice(), value);
+                }
+                batch.commit()?;
+            }
+            State::Redb(state) => {
+                let db = state.lock()?;
+                let mut transaction = db.begin_write()?;
+                transaction.set_durability(state.commit_durability);
+                {
+                    let mut table = transaction.open_table(REDB_TABLE)?;
+                    for key in keys {
+                        table.insert(key.as_slice(), value)?;
+                    }
                 }
                 transaction.commit()?;
                 if state.full_sync_after_commit {
