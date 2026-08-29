@@ -53,6 +53,16 @@ fn release_requires_explicit_confirmation_and_machine_name() {
     ])
     .unwrap();
     assert_eq!(paranoid.profile, Profile::Paranoid);
+
+    let ingest = Cli::parse([
+        "--profile".into(),
+        "ingest".into(),
+        "--confirm-release".into(),
+        "--machine".into(),
+        "Apple M4 reference".into(),
+    ])
+    .unwrap();
+    assert_eq!(ingest.profile, Profile::Ingest);
 }
 
 #[test]
@@ -61,6 +71,10 @@ fn release_is_production_scale_durable_and_paranoid_is_explicitly_bounded() {
     let release_logical_bytes = release.keys * (KEY_BYTES + release.value_bytes) as u64;
     assert!(release_logical_bytes > MEMTABLE_BYTES as u64);
     assert_eq!(Profile::Release.durabilities(), [Durability::Durable]);
+
+    let ingest = Profile::Ingest.defaults();
+    assert_eq!(ingest, release);
+    assert_eq!(Profile::Ingest.durabilities(), [Durability::Durable]);
 
     let paranoid = Profile::Paranoid.defaults();
     let paranoid_logical_bytes = paranoid.keys * (KEY_BYTES + paranoid.value_bytes) as u64;
@@ -116,6 +130,8 @@ fn repeated_run_dispersion_is_population_standard_deviation() {
 #[test]
 fn release_requires_a_clean_source_tree() {
     assert!(ensure_release_reproducible(Profile::Quick, true).is_ok());
+    assert!(ensure_release_reproducible(Profile::Ingest, false).is_ok());
+    assert!(ensure_release_reproducible(Profile::Ingest, true).is_err());
     assert!(ensure_release_reproducible(Profile::Release, false).is_ok());
     assert!(ensure_release_reproducible(Profile::Release, true).is_err());
     assert!(ensure_release_reproducible(Profile::Paranoid, false).is_ok());

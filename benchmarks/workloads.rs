@@ -24,6 +24,10 @@ pub enum Workload {
     SequentialFill,
     RandomFill,
     Overwrite,
+    #[serde(rename = "sequential_batch_100")]
+    SequentialBatch100,
+    #[serde(rename = "sequential_batch_1000")]
+    SequentialBatch1000,
     RandomRead,
     SequentialScan,
     Mixed,
@@ -33,16 +37,26 @@ pub enum Workload {
 }
 
 impl Workload {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::SequentialFill,
         Self::RandomFill,
         Self::Overwrite,
+        Self::SequentialBatch100,
+        Self::SequentialBatch1000,
         Self::RandomRead,
         Self::SequentialScan,
         Self::Mixed,
         Self::Recovery,
         Self::Flush,
         Self::Compaction,
+    ];
+
+    pub const INGEST: [Self; 5] = [
+        Self::SequentialFill,
+        Self::RandomFill,
+        Self::Overwrite,
+        Self::SequentialBatch100,
+        Self::SequentialBatch1000,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -62,6 +76,16 @@ impl Workload {
             Self::SequentialFill => WorkloadMetadata::database("sequential_fill"),
             Self::RandomFill => WorkloadMetadata::database("random_fill"),
             Self::Overwrite => WorkloadMetadata::database("overwrite"),
+            Self::SequentialBatch100 => WorkloadMetadata {
+                name: "sequential_batch_100",
+                operation_unit: "keys inserted",
+                latency_unit: "100-key atomic batch commits",
+            },
+            Self::SequentialBatch1000 => WorkloadMetadata {
+                name: "sequential_batch_1000",
+                operation_unit: "keys inserted",
+                latency_unit: "1,000-key atomic batch commits",
+            },
             Self::RandomRead => WorkloadMetadata::database("random_read"),
             Self::SequentialScan => WorkloadMetadata {
                 name: "sequential_scan",
@@ -181,6 +205,14 @@ pub async fn run(
                 logical_mutation_bytes: logical_bytes(config, config.keys),
                 counters: database.counters()?.delta(before),
             }
+        }
+        Workload::SequentialBatch100 => {
+            let keys = sequential_keys(config.keys);
+            run_batch_fill(&database, &keys, &value, config, 100).await?
+        }
+        Workload::SequentialBatch1000 => {
+            let keys = sequential_keys(config.keys);
+            run_batch_fill(&database, &keys, &value, config, 1_000).await?
         }
         Workload::RandomRead => {
             write_setup(&database, &keys, &value).await?;
@@ -403,6 +435,33 @@ async fn run_fill(
 ) -> Result<Outcome, DynError> {
     let before = database.counters()?;
     let (acknowledgement, samples) = timed_puts(database, keys, value).await?;
+    let settlement = database.settle(config.keys).await?;
+    Ok(Outcome {
+        operations: config.keys,
+        acknowledgement,
+        settlement,
+        samples,
+        logical_mutation_bytes: logical_bytes(config, config.keys),
+        counters: database.counters()?.delta(before),
+    })
+}
+
+async fn run_batch_fill(
+    database: &Database,
+    keys: &[Vec<u8>],
+    value: &[u8],
+    config: &WorkloadConfig,
+    batch_size: usize,
+) -> Result<Outcome, DynError> {
+    let before = database.counters()?;
+    let started = Instant::now();
+    let mut samples = Vec::with_capacity(keys.len().div_ceil(batch_size));
+    for batch in keys.chunks(batch_size) {
+        let operation = Instant::now();
+        database.put_batch(batch, value).await?;
+        samples.push(nanos(operation.elapsed()));
+    }
+    let acknowledgement = started.elapsed();
     let settlement = database.settle(config.keys).await?;
     Ok(Outcome {
         operations: config.keys,

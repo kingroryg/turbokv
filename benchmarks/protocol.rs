@@ -44,6 +44,7 @@ pub enum AcknowledgementBoundary {
 #[serde(rename_all = "snake_case")]
 pub enum Profile {
     Quick,
+    Ingest,
     Release,
     Paranoid,
 }
@@ -52,10 +53,11 @@ impl Profile {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "quick" => Ok(Self::Quick),
+            "ingest" => Ok(Self::Ingest),
             "release" => Ok(Self::Release),
             "paranoid" => Ok(Self::Paranoid),
             _ => Err(format!(
-                "unknown profile {value:?}; expected quick, release, or paranoid"
+                "unknown profile {value:?}; expected quick, ingest, release, or paranoid"
             )),
         }
     }
@@ -70,7 +72,7 @@ impl Profile {
                 recovery_cycles: 3,
                 seed: SEED,
             },
-            Self::Release => WorkloadConfig {
+            Self::Ingest | Self::Release => WorkloadConfig {
                 keys: 200_000,
                 value_bytes: 400,
                 repetitions: 3,
@@ -92,18 +94,19 @@ impl Profile {
     pub const fn durabilities(self) -> &'static [Durability] {
         match self {
             Self::Quick => &Durability::ALL,
-            Self::Release => &Durability::DURABLE_ONLY,
+            Self::Ingest | Self::Release => &Durability::DURABLE_ONLY,
             Self::Paranoid => &Durability::PARANOID_ONLY,
         }
     }
 
     const fn requires_release_controls(self) -> bool {
-        matches!(self, Self::Release | Self::Paranoid)
+        matches!(self, Self::Ingest | Self::Release | Self::Paranoid)
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Quick => "quick",
+            Self::Ingest => "ingest",
             Self::Release => "release",
             Self::Paranoid => "paranoid",
         }
@@ -176,7 +179,7 @@ impl Cli {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- --profile quick|release|paranoid [--output DIR] [--machine NAME] [--confirm-release]"
+    "usage: cargo bench --manifest-path benchmarks/Cargo.toml --bench benchmarks -- --profile quick|ingest|release|paranoid [--output DIR] [--machine NAME] [--confirm-release]"
 }
 
 pub fn percentile(sorted_values: &[u64], percentile: u32) -> u64 {

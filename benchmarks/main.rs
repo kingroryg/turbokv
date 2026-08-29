@@ -56,7 +56,8 @@ struct Protocol {
 #[derive(Clone, Copy, Debug, Serialize)]
 struct CommonSettings {
     durable_storage_enabled: bool,
-    batch_size: u32,
+    single_key_batch_size: u32,
+    atomic_batch_sizes: [u32; 2],
     concurrency: u32,
     key_bytes: usize,
     memtable_bytes: usize,
@@ -163,15 +164,16 @@ async fn main() -> Result<(), DynError> {
 async fn run(profile: Profile, environment: Environment) -> Result<Report, DynError> {
     let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let dataset = profile.defaults();
+    let workloads = profile_workloads(profile);
     let mut results = Vec::with_capacity(
         profile.durabilities().len()
             * dataset.repetitions as usize
-            * Workload::ALL.len()
+            * workloads.len()
             * EngineName::ALL.len(),
     );
     for (durability_index, &durability) in profile.durabilities().iter().enumerate() {
         for repetition in 1..=dataset.repetitions {
-            for (workload_index, workload) in Workload::ALL.into_iter().enumerate() {
+            for (workload_index, &workload) in workloads.iter().enumerate() {
                 let rotation = (durability_index + repetition as usize - 1 + workload_index)
                     % EngineName::ALL.len();
                 for offset in 0..EngineName::ALL.len() {
@@ -190,9 +192,9 @@ async fn run(profile: Profile, environment: Environment) -> Result<Report, DynEr
             }
         }
     }
-    let summaries = summaries(&results, profile.durabilities());
+    let summaries = summaries(&results, profile.durabilities(), workloads);
     Ok(Report {
-        schema_version: 6,
+        schema_version: 7,
         generated_unix_seconds,
         profile,
         dataset,
@@ -230,8 +232,9 @@ fn protocol_settings(profile: Profile) -> Protocol {
                 },
             })
             .collect(),
-        workloads: Workload::ALL
-            .into_iter()
+        workloads: profile_workloads(profile)
+            .iter()
+            .copied()
             .map(Workload::as_str)
             .collect(),
         workload_order: "fixed documented order",
@@ -245,10 +248,11 @@ fn protocol_settings(profile: Profile) -> Protocol {
         recovery_boundary:
             "time to reopen after a subprocess acknowledged a marker and exited without running database destructors; post-open marker verification is excluded",
         production_scale_rule:
-            "release durable logical key-plus-value bytes exceed the configured LSM memtable; quick and paranoid profiles are explicitly bounded and are not production-scale ingest evidence",
+            "ingest and release durable logical key-plus-value bytes exceed the configured LSM memtable; quick and paranoid profiles are explicitly bounded and are not production-scale ingest evidence",
         common: CommonSettings {
             durable_storage_enabled: true,
-            batch_size: 1,
+            single_key_batch_size: 1,
+            atomic_batch_sizes: [100, 1_000],
             concurrency: 1,
             key_bytes: KEY_BYTES,
             memtable_bytes: MEMTABLE_BYTES,
@@ -392,12 +396,16 @@ fn direct_dependencies() -> BTreeMap<String, String> {
     .collect()
 }
 
-fn summaries(results: &[Measurement], durabilities: &[Durability]) -> Vec<Summary> {
+fn summaries(
+    results: &[Measurement],
+    durabilities: &[Durability],
+    workloads: &[Workload],
+) -> Vec<Summary> {
     let mut output =
-        Vec::with_capacity(EngineName::ALL.len() * durabilities.len() * Workload::ALL.len());
+        Vec::with_capacity(EngineName::ALL.len() * durabilities.len() * workloads.len());
     for engine in EngineName::ALL {
         for &durability in durabilities {
-            for workload in Workload::ALL {
+            for &workload in workloads {
                 let matching = results
                     .iter()
                     .filter(|result| {
@@ -427,6 +435,13 @@ fn summaries(results: &[Measurement], durabilities: &[Durability]) -> Vec<Summar
         }
     }
     output
+}
+
+const fn profile_workloads(profile: Profile) -> &'static [Workload] {
+    match profile {
+        Profile::Ingest => &Workload::INGEST,
+        Profile::Quick | Profile::Release | Profile::Paranoid => &Workload::ALL,
+    }
 }
 
 fn environment(machine: Option<&str>) -> Result<Environment, DynError> {
@@ -506,7 +521,7 @@ fn git_blob_hash(content: &str) -> Result<String, DynError> {
 
 fn human_report(report: &Report) -> String {
     let mut output = format!(
-        "TurboKV durability-equivalent baseline protocol v{} ({})\ncommit: {}{}\nsource manifest git hash: {}\nmachine: {} / {} / {} / {} bytes RAM\nenvironment: {} / {} / {} CPUs / filesystem {} / {}\ndataset: {} keys, {}-byte keys, {}-byte values, seed {:#x}, {} repetition(s)\nequivalence: durable storage; durable and paranoid classes reported separately; compression {} where applicable; configured block cache {} bytes; batch {}; concurrency {}; LSM memtable {} bytes (redb uses a copy-on-write B-tree)\nbenchmark Cargo.lock fnv1a64: {}\n\n",
+        "TurboKV durability-equivalent baseline protocol v{} ({})\ncommit: {}{}\nsource manifest git hash: {}\nmachine: {} / {} / {} / {} bytes RAM\nenvironment: {} / {} / {} CPUs / filesystem {} / {}\ndataset: {} keys, {}-byte keys, {}-byte values, seed {:#x}, {} repetition(s)\nequivalence: durable storage; durable and paranoid classes reported separately; compression {} where applicable; configured block cache {} bytes; single-key batch {}; atomic batch sizes {} and {}; concurrency {}; LSM memtable {} bytes (redb uses a copy-on-write B-tree)\nbenchmark Cargo.lock fnv1a64: {}\n\n",
         report.schema_version,
         report.profile.as_str(),
         report.environment.git_commit,
@@ -528,7 +543,9 @@ fn human_report(report: &Report) -> String {
         report.dataset.repetitions,
         report.protocol.common.compression,
         report.protocol.common.block_cache_bytes,
-        report.protocol.common.batch_size,
+        report.protocol.common.single_key_batch_size,
+        report.protocol.common.atomic_batch_sizes[0],
+        report.protocol.common.atomic_batch_sizes[1],
         report.protocol.common.concurrency,
         report.protocol.common.memtable_bytes,
         report.benchmark_lock_fnv1a64,
