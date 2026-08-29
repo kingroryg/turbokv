@@ -28,6 +28,7 @@ mod file;
 mod iterator;
 mod reservation;
 mod types;
+mod verified_arithmetic;
 
 pub use iterator::WalEntryIterator;
 pub use types::{

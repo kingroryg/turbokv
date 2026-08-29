@@ -1,0 +1,13 @@
+{
+  "profile": [],
+  "proofs": {
+    "Coma": {
+      "vc_checked_record_end": { "prover": "alt-ergo", "time": 0.009 },
+      "vc_elim_Some": { "prover": "alt-ergo", "time": 0.01 },
+      "vc_prove_successful_record_end_is_exact": {
+        "prover": "alt-ergo",
+        "time": 0.018
+      }
+    }
+  }
+}

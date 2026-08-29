@@ -1,0 +1,13 @@
+{
+  "profile": [],
+  "proofs": {
+    "Coma": {
+      "vc_checked_record_end": { "prover": "alt-ergo", "time": 0.009 },
+      "vc_is_none_u64": { "prover": "alt-ergo", "time": 0.008 },
+      "vc_prove_rejection_means_overflow": {
+        "prover": "alt-ergo",
+        "time": 0.01
+      }
+    }
+  }
+}

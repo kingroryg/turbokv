@@ -32,6 +32,7 @@ use crate::core::crypto::crc32_checksum;
 
 use super::reservation::{allocation_api_unsupported, reserve_file_space, AllocationResult};
 use super::types::*;
+use super::verified_arithmetic::checked_record_end;
 
 const MAX_SUFFIX_CANDIDATE_OFFSETS: u64 = 64 * 1024;
 const MAX_SUFFIX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
@@ -1023,9 +1024,7 @@ fn read_record_at(
     ) as u64;
     let v5_tag_published = format == WalFormat::Current
         && base_header[V5_COMMIT_TAG_OFFSET..ENTRY_HEADER_SIZE] == V5_COMMIT_TAG;
-    let declared_end = offset
-        .checked_add(header_size)
-        .and_then(|end| end.checked_add(length));
+    let declared_end = checked_record_end(offset, header_size, length);
     let Some(end) = declared_end else {
         return Err(RecordReadError::Damage(RecordFailure {
             reason: "record length overflows the file offset".to_string(),

@@ -1,0 +1,11 @@
+[package]
+name = "turbokv-creusot-wal-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+creusot-std = "=0.13.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(creusot)"] }
