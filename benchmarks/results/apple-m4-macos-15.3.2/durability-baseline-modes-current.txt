@@ -1,0 +1,215 @@
+TurboKV durability-equivalent baseline protocol v8 (modes)
+commit: 44dd06c0c3fbc83db48f4b19acd51a4861bdb344
+source manifest git hash: 687d7d5540bc5a03bb28172950706b7293ca29c6
+machine: Apple M4 (Mac16,1), 32 GiB, macOS 15.3.2 / Apple M4 / Mac16,1 / 34359738368 bytes RAM
+environment: ProductName:		macOS; ProductVersion:		15.3.2; BuildVersion:		24D81 / aarch64 / 10 CPUs / filesystem APFS / rustc 1.88.0 (6b00bc388 2025-06-23)
+dataset: 200000 keys, 20-byte keys, 400-byte values, seed 0x545552424f4b5604, 3 repetition(s)
+equivalence: durable storage; durable and paranoid classes reported separately; compression disabled where applicable; configured block cache 0 bytes; single-key batch 1; atomic batch sizes 100 and 1000; concurrency 1; LSM memtable 67108864 bytes (redb uses a copy-on-write B-tree)
+benchmark Cargo.lock fnv1a64: 395647ed150b4a81
+
+resolved dependencies (benchmark Cargo.lock):
+  allocator-api2: 0.2.21
+  bitflags: 2.13.1
+  byteorder: 1.5.0
+  bytes: 1.12.1
+  byteview: 0.6.1
+  cc: 1.4.3
+  cfg-if: 1.0.4
+  compare: 0.0.6
+  crc32fast: 1.5.0
+  crossbeam-epoch: 0.9.20
+  crossbeam-skiplist: 0.1.3
+  crossbeam-utils: 0.8.22
+  dashmap: 6.2.1
+  double-ended-peekable: 0.1.0
+  enum_dispatch: 0.3.13
+  equivalent: 1.0.2
+  errno: 0.3.14
+  fastrand: 2.5.0
+  find-msvc-tools: 0.1.11
+  fjall: 2.11.2
+  foldhash: 0.1.5
+  getrandom: 0.3.4, 0.4.3
+  guardian: 1.3.0
+  gxhash: 3.5.0
+  hashbrown: 0.14.5, 0.15.5, 0.16.1
+  hermit-abi: 0.5.2
+  interval-heap: 0.0.5
+  itoa: 1.0.18
+  jobserver: 0.1.35
+  libc: 0.2.189
+  linux-raw-sys: 0.12.1
+  lock_api: 0.4.14
+  log: 0.4.33
+  lru: 0.12.5
+  lsm-tree: 2.10.4
+  lz4_flex: 0.11.6
+  memchr: 2.8.3
+  memmap2: 0.9.11
+  num_cpus: 1.17.0
+  once_cell: 1.21.4
+  parking_lot: 0.12.5
+  parking_lot_core: 0.9.12
+  path-absolutize: 3.1.1
+  path-dedot: 3.1.1
+  pin-project-lite: 0.2.17
+  pkg-config: 0.3.34
+  proc-macro2: 1.0.107
+  quick_cache: 0.6.24
+  quote: 1.0.47
+  r-efi: 5.3.0, 6.0.0
+  redb: 2.6.3
+  redox_syscall: 0.5.18
+  rustc-hash: 2.1.3
+  rustix: 1.1.4
+  rustversion: 1.0.23
+  scopeguard: 1.2.0
+  self_cell: 1.3.0
+  serde: 1.0.228
+  serde_bytes: 0.11.19
+  serde_core: 1.0.228
+  serde_derive: 1.0.228
+  serde_json: 1.0.148
+  shlex: 2.0.1
+  smallvec: 1.15.2
+  snap: 1.1.2
+  std-semaphore: 0.1.0
+  syn: 2.0.119, 3.0.3
+  tempfile: 3.24.0
+  thiserror: 2.0.20
+  thiserror-impl: 2.0.20
+  tokio: 1.49.0
+  tokio-macros: 2.6.1
+  tracing: 0.1.44
+  tracing-attributes: 0.1.31
+  tracing-core: 0.1.36
+  turbokv: 0.6.0
+  turbokv-benchmarks: 0.1.0
+  twox-hash: 2.1.3
+  unicode-ident: 1.0.24
+  value-log: 1.9.0
+  varint-rs: 2.2.1
+  wasip2: 1.0.4+wasi-0.2.12
+  windows-link: 0.2.1
+  windows-sys: 0.61.2
+  wit-bindgen: 0.57.1
+  xxhash-rust: 0.8.18
+  zmij: 1.0.23
+  zstd: 0.13.3
+  zstd-safe: 7.2.4
+  zstd-sys: 2.0.16+zstd.1.5.7
+
+engine    mode      workload          run  ack ops/s  settled ops/s  p50 ns  p95 ns  p99 ns  max ns  disk bytes  wal bytes  flush bytes  compact r/w
+turbokv   fast      sequential_fill     1    3087871         804060      83     125   13417   80334    88478822          0     88478382 0/0
+turbokv   durable   sequential_fill     1    1798118         634550     458    1000    1458 1199875   179678886   91200000     88478382 0/0
+turbokv   paranoid  sequential_fill     1        224            224 4184250 5350125 8929083 163818208   179696693   91200000     88495983 0/0
+turbokv   durable   random_fill         1     906806         240173     875    1875    3500 2147875   179678886   91200000     88478382 0/0
+turbokv   paranoid  random_fill         1        213            212 4651000 5781875 9639625 155293125   179678884   91200000     88513584 88513584/88478382
+turbokv   fast      random_fill         1    1217087         359038      83     125   36459  247375    88478822          0     88478382 0/0
+turbokv   paranoid  overwrite           1        213            213 4645209 5793667 9478334 255784167   270878884   91200000     88513539 177009522/88478382
+turbokv   fast      overwrite           1    1278894         223846      83     125   36209  177416    88478820          0     88478382 176956764/88478382
+turbokv   durable   overwrite           1     912740         176810     875    1958    3583  292625   270878884   91200000     88478382 176956764/88478382
+turbokv   fast      sequential_batch_100   1    3856202         404594   25166   29958   40125  106834    88478822          0     88478382 0/0
+turbokv   durable   sequential_batch_100   1    2277031         326101   37167   88333  164916  349916   174350886   85872000     88478382 0/0
+turbokv   paranoid  sequential_batch_100   1      20670          19974 4844125 6092458 9629791 15810916   174350886   85872000     88478382 0/0
+turbokv   durable   sequential_batch_1000   1    2360162         337156  402375  611083  779750  836041   174286131   85807200     88478427 0/0
+turbokv   paranoid  sequential_batch_1000   1     161677         127345 6047792 7254666 13059333 15087666   174286131   85807200     88478427 0/0
+turbokv   fast      sequential_batch_1000   1    3724635         526071  259042  318375  372750  379416    88478867          0     88478427 0/0
+turbokv   durable   sequential_fill     2    1774574         294954     458    1041    1583  463250   179678886   91200000     88478382 0/0
+turbokv   paranoid  sequential_fill     2        213            213 4564417 5797958 9703875 277837792   179678884   91200000     88513584 88513584/88478382
+turbokv   fast      sequential_fill     2    2877258         398353      83     125   14291  112375    88478822          0     88478382 0/0
+turbokv   paranoid  random_fill         2        226            226 4043833 5403042 9351625 255443209   179696738   91200000     88496028 0/0
+turbokv   fast      random_fill         2    1395045         378036      83     125   32250  108334    88478822          0     88478382 0/0
+turbokv   durable   random_fill         2    1005553         240365     791    1709    2667 2187833   179678886   91200000     88478382 0/0
+turbokv   fast      overwrite           2    1358980         312488      83     125   32833  102375    88478820          0     88478382 176956764/88478382
+turbokv   durable   overwrite           2     929340         226216     833    2000    3125 1062917   270878884   91200000     88478382 176956764/88478382
+turbokv   paranoid  overwrite           2        210            210 4240792 6083834 12363708 298442917   270878886   91200000     88513539 176991921/88478382
+turbokv   durable   sequential_batch_100   2    2297104         370700   33250   76000   87167 9122541   174350886   85872000     88478382 0/0
+turbokv   paranoid  sequential_batch_100   2      23150          22380 4032541 5084416 9458583 21830708   174350886   85872000     88478382 0/0
+turbokv   fast      sequential_batch_100   2    3998937         615992   24084   31292   40958  130041    88478822          0     88478382 0/0
+turbokv   paranoid  sequential_batch_1000   2     174468         137320 5707041 6862459 8667750 10130792   174286131   85807200     88478427 0/0
+turbokv   fast      sequential_batch_1000   2    3917165         537879  253084  290417  401250  580833    88478867          0     88478427 0/0
+turbokv   durable   sequential_batch_1000   2    2564314         425800  372458  553708  643542  723625   174286131   85807200     88478427 0/0
+turbokv   paranoid  sequential_fill     3        211            211 4326750 5872916 10275000 174465125   179678884   91200000     88513539 88513539/88478382
+turbokv   fast      sequential_fill     3    2989537         466419      83     125   13917   74542    88478822          0     88478382 0/0
+turbokv   durable   sequential_fill     3    1727328         284598     459    1083    1500  324875   179678886   91200000     88478382 0/0
+turbokv   fast      random_fill         3    1210662         332467      83     125   35792  204875    88478822          0     88478382 0/0
+turbokv   durable   random_fill         3     855930         232059     916    2083    5166  272333   179678886   91200000     88478382 0/0
+turbokv   paranoid  random_fill         3        236            235 4012459 5212333 8667291 38603709   179696693   91200000     88495983 0/0
+turbokv   durable   overwrite           3     995493         311859     792    1833    2750  452375   270878884   91200000     88478382 176956764/88478382
+turbokv   paranoid  overwrite           3        195            195 4747750 6786750 24699584 197461375   270878886   91200000     88513539 176991921/88478382
+turbokv   fast      overwrite           3    1226353         260626      83     125   36334  163917    88478820          0     88478382 176956764/88478382
+turbokv   paranoid  sequential_batch_100   3      20314          19753 4736542 5788750 21111958 47959833   174350886   85872000     88478382 0/0
+turbokv   fast      sequential_batch_100   3    3822134         624333   25334   31625   39250   82500    88478822          0     88478382 0/0
+turbokv   durable   sequential_batch_100   3    2076863         213912   39834   82916  164000  741125   174350886   85872000     88478382 0/0
+turbokv   fast      sequential_batch_1000   3    3434670         408902  277750  385958  507208  622792    88478867          0     88478427 0/0
+turbokv   durable   sequential_batch_1000   3    2380390         316103  394209  565042  666500  678959   174286131   85807200     88478427 0/0
+turbokv   paranoid  sequential_batch_1000   3     162938         126292 6087458 7449959 9071042 9848750   174286131   85807200     88478427 0/0
+
+storage accounting
+engine    mode      workload          run  logical mutation bytes  logical live bytes  write amp  disk amp
+turbokv   fast      sequential_fill     1                84000000            84000000   1.053314  1.053319
+turbokv   durable   sequential_fill     1                84000000            84000000   2.139028  2.139034
+turbokv   paranoid  sequential_fill     1                84000000            84000000   2.139238  2.139246
+turbokv   durable   random_fill         1                84000000            84000000   2.139028  2.139034
+turbokv   paranoid  random_fill         1                84000000            84000000   3.192762  2.139034
+turbokv   fast      random_fill         1                84000000            84000000   1.053314  1.053319
+turbokv   paranoid  overwrite           1                84000000            84000000   3.192761  3.224749
+turbokv   fast      overwrite           1                84000000            84000000   2.106628  1.053319
+turbokv   durable   overwrite           1                84000000            84000000   3.192342  3.224749
+turbokv   fast      sequential_batch_100   1                84000000            84000000   1.053314  1.053319
+turbokv   durable   sequential_batch_100   1                84000000            84000000   2.075600  2.075606
+turbokv   paranoid  sequential_batch_100   1                84000000            84000000   2.075600  2.075606
+turbokv   durable   sequential_batch_1000   1                84000000            84000000   2.074829  2.074835
+turbokv   paranoid  sequential_batch_1000   1                84000000            84000000   2.074829  2.074835
+turbokv   fast      sequential_batch_1000   1                84000000            84000000   1.053315  1.053320
+turbokv   durable   sequential_fill     2                84000000            84000000   2.139028  2.139034
+turbokv   paranoid  sequential_fill     2                84000000            84000000   3.192762  2.139034
+turbokv   fast      sequential_fill     2                84000000            84000000   1.053314  1.053319
+turbokv   paranoid  random_fill         2                84000000            84000000   2.139238  2.139247
+turbokv   fast      random_fill         2                84000000            84000000   1.053314  1.053319
+turbokv   durable   random_fill         2                84000000            84000000   2.139028  2.139034
+turbokv   fast      overwrite           2                84000000            84000000   2.106628  1.053319
+turbokv   durable   overwrite           2                84000000            84000000   3.192342  3.224749
+turbokv   paranoid  overwrite           2                84000000            84000000   3.192761  3.224749
+turbokv   durable   sequential_batch_100   2                84000000            84000000   2.075600  2.075606
+turbokv   paranoid  sequential_batch_100   2                84000000            84000000   2.075600  2.075606
+turbokv   fast      sequential_batch_100   2                84000000            84000000   1.053314  1.053319
+turbokv   paranoid  sequential_batch_1000   2                84000000            84000000   2.074829  2.074835
+turbokv   fast      sequential_batch_1000   2                84000000            84000000   1.053315  1.053320
+turbokv   durable   sequential_batch_1000   2                84000000            84000000   2.074829  2.074835
+turbokv   paranoid  sequential_fill     3                84000000            84000000   3.192761  2.139034
+turbokv   fast      sequential_fill     3                84000000            84000000   1.053314  1.053319
+turbokv   durable   sequential_fill     3                84000000            84000000   2.139028  2.139034
+turbokv   fast      random_fill         3                84000000            84000000   1.053314  1.053319
+turbokv   durable   random_fill         3                84000000            84000000   2.139028  2.139034
+turbokv   paranoid  random_fill         3                84000000            84000000   2.139238  2.139246
+turbokv   durable   overwrite           3                84000000            84000000   3.192342  3.224749
+turbokv   paranoid  overwrite           3                84000000            84000000   3.192761  3.224749
+turbokv   fast      overwrite           3                84000000            84000000   2.106628  1.053319
+turbokv   paranoid  sequential_batch_100   3                84000000            84000000   2.075600  2.075606
+turbokv   fast      sequential_batch_100   3                84000000            84000000   1.053314  1.053319
+turbokv   durable   sequential_batch_100   3                84000000            84000000   2.075600  2.075606
+turbokv   fast      sequential_batch_1000   3                84000000            84000000   1.053315  1.053320
+turbokv   durable   sequential_batch_1000   3                84000000            84000000   2.074829  2.074835
+turbokv   paranoid  sequential_batch_1000   3                84000000            84000000   2.074829  2.074835
+
+repeated-run throughput dispersion (population CV)
+engine    mode      workload          ack median  ack CV%  settled median  settled CV%
+turbokv   fast      sequential_fill      2989537     2.88          466419        31.89
+turbokv   fast      random_fill          1217087     6.71          359038         5.24
+turbokv   fast      overwrite            1278894     4.23          260626        13.69
+turbokv   fast      sequential_batch_100    3856202     1.97          615992        18.54
+turbokv   fast      sequential_batch_1000    3724635     5.37          526071        11.86
+turbokv   durable   sequential_fill      1774574     1.67          294954        40.17
+turbokv   durable   random_fill           906806     6.73          240173         1.63
+turbokv   durable   overwrite             929340     3.78          226216        23.41
+turbokv   durable   sequential_batch_100    2277031     4.48          326101        21.73
+turbokv   durable   sequential_batch_1000    2380390     3.77          337156        13.22
+turbokv   paranoid  sequential_fill          213     2.66             213         2.67
+turbokv   paranoid  random_fill              226     4.17             226         4.19
+turbokv   paranoid  overwrite                210     3.87             210         3.87
+turbokv   paranoid  sequential_batch_100      20670     5.90           19974         5.75
+turbokv   paranoid  sequential_batch_1000     162938     3.46          127345         3.81
+
+Null byte counters mean unavailable, never estimated. Setup is excluded from each timed workload. Durable and paranoid rows are different durability classes and must not be compared with each other. These are baseline observations, not performance claims.

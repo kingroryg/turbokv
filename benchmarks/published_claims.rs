@@ -12,11 +12,16 @@ const INGEST_ARTIFACT: &str =
 const INGEST_TIMESTAMPED_ARTIFACT: &str = include_str!(
     "results/apple-m4-macos-15.3.2/durability-baseline-ingest-release-1787966746.json"
 );
+const MODE_ARTIFACT: &str =
+    include_str!("results/apple-m4-macos-15.3.2/durability-baseline-modes-current.json");
+const MODE_TIMESTAMPED_ARTIFACT: &str =
+    include_str!("results/apple-m4-macos-15.3.2/durability-baseline-modes-release-1787978384.json");
 const REQUIRED_DURABLE_INGEST: [&str; 3] = ["sequential_fill", "random_fill", "overwrite"];
 
 #[test]
 fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
-    let report = ingest_report();
+    let cross_engine = ingest_report();
+    let modes = mode_report();
     let headings = README
         .lines()
         .filter(|line| line.starts_with("## "))
@@ -54,19 +59,26 @@ fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
             "",
         ),
     ] {
-        let turbo = median(
-            &report,
-            "turbo_kv",
+        let fast = mode_median(&modes, "fast", workload);
+        let durable = mode_median(&modes, "durable", workload);
+        let paranoid = mode_median(&modes, "paranoid", workload);
+        let fjall = median(
+            &cross_engine,
+            "fjall",
             workload,
             "acknowledgement_ops_per_second",
         );
-        let fjall = median(&report, "fjall", workload, "acknowledgement_ops_per_second");
-        let redb = median(&report, "redb", workload, "acknowledgement_ops_per_second");
-        let ratio = turbo / fjall;
-        assert!(ratio.is_finite() && ratio > 0.0, "invalid {workload} ratio");
+        let redb = median(
+            &cross_engine,
+            "redb",
+            workload,
+            "acknowledgement_ops_per_second",
+        );
         let row = format!(
-            "| {label} | — | {} | — | {} | {}{redb_note} | {ratio:.3}× |",
-            grouped_integer(turbo),
+            "| {label} | {} | {} | {} | {} | {}{redb_note} |",
+            grouped_integer(fast),
+            grouped_integer(durable),
+            grouped_integer(paranoid),
             grouped_integer(fjall),
             grouped_integer(redb),
         );
@@ -78,16 +90,54 @@ fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
 
     assert!(REQUIRED_DURABLE_INGEST
         .iter()
-        .all(|workload| acknowledgement_ratio(&report, workload) > 1.0));
+        .all(|workload| acknowledgement_ratio(&cross_engine, workload) > 1.0));
     assert!(README.contains("Cross-engine settled timings are not"));
     assert!(README.contains("compared."));
     assert!(README.contains("2.6.3's `Durability::Eventual` performs a macOS"));
     assert!(README.contains("Batching amortizes that fixed"));
-    assert!(README.contains("TurboKV Fast (no WAL)"));
-    assert!(README.contains("TurboKV Recoverable (OS cache)"));
-    assert!(README.contains("TurboKV Durable (sync)"));
-    assert!(README.contains("An em dash means the"));
+    assert!(README.contains("TurboKV Fast | TurboKV Durable | TurboKV Paranoid"));
+    assert!(README.contains("Paranoid performs that sync before"));
     assert_eq!(INGEST_ARTIFACT, INGEST_TIMESTAMPED_ARTIFACT);
+    assert_eq!(MODE_ARTIFACT, MODE_TIMESTAMPED_ARTIFACT);
+}
+
+#[test]
+fn retained_mode_evidence_matches_the_documented_protocol() {
+    let report = mode_report();
+    let results = report["results"].as_array().unwrap();
+    let summaries = report["summaries"].as_array().unwrap();
+
+    assert_eq!(report["schema_version"], 8);
+    assert_eq!(report["profile"], "modes");
+    assert_eq!(report["dataset"]["keys"], 200_000);
+    assert_eq!(report["dataset"]["value_bytes"], 400);
+    assert_eq!(report["dataset"]["repetitions"], 3);
+    assert_eq!(report["environment"]["git_dirty"], false);
+    assert_eq!(
+        report["environment"]["git_commit"],
+        "44dd06c0c3fbc83db48f4b19acd51a4861bdb344"
+    );
+    assert_eq!(
+        report["environment"]["source_manifest_git_hash"],
+        "687d7d5540bc5a03bb28172950706b7293ca29c6"
+    );
+    assert_eq!(report["generated_unix_seconds"], 1_787_978_384_u64);
+    assert_eq!(results.len(), 45);
+    assert_eq!(summaries.len(), 15);
+    assert!(results
+        .iter()
+        .all(|measurement| measurement["engine"] == "turbo_kv"));
+    for mode in ["fast", "durable", "paranoid"] {
+        assert_eq!(
+            results
+                .iter()
+                .filter(|measurement| measurement["durability"] == mode)
+                .count(),
+            15
+        );
+    }
+    assert_eq!(report["engine_settings"].as_array().unwrap().len(), 1);
+    assert_eq!(report["counter_availability"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -250,6 +300,20 @@ fn ingest_report() -> Value {
     serde_json::from_str(INGEST_ARTIFACT).expect("retained ingest artifact must be JSON")
 }
 
+fn mode_report() -> Value {
+    serde_json::from_str(MODE_ARTIFACT).expect("retained mode artifact must be JSON")
+}
+
+fn mode_median(report: &Value, mode: &str, workload: &str) -> f64 {
+    median_for_mode(
+        report,
+        "turbo_kv",
+        mode,
+        workload,
+        "acknowledgement_ops_per_second",
+    )
+}
+
 fn acknowledgement_ratio(report: &Value, workload: &str) -> f64 {
     median(
         report,
@@ -260,17 +324,27 @@ fn acknowledgement_ratio(report: &Value, workload: &str) -> f64 {
 }
 
 fn median(report: &Value, engine: &str, workload: &str, boundary: &str) -> f64 {
+    median_for_mode(report, engine, "durable", workload, boundary)
+}
+
+fn median_for_mode(
+    report: &Value,
+    engine: &str,
+    mode: &str,
+    workload: &str,
+    boundary: &str,
+) -> f64 {
     report["summaries"]
         .as_array()
         .expect("summaries must be an array")
         .iter()
         .find(|summary| {
             summary["engine"] == engine
-                && summary["durability"] == "durable"
+                && summary["durability"] == mode
                 && summary["workload"] == workload
         })
-        .unwrap_or_else(|| panic!("missing durable summary for {engine}/{workload}"))[boundary]
+        .unwrap_or_else(|| panic!("missing {mode} summary for {engine}/{workload}"))[boundary]
         ["median"]
         .as_f64()
-        .unwrap_or_else(|| panic!("missing median {boundary} for {engine}/{workload}"))
+        .unwrap_or_else(|| panic!("missing median {boundary} for {engine}/{mode}/{workload}"))
 }

@@ -1,0 +1,2106 @@
+{
+  "schema_version": 8,
+  "generated_unix_seconds": 1787978384,
+  "profile": "modes",
+  "dataset": {
+    "keys": 200000,
+    "value_bytes": 400,
+    "repetitions": 3,
+    "scan_passes": 5,
+    "recovery_cycles": 5,
+    "seed": 6076853716958008836
+  },
+  "protocol": {
+    "durability_classes": [
+      {
+        "durability": "fast",
+        "acknowledgement": "the mutation is published to the in-memory table without a write-ahead log",
+        "comparison_rule": "TurboKV-only no-WAL baseline; do not compare it with persistent rows"
+      },
+      {
+        "durability": "durable",
+        "acknowledgement": "the engine's acknowledged recovery state has reached its named non-full-sync operating-system persistence boundary",
+        "comparison_rule": "process-crash durability only; compare throughput only with other durable rows"
+      },
+      {
+        "durability": "paranoid",
+        "acknowledgement": "the engine's acknowledged recovery state has crossed a macOS full-storage synchronization barrier",
+        "comparison_rule": "power-loss-oriented full-sync boundary; compare throughput only with other paranoid rows"
+      }
+    ],
+    "workloads": [
+      "sequential_fill",
+      "random_fill",
+      "overwrite",
+      "sequential_batch_100",
+      "sequential_batch_1000"
+    ],
+    "workload_order": "fixed documented order",
+    "durability_order": "deterministic Latin rotation by workload and repetition",
+    "engine_order": "deterministic Latin rotation by workload and repetition",
+    "setup_boundary": "dataset preparation and prerequisite settlement are excluded from measured workload time",
+    "acknowledgement_boundary": "all measured operations returned successfully; mutation acknowledgement uses the row's named durability class",
+    "settled_boundary": "acknowledgement followed by synchronous forced flush and two manual compaction drains for mutation workloads",
+    "recovery_boundary": "time to reopen after a subprocess acknowledged a marker and exited without running database destructors; post-open marker verification is excluded",
+    "production_scale_rule": "ingest, modes, and release logical key-plus-value bytes exceed the configured LSM memtable; quick and paranoid profiles are explicitly bounded",
+    "common": {
+      "durable_storage_enabled": true,
+      "single_key_batch_size": 1,
+      "atomic_batch_sizes": [
+        100,
+        1000
+      ],
+      "concurrency": 1,
+      "key_bytes": 20,
+      "memtable_bytes": 67108864,
+      "compression": "disabled",
+      "block_cache_bytes": 0
+    },
+    "os_page_cache": "enabled and not cleared between runs; every measurement uses a fresh directory",
+    "mixed_read_percent": 50,
+    "mixed_write_percent": 50
+  },
+  "engine_settings": [
+    {
+      "engine": "turbo_kv",
+      "version": "0.6.0 (path source measured at report git commit)",
+      "storage_model": "memtable with an optional write-ahead log",
+      "acknowledgement_modes": [
+        {
+          "durability": "fast",
+          "acknowledgement": "StorageConfig::fast; publication to the memtable without a write-ahead log",
+          "conservative_difference": "process termination can lose acknowledged writes that have not completed settlement"
+        },
+        {
+          "durability": "durable",
+          "acknowledgement": "StorageConfig/WalConfig::durable; committed v5 record through a physically reserved shared WAL mapping, with ordered file-write fallback, and sync_on_write=false",
+          "conservative_difference": "TurboKV reserves active-WAL capacity in bounded chunks; unsupported allocation APIs retain the ordered-write path"
+        },
+        {
+          "durability": "paranoid",
+          "acknowledgement": "StorageConfig/WalConfig::paranoid; Rust File::sync_all; group size 1 and zero collection delay",
+          "conservative_difference": "none"
+        }
+      ],
+      "settlement": "foreground flush then two coordinated manual compaction drains",
+      "automatic_flush_workers": "one async task installed; polling interval raised to 3600 seconds",
+      "automatic_compaction_workers": "one async task installed; polling interval raised to 3600 seconds",
+      "differences": "async API; bounded runs use explicit foreground flush/compaction before deferred polling"
+    }
+  ],
+  "counter_availability": [
+    {
+      "engine": "turbo_kv",
+      "disk_bytes": "recursive exact file length at measurement boundary",
+      "wal_bytes": "process-lifetime exact engine counter delta",
+      "flush_bytes": "process-lifetime exact engine counter delta",
+      "compaction_bytes": "process-lifetime exact input/output counter delta",
+      "amplification": "WAL + flush output + compaction output divided by timed logical mutation bytes"
+    }
+  ],
+  "environment": {
+    "machine_name": "Apple M4 (Mac16,1), 32 GiB, macOS 15.3.2",
+    "cpu": "Apple M4",
+    "hardware_model": "Mac16,1",
+    "memory_bytes": 34359738368,
+    "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.3.2\nBuildVersion:\t\t24D81",
+    "architecture": "aarch64",
+    "cpu_parallelism": 10,
+    "filesystem": "APFS",
+    "rustc": "rustc 1.88.0 (6b00bc388 2025-06-23)",
+    "git_commit": "44dd06c0c3fbc83db48f4b19acd51a4861bdb344",
+    "source_manifest_git_hash": "687d7d5540bc5a03bb28172950706b7293ca29c6",
+    "source_manifest_hash_algorithm": "Git blob object ID using this repository's SHA-1 object format",
+    "source_manifest_scope": "bytewise path-sorted `mode type blob_oid<TAB>path` records from `git ls-tree -r --full-tree HEAD`, excluding only paths under benchmarks/results/, joined with LF and terminated by LF",
+    "git_dirty": false,
+    "power_policy": "operator-controlled; harness does not change macOS power settings",
+    "thermal_policy": "operator-controlled; harness does not read or change fan/thermal policy",
+    "background_load": "release protocol requires an otherwise idle host; not programmatically enforced"
+  },
+  "direct_dependencies": {
+    "fjall": "2.11.2",
+    "redb": "2.6.3",
+    "serde": "1.0.228",
+    "serde_json": "1.0.148",
+    "tempfile": "3.24.0",
+    "tokio": "1.49.0",
+    "turbokv": "0.6.0 path"
+  },
+  "resolved_dependencies": {
+    "allocator-api2": [
+      "0.2.21"
+    ],
+    "bitflags": [
+      "2.13.1"
+    ],
+    "byteorder": [
+      "1.5.0"
+    ],
+    "bytes": [
+      "1.12.1"
+    ],
+    "byteview": [
+      "0.6.1"
+    ],
+    "cc": [
+      "1.4.3"
+    ],
+    "cfg-if": [
+      "1.0.4"
+    ],
+    "compare": [
+      "0.0.6"
+    ],
+    "crc32fast": [
+      "1.5.0"
+    ],
+    "crossbeam-epoch": [
+      "0.9.20"
+    ],
+    "crossbeam-skiplist": [
+      "0.1.3"
+    ],
+    "crossbeam-utils": [
+      "0.8.22"
+    ],
+    "dashmap": [
+      "6.2.1"
+    ],
+    "double-ended-peekable": [
+      "0.1.0"
+    ],
+    "enum_dispatch": [
+      "0.3.13"
+    ],
+    "equivalent": [
+      "1.0.2"
+    ],
+    "errno": [
+      "0.3.14"
+    ],
+    "fastrand": [
+      "2.5.0"
+    ],
+    "find-msvc-tools": [
+      "0.1.11"
+    ],
+    "fjall": [
+      "2.11.2"
+    ],
+    "foldhash": [
+      "0.1.5"
+    ],
+    "getrandom": [
+      "0.3.4",
+      "0.4.3"
+    ],
+    "guardian": [
+      "1.3.0"
+    ],
+    "gxhash": [
+      "3.5.0"
+    ],
+    "hashbrown": [
+      "0.14.5",
+      "0.15.5",
+      "0.16.1"
+    ],
+    "hermit-abi": [
+      "0.5.2"
+    ],
+    "interval-heap": [
+      "0.0.5"
+    ],
+    "itoa": [
+      "1.0.18"
+    ],
+    "jobserver": [
+      "0.1.35"
+    ],
+    "libc": [
+      "0.2.189"
+    ],
+    "linux-raw-sys": [
+      "0.12.1"
+    ],
+    "lock_api": [
+      "0.4.14"
+    ],
+    "log": [
+      "0.4.33"
+    ],
+    "lru": [
+      "0.12.5"
+    ],
+    "lsm-tree": [
+      "2.10.4"
+    ],
+    "lz4_flex": [
+      "0.11.6"
+    ],
+    "memchr": [
+      "2.8.3"
+    ],
+    "memmap2": [
+      "0.9.11"
+    ],
+    "num_cpus": [
+      "1.17.0"
+    ],
+    "once_cell": [
+      "1.21.4"
+    ],
+    "parking_lot": [
+      "0.12.5"
+    ],
+    "parking_lot_core": [
+      "0.9.12"
+    ],
+    "path-absolutize": [
+      "3.1.1"
+    ],
+    "path-dedot": [
+      "3.1.1"
+    ],
+    "pin-project-lite": [
+      "0.2.17"
+    ],
+    "pkg-config": [
+      "0.3.34"
+    ],
+    "proc-macro2": [
+      "1.0.107"
+    ],
+    "quick_cache": [
+      "0.6.24"
+    ],
+    "quote": [
+      "1.0.47"
+    ],
+    "r-efi": [
+      "5.3.0",
+      "6.0.0"
+    ],
+    "redb": [
+      "2.6.3"
+    ],
+    "redox_syscall": [
+      "0.5.18"
+    ],
+    "rustc-hash": [
+      "2.1.3"
+    ],
+    "rustix": [
+      "1.1.4"
+    ],
+    "rustversion": [
+      "1.0.23"
+    ],
+    "scopeguard": [
+      "1.2.0"
+    ],
+    "self_cell": [
+      "1.3.0"
+    ],
+    "serde": [
+      "1.0.228"
+    ],
+    "serde_bytes": [
+      "0.11.19"
+    ],
+    "serde_core": [
+      "1.0.228"
+    ],
+    "serde_derive": [
+      "1.0.228"
+    ],
+    "serde_json": [
+      "1.0.148"
+    ],
+    "shlex": [
+      "2.0.1"
+    ],
+    "smallvec": [
+      "1.15.2"
+    ],
+    "snap": [
+      "1.1.2"
+    ],
+    "std-semaphore": [
+      "0.1.0"
+    ],
+    "syn": [
+      "2.0.119",
+      "3.0.3"
+    ],
+    "tempfile": [
+      "3.24.0"
+    ],
+    "thiserror": [
+      "2.0.20"
+    ],
+    "thiserror-impl": [
+      "2.0.20"
+    ],
+    "tokio": [
+      "1.49.0"
+    ],
+    "tokio-macros": [
+      "2.6.1"
+    ],
+    "tracing": [
+      "0.1.44"
+    ],
+    "tracing-attributes": [
+      "0.1.31"
+    ],
+    "tracing-core": [
+      "0.1.36"
+    ],
+    "turbokv": [
+      "0.6.0"
+    ],
+    "turbokv-benchmarks": [
+      "0.1.0"
+    ],
+    "twox-hash": [
+      "2.1.3"
+    ],
+    "unicode-ident": [
+      "1.0.24"
+    ],
+    "value-log": [
+      "1.9.0"
+    ],
+    "varint-rs": [
+      "2.2.1"
+    ],
+    "wasip2": [
+      "1.0.4+wasi-0.2.12"
+    ],
+    "windows-link": [
+      "0.2.1"
+    ],
+    "windows-sys": [
+      "0.61.2"
+    ],
+    "wit-bindgen": [
+      "0.57.1"
+    ],
+    "xxhash-rust": [
+      "0.8.18"
+    ],
+    "zmij": [
+      "1.0.23"
+    ],
+    "zstd": [
+      "0.13.3"
+    ],
+    "zstd-safe": [
+      "7.2.4"
+    ],
+    "zstd-sys": [
+      "2.0.16+zstd.1.5.7"
+    ]
+  },
+  "benchmark_lock_fnv1a64": "395647ed150b4a81",
+  "results": [
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "sequential_fill",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.064769541,
+      "settlement_seconds": 0.183968,
+      "total_seconds": 0.248737541,
+      "acknowledgement_ops_per_second": 3087871.195505307,
+      "fully_settled_ops_per_second": 804060.3730178389,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 83,
+        "p95": 125,
+        "p99": 13417,
+        "maximum": 80334
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478822,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 1.0533140714285714,
+      "disk_amplification": 1.0533193095238096
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "sequential_fill",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.111227375,
+      "settlement_seconds": 0.203956458,
+      "total_seconds": 0.315183833,
+      "acknowledgement_ops_per_second": 1798118.4937610908,
+      "fully_settled_ops_per_second": 634550.3133721963,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 458,
+        "p95": 1000,
+        "p99": 1458,
+        "maximum": 1199875
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 179678886,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.139028357142857,
+      "disk_amplification": 2.139034357142857
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "sequential_fill",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 891.432497958,
+      "settlement_seconds": 0.380419083,
+      "total_seconds": 891.812917041,
+      "acknowledgement_ops_per_second": 224.357986115762,
+      "fully_settled_ops_per_second": 224.26228212032643,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 4184250,
+        "p95": 5350125,
+        "p99": 8929083,
+        "maximum": 163818208
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 179696693,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88495983,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.139237892857143,
+      "disk_amplification": 2.1392463452380954
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "random_fill",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.220554458,
+      "settlement_seconds": 0.612179167,
+      "total_seconds": 0.832733625,
+      "acknowledgement_ops_per_second": 906805.5201133137,
+      "fully_settled_ops_per_second": 240172.84038458276,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 875,
+        "p95": 1875,
+        "p99": 3500,
+        "maximum": 2147875
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 179678886,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.139028357142857,
+      "disk_amplification": 2.139034357142857
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "random_fill",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 940.520130833,
+      "settlement_seconds": 0.659610166,
+      "total_seconds": 941.179740999,
+      "acknowledgement_ops_per_second": 212.64829262385268,
+      "fully_settled_ops_per_second": 212.4992616051353,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 4651000,
+        "p95": 5781875,
+        "p99": 9639625,
+        "maximum": 155293125
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 179678884,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88513584,
+      "compaction_bytes_read": 88513584,
+      "compaction_bytes_written": 88478382,
+      "write_amplification": 3.1927615,
+      "disk_amplification": 2.1390343333333335
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "random_fill",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.164326791,
+      "settlement_seconds": 0.392718,
+      "total_seconds": 0.557044791,
+      "acknowledgement_ops_per_second": 1217086.9934410148,
+      "fully_settled_ops_per_second": 359037.55538394395,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 83,
+        "p95": 125,
+        "p99": 36459,
+        "maximum": 247375
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478822,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 1.0533140714285714,
+      "disk_amplification": 1.0533193095238096
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "overwrite",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 939.288258791,
+      "settlement_seconds": 0.69188425,
+      "total_seconds": 939.980143041,
+      "acknowledgement_ops_per_second": 212.92717983873126,
+      "fully_settled_ops_per_second": 212.77045210015294,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 4645209,
+        "p95": 5793667,
+        "p99": 9478334,
+        "maximum": 255784167
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 270878884,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88513539,
+      "compaction_bytes_read": 177009522,
+      "compaction_bytes_written": 88478382,
+      "write_amplification": 3.192760964285714,
+      "disk_amplification": 3.224748619047619
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "overwrite",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.156385083,
+      "settlement_seconds": 0.737084709,
+      "total_seconds": 0.893469792,
+      "acknowledgement_ops_per_second": 1278894.3559277963,
+      "fully_settled_ops_per_second": 223846.40397556944,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 83,
+        "p95": 125,
+        "p99": 36209,
+        "maximum": 177416
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478820,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 176956764,
+      "compaction_bytes_written": 88478382,
+      "write_amplification": 2.1066281428571427,
+      "disk_amplification": 1.0533192857142857
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "overwrite",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.219120542,
+      "settlement_seconds": 0.912037208,
+      "total_seconds": 1.13115775,
+      "acknowledgement_ops_per_second": 912739.6189080256,
+      "fully_settled_ops_per_second": 176809.99842860113,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 875,
+        "p95": 1958,
+        "p99": 3583,
+        "maximum": 292625
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 270878884,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 176956764,
+      "compaction_bytes_written": 88478382,
+      "write_amplification": 3.1923424285714286,
+      "disk_amplification": 3.224748619047619
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "sequential_batch_100",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 0.0518645,
+      "settlement_seconds": 0.442457708,
+      "total_seconds": 0.494322208,
+      "acknowledgement_ops_per_second": 3856202.219244377,
+      "fully_settled_ops_per_second": 404594.40576054394,
+      "latency_unit": "100-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 2000,
+        "p50": 25166,
+        "p95": 29958,
+        "p99": 40125,
+        "maximum": 106834
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478822,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 1.0533140714285714,
+      "disk_amplification": 1.0533193095238096
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "sequential_batch_100",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 0.087833667,
+      "settlement_seconds": 0.52547375,
+      "total_seconds": 0.613307417,
+      "acknowledgement_ops_per_second": 2277031.1980712363,
+      "fully_settled_ops_per_second": 326100.7358728877,
+      "latency_unit": "100-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 2000,
+        "p50": 37167,
+        "p95": 88333,
+        "p99": 164916,
+        "maximum": 349916
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 174350886,
+      "wal_bytes_written": 85872000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.0755997857142856,
+      "disk_amplification": 2.0756057857142856
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "sequential_batch_100",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 9.675687167,
+      "settlement_seconds": 0.337216208,
+      "total_seconds": 10.012903375,
+      "acknowledgement_ops_per_second": 20670.366512274406,
+      "fully_settled_ops_per_second": 19974.22650650516,
+      "latency_unit": "100-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 2000,
+        "p50": 4844125,
+        "p95": 6092458,
+        "p99": 9629791,
+        "maximum": 15810916
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 174350886,
+      "wal_bytes_written": 85872000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.0755997857142856,
+      "disk_amplification": 2.0756057857142856
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "sequential_batch_1000",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 0.084739958,
+      "settlement_seconds": 0.508458125,
+      "total_seconds": 0.593198083,
+      "acknowledgement_ops_per_second": 2360161.6606890457,
+      "fully_settled_ops_per_second": 337155.50628305046,
+      "latency_unit": "1,000-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 200,
+        "p50": 402375,
+        "p95": 611083,
+        "p99": 779750,
+        "maximum": 836041
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 174286131,
+      "wal_bytes_written": 85807200,
+      "flush_bytes_written": 88478427,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.074828892857143,
+      "disk_amplification": 2.074834892857143
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "sequential_batch_1000",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 1.237037458,
+      "settlement_seconds": 0.333499167,
+      "total_seconds": 1.570536625,
+      "acknowledgement_ops_per_second": 161676.59168813948,
+      "fully_settled_ops_per_second": 127345.00858902288,
+      "latency_unit": "1,000-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 200,
+        "p50": 6047792,
+        "p95": 7254666,
+        "p99": 13059333,
+        "maximum": 15087666
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 174286131,
+      "wal_bytes_written": 85807200,
+      "flush_bytes_written": 88478427,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.074828892857143,
+      "disk_amplification": 2.074834892857143
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "sequential_batch_1000",
+      "repetition": 1,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 0.053696542,
+      "settlement_seconds": 0.326480291,
+      "total_seconds": 0.380176833,
+      "acknowledgement_ops_per_second": 3724634.6328968448,
+      "fully_settled_ops_per_second": 526070.9823420513,
+      "latency_unit": "1,000-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 200,
+        "p50": 259042,
+        "p95": 318375,
+        "p99": 372750,
+        "maximum": 379416
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478867,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478427,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 1.0533146071428572,
+      "disk_amplification": 1.0533198452380952
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "sequential_fill",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.112703125,
+      "settlement_seconds": 0.565369458,
+      "total_seconds": 0.678072583,
+      "acknowledgement_ops_per_second": 1774573.6863995562,
+      "fully_settled_ops_per_second": 294953.6745979892,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 458,
+        "p95": 1041,
+        "p99": 1583,
+        "maximum": 463250
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 179678886,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.139028357142857,
+      "disk_amplification": 2.139034357142857
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "sequential_fill",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 937.047414209,
+      "settlement_seconds": 0.601355416,
+      "total_seconds": 937.648769625,
+      "acknowledgement_ops_per_second": 213.4363714869521,
+      "fully_settled_ops_per_second": 213.29948534992192,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 4564417,
+        "p95": 5797958,
+        "p99": 9703875,
+        "maximum": 277837792
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 179678884,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88513584,
+      "compaction_bytes_read": 88513584,
+      "compaction_bytes_written": 88478382,
+      "write_amplification": 3.1927615,
+      "disk_amplification": 2.1390343333333335
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "sequential_fill",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.069510625,
+      "settlement_seconds": 0.432556958,
+      "total_seconds": 0.502067583,
+      "acknowledgement_ops_per_second": 2877257.9731515865,
+      "fully_settled_ops_per_second": 398352.7452717456,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 83,
+        "p95": 125,
+        "p99": 14291,
+        "maximum": 112375
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478822,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 1.0533140714285714,
+      "disk_amplification": 1.0533193095238096
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "random_fill",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 886.31860075,
+      "settlement_seconds": 0.438569667,
+      "total_seconds": 886.757170417,
+      "acknowledgement_ops_per_second": 225.65249091101174,
+      "fully_settled_ops_per_second": 225.54088838768504,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 4043833,
+        "p95": 5403042,
+        "p99": 9351625,
+        "maximum": 255443209
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 179696738,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88496028,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.1392384285714288,
+      "disk_amplification": 2.139246880952381
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "random_fill",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.143364542,
+      "settlement_seconds": 0.385684958,
+      "total_seconds": 0.5290495,
+      "acknowledgement_ops_per_second": 1395045.0872294488,
+      "fully_settled_ops_per_second": 378036.45972635836,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 83,
+        "p95": 125,
+        "p99": 32250,
+        "maximum": 108334
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478822,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 1.0533140714285714,
+      "disk_amplification": 1.0533193095238096
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "random_fill",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.198895542,
+      "settlement_seconds": 0.633173917,
+      "total_seconds": 0.832069459,
+      "acknowledgement_ops_per_second": 1005552.9550280217,
+      "fully_settled_ops_per_second": 240364.54870049498,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 791,
+        "p95": 1709,
+        "p99": 2667,
+        "maximum": 2187833
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 179678886,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.139028357142857,
+      "disk_amplification": 2.139034357142857
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "overwrite",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.147169166,
+      "settlement_seconds": 0.492854542,
+      "total_seconds": 0.640023708,
+      "acknowledgement_ops_per_second": 1358980.317928825,
+      "fully_settled_ops_per_second": 312488.42425693397,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 83,
+        "p95": 125,
+        "p99": 32833,
+        "maximum": 102375
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478820,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 176956764,
+      "compaction_bytes_written": 88478382,
+      "write_amplification": 2.1066281428571427,
+      "disk_amplification": 1.0533192857142857
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "overwrite",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.215206375,
+      "settlement_seconds": 0.668904,
+      "total_seconds": 0.884110375,
+      "acknowledgement_ops_per_second": 929340.4993230335,
+      "fully_settled_ops_per_second": 226216.09886661492,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 833,
+        "p95": 2000,
+        "p99": 3125,
+        "maximum": 1062917
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 270878884,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 176956764,
+      "compaction_bytes_written": 88478382,
+      "write_amplification": 3.1923424285714286,
+      "disk_amplification": 3.224748619047619
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "overwrite",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 953.103983417,
+      "settlement_seconds": 0.710317541,
+      "total_seconds": 953.814300958,
+      "acknowledgement_ops_per_second": 209.84069259995573,
+      "fully_settled_ops_per_second": 209.68442158932018,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 4240792,
+        "p95": 6083834,
+        "p99": 12363708,
+        "maximum": 298442917
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 270878886,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88513539,
+      "compaction_bytes_read": 176991921,
+      "compaction_bytes_written": 88478382,
+      "write_amplification": 3.192760964285714,
+      "disk_amplification": 3.224748642857143
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "sequential_batch_100",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 0.087066167,
+      "settlement_seconds": 0.452453958,
+      "total_seconds": 0.539520125,
+      "acknowledgement_ops_per_second": 2297103.535062018,
+      "fully_settled_ops_per_second": 370699.79548955656,
+      "latency_unit": "100-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 2000,
+        "p50": 33250,
+        "p95": 76000,
+        "p99": 87167,
+        "maximum": 9122541
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 174350886,
+      "wal_bytes_written": 85872000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.0755997857142856,
+      "disk_amplification": 2.0756057857142856
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "sequential_batch_100",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 8.639259625,
+      "settlement_seconds": 0.297197375,
+      "total_seconds": 8.936457,
+      "acknowledgement_ops_per_second": 23150.131918856416,
+      "fully_settled_ops_per_second": 22380.23413529545,
+      "latency_unit": "100-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 2000,
+        "p50": 4032541,
+        "p95": 5084416,
+        "p99": 9458583,
+        "maximum": 21830708
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 174350886,
+      "wal_bytes_written": 85872000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.0755997857142856,
+      "disk_amplification": 2.0756057857142856
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "sequential_batch_100",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 0.050013291,
+      "settlement_seconds": 0.274666125,
+      "total_seconds": 0.324679416,
+      "acknowledgement_ops_per_second": 3998937.0025659776,
+      "fully_settled_ops_per_second": 615992.2377093348,
+      "latency_unit": "100-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 2000,
+        "p50": 24084,
+        "p95": 31292,
+        "p99": 40958,
+        "maximum": 130041
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478822,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 1.0533140714285714,
+      "disk_amplification": 1.0533193095238096
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "sequential_batch_1000",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 1.146341334,
+      "settlement_seconds": 0.310109625,
+      "total_seconds": 1.456450959,
+      "acknowledgement_ops_per_second": 174468.1048027184,
+      "fully_settled_ops_per_second": 137320.10594941012,
+      "latency_unit": "1,000-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 200,
+        "p50": 5707041,
+        "p95": 6862459,
+        "p99": 8667750,
+        "maximum": 10130792
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 174286131,
+      "wal_bytes_written": 85807200,
+      "flush_bytes_written": 88478427,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.074828892857143,
+      "disk_amplification": 2.074834892857143
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "sequential_batch_1000",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 0.051057333,
+      "settlement_seconds": 0.320773834,
+      "total_seconds": 0.371831167,
+      "acknowledgement_ops_per_second": 3917165.04267859,
+      "fully_settled_ops_per_second": 537878.5259278709,
+      "latency_unit": "1,000-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 200,
+        "p50": 253084,
+        "p95": 290417,
+        "p99": 401250,
+        "maximum": 580833
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478867,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478427,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 1.0533146071428572,
+      "disk_amplification": 1.0533198452380952
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "sequential_batch_1000",
+      "repetition": 2,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 0.077993583,
+      "settlement_seconds": 0.391710125,
+      "total_seconds": 0.469703708,
+      "acknowledgement_ops_per_second": 2564313.5282039805,
+      "fully_settled_ops_per_second": 425800.34305371076,
+      "latency_unit": "1,000-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 200,
+        "p50": 372458,
+        "p95": 553708,
+        "p99": 643542,
+        "maximum": 723625
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 174286131,
+      "wal_bytes_written": 85807200,
+      "flush_bytes_written": 88478427,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.074828892857143,
+      "disk_amplification": 2.074834892857143
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "sequential_fill",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 947.074051875,
+      "settlement_seconds": 0.612675042,
+      "total_seconds": 947.686726917,
+      "acknowledgement_ops_per_second": 211.17672858214584,
+      "fully_settled_ops_per_second": 211.04020381359246,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 4326750,
+        "p95": 5872916,
+        "p99": 10275000,
+        "maximum": 174465125
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 179678884,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88513539,
+      "compaction_bytes_read": 88513539,
+      "compaction_bytes_written": 88478382,
+      "write_amplification": 3.192760964285714,
+      "disk_amplification": 2.1390343333333335
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "sequential_fill",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.0669,
+      "settlement_seconds": 0.361899375,
+      "total_seconds": 0.428799375,
+      "acknowledgement_ops_per_second": 2989536.6218236173,
+      "fully_settled_ops_per_second": 466418.59027896204,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 83,
+        "p95": 125,
+        "p99": 13917,
+        "maximum": 74542
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478822,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 1.0533140714285714,
+      "disk_amplification": 1.0533193095238096
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "sequential_fill",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.115785792,
+      "settlement_seconds": 0.586960291,
+      "total_seconds": 0.702746083,
+      "acknowledgement_ops_per_second": 1727327.6500108063,
+      "fully_settled_ops_per_second": 284597.8153961479,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 459,
+        "p95": 1083,
+        "p99": 1500,
+        "maximum": 324875
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 179678886,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.139028357142857,
+      "disk_amplification": 2.139034357142857
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "random_fill",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.165198833,
+      "settlement_seconds": 0.436364166,
+      "total_seconds": 0.601562999,
+      "acknowledgement_ops_per_second": 1210662.3053444936,
+      "fully_settled_ops_per_second": 332467.2566837842,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 83,
+        "p95": 125,
+        "p99": 35792,
+        "maximum": 204875
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478822,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 1.0533140714285714,
+      "disk_amplification": 1.0533193095238096
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "random_fill",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.233664,
+      "settlement_seconds": 0.628186333,
+      "total_seconds": 0.861850333,
+      "acknowledgement_ops_per_second": 855929.8822240481,
+      "fully_settled_ops_per_second": 232058.85330904662,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 916,
+        "p95": 2083,
+        "p99": 5166,
+        "maximum": 272333
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 179678886,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.139028357142857,
+      "disk_amplification": 2.139034357142857
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "random_fill",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 849.100913458,
+      "settlement_seconds": 0.365624667,
+      "total_seconds": 849.466538125,
+      "acknowledgement_ops_per_second": 235.54326326830974,
+      "fully_settled_ops_per_second": 235.4418814912398,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 4012459,
+        "p95": 5212333,
+        "p99": 8667291,
+        "maximum": 38603709
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 179696693,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88495983,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.139237892857143,
+      "disk_amplification": 2.1392463452380954
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "overwrite",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.200905458,
+      "settlement_seconds": 0.440409916,
+      "total_seconds": 0.641315374,
+      "acknowledgement_ops_per_second": 995493.1139800095,
+      "fully_settled_ops_per_second": 311859.0448761018,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 792,
+        "p95": 1833,
+        "p99": 2750,
+        "maximum": 452375
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 270878884,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 176956764,
+      "compaction_bytes_written": 88478382,
+      "write_amplification": 3.1923424285714286,
+      "disk_amplification": 3.224748619047619
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "overwrite",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 1027.238688,
+      "settlement_seconds": 0.760794625,
+      "total_seconds": 1027.999482625,
+      "acknowledgement_ops_per_second": 194.696716874433,
+      "fully_settled_ops_per_second": 194.5526270979236,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 4747750,
+        "p95": 6786750,
+        "p99": 24699584,
+        "maximum": 197461375
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 270878886,
+      "wal_bytes_written": 91200000,
+      "flush_bytes_written": 88513539,
+      "compaction_bytes_read": 176991921,
+      "compaction_bytes_written": 88478382,
+      "write_amplification": 3.192760964285714,
+      "disk_amplification": 3.224748642857143
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "overwrite",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "database operations",
+      "acknowledgement_seconds": 0.163085125,
+      "settlement_seconds": 0.604296583,
+      "total_seconds": 0.767381708,
+      "acknowledgement_ops_per_second": 1226353.4151259963,
+      "fully_settled_ops_per_second": 260626.48863660428,
+      "latency_unit": "individual database operations",
+      "latency_nanoseconds": {
+        "samples": 200000,
+        "p50": 83,
+        "p95": 125,
+        "p99": 36334,
+        "maximum": 163917
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478820,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 176956764,
+      "compaction_bytes_written": 88478382,
+      "write_amplification": 2.1066281428571427,
+      "disk_amplification": 1.0533192857142857
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "sequential_batch_100",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 9.845363417,
+      "settlement_seconds": 0.27955325,
+      "total_seconds": 10.124916667,
+      "acknowledgement_ops_per_second": 20314.130776996997,
+      "fully_settled_ops_per_second": 19753.24899728382,
+      "latency_unit": "100-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 2000,
+        "p50": 4736542,
+        "p95": 5788750,
+        "p99": 21111958,
+        "maximum": 47959833
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 174350886,
+      "wal_bytes_written": 85872000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.0755997857142856,
+      "disk_amplification": 2.0756057857142856
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "sequential_batch_100",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 0.052326791,
+      "settlement_seconds": 0.26801525,
+      "total_seconds": 0.320342041,
+      "acknowledgement_ops_per_second": 3822133.866378315,
+      "fully_settled_ops_per_second": 624332.6644722227,
+      "latency_unit": "100-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 2000,
+        "p50": 25334,
+        "p95": 31625,
+        "p99": 39250,
+        "maximum": 82500
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478822,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 1.0533140714285714,
+      "disk_amplification": 1.0533193095238096
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "sequential_batch_100",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 0.096299083,
+      "settlement_seconds": 0.838665708,
+      "total_seconds": 0.934964791,
+      "acknowledgement_ops_per_second": 2076862.9749049637,
+      "fully_settled_ops_per_second": 213911.7985246142,
+      "latency_unit": "100-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 2000,
+        "p50": 39834,
+        "p95": 82916,
+        "p99": 164000,
+        "maximum": 741125
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 174350886,
+      "wal_bytes_written": 85872000,
+      "flush_bytes_written": 88478382,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.0755997857142856,
+      "disk_amplification": 2.0756057857142856
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "sequential_batch_1000",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 0.05822975,
+      "settlement_seconds": 0.4308845,
+      "total_seconds": 0.48911425,
+      "acknowledgement_ops_per_second": 3434670.4219063283,
+      "fully_settled_ops_per_second": 408902.41901559813,
+      "latency_unit": "1,000-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 200,
+        "p50": 277750,
+        "p95": 385958,
+        "p99": 507208,
+        "maximum": 622792
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 88478867,
+      "wal_bytes_written": 0,
+      "flush_bytes_written": 88478427,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 1.0533146071428572,
+      "disk_amplification": 1.0533198452380952
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "sequential_batch_1000",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 0.084019833,
+      "settlement_seconds": 0.548685417,
+      "total_seconds": 0.63270525,
+      "acknowledgement_ops_per_second": 2380390.3537870636,
+      "fully_settled_ops_per_second": 316102.95631338604,
+      "latency_unit": "1,000-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 200,
+        "p50": 394209,
+        "p95": 565042,
+        "p99": 666500,
+        "maximum": 678959
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 174286131,
+      "wal_bytes_written": 85807200,
+      "flush_bytes_written": 88478427,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.074828892857143,
+      "disk_amplification": 2.074834892857143
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "sequential_batch_1000",
+      "repetition": 3,
+      "operations": 200000,
+      "operation_unit": "keys inserted",
+      "acknowledgement_seconds": 1.22745925,
+      "settlement_seconds": 0.35617725,
+      "total_seconds": 1.5836365,
+      "acknowledgement_ops_per_second": 162938.19937403218,
+      "fully_settled_ops_per_second": 126291.60795422435,
+      "latency_unit": "1,000-key atomic batch commits",
+      "latency_nanoseconds": {
+        "samples": 200,
+        "p50": 6087458,
+        "p95": 7449959,
+        "p99": 9071042,
+        "maximum": 9848750
+      },
+      "logical_mutation_bytes": 84000000,
+      "logical_live_bytes": 84000000,
+      "disk_bytes": 174286131,
+      "wal_bytes_written": 85807200,
+      "flush_bytes_written": 88478427,
+      "compaction_bytes_read": 0,
+      "compaction_bytes_written": 0,
+      "write_amplification": 2.074828892857143,
+      "disk_amplification": 2.074834892857143
+    }
+  ],
+  "summaries": [
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "sequential_fill",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 2877257.9731515865,
+        "median": 2989536.6218236173,
+        "maximum": 3087871.195505307,
+        "mean": 2984888.5968268365,
+        "standard_deviation": 86045.28055945295,
+        "coefficient_of_variation_percent": 2.882696548572219
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 398352.7452717456,
+        "median": 466418.59027896204,
+        "maximum": 804060.3730178389,
+        "mean": 556277.2361895154,
+        "standard_deviation": 177398.98907359334,
+        "coefficient_of_variation_percent": 31.89039161278139
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "random_fill",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 1210662.3053444936,
+        "median": 1217086.9934410148,
+        "maximum": 1395045.0872294488,
+        "mean": 1274264.7953383191,
+        "standard_deviation": 85444.82951497329,
+        "coefficient_of_variation_percent": 6.7054218108793915
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 332467.2566837842,
+        "median": 359037.55538394395,
+        "maximum": 378036.45972635836,
+        "mean": 356513.75726469554,
+        "standard_deviation": 18688.949215938264,
+        "coefficient_of_variation_percent": 5.2421397029182675
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "overwrite",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 1226353.4151259963,
+        "median": 1278894.3559277963,
+        "maximum": 1358980.317928825,
+        "mean": 1288076.0296608726,
+        "standard_deviation": 54532.56633225838,
+        "coefficient_of_variation_percent": 4.233644992727318
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 223846.40397556944,
+        "median": 260626.48863660428,
+        "maximum": 312488.42425693397,
+        "mean": 265653.77228970255,
+        "standard_deviation": 36362.13346864191,
+        "coefficient_of_variation_percent": 13.687791125731888
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "sequential_batch_100",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 3822133.866378315,
+        "median": 3856202.219244377,
+        "maximum": 3998937.0025659776,
+        "mean": 3892424.362729557,
+        "standard_deviation": 76589.25077077941,
+        "coefficient_of_variation_percent": 1.9676490442339982
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 404594.40576054394,
+        "median": 615992.2377093348,
+        "maximum": 624332.6644722227,
+        "mean": 548306.4359807004,
+        "standard_deviation": 101676.78005046568,
+        "coefficient_of_variation_percent": 18.543787447726505
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "fast",
+      "workload": "sequential_batch_1000",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 3434670.4219063283,
+        "median": 3724634.6328968448,
+        "maximum": 3917165.04267859,
+        "mean": 3692156.6991605875,
+        "standard_deviation": 198311.83676787876,
+        "coefficient_of_variation_percent": 5.371165227439155
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 408902.41901559813,
+        "median": 526070.9823420513,
+        "maximum": 537878.5259278709,
+        "mean": 490950.6424285068,
+        "standard_deviation": 58216.765885746274,
+        "coefficient_of_variation_percent": 11.857967146712495
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "sequential_fill",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 1727327.6500108063,
+        "median": 1774573.6863995562,
+        "maximum": 1798118.4937610908,
+        "mean": 1766673.2767238177,
+        "standard_deviation": 29435.219771589676,
+        "coefficient_of_variation_percent": 1.6661382814470032
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 284597.8153961479,
+        "median": 294953.6745979892,
+        "maximum": 634550.3133721963,
+        "mean": 404700.6011221111,
+        "standard_deviation": 162583.2681449464,
+        "coefficient_of_variation_percent": 40.17371550577209
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "random_fill",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 855929.8822240481,
+        "median": 906805.5201133137,
+        "maximum": 1005552.9550280217,
+        "mean": 922762.7857884612,
+        "standard_deviation": 62116.781010696424,
+        "coefficient_of_variation_percent": 6.73160881294322
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 232058.85330904662,
+        "median": 240172.84038458276,
+        "maximum": 240364.54870049498,
+        "mean": 237532.08079804145,
+        "standard_deviation": 3870.9475480226606,
+        "coefficient_of_variation_percent": 1.629652523152813
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "overwrite",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 912739.6189080256,
+        "median": 929340.4993230335,
+        "maximum": 995493.1139800095,
+        "mean": 945857.7440703561,
+        "standard_deviation": 35745.8600604269,
+        "coefficient_of_variation_percent": 3.779200443673483
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 176809.99842860113,
+        "median": 226216.09886661492,
+        "maximum": 311859.0448761018,
+        "mean": 238295.0473904393,
+        "standard_deviation": 55791.19993138521,
+        "coefficient_of_variation_percent": 23.4126560926686
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "sequential_batch_100",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 2076862.9749049637,
+        "median": 2277031.1980712363,
+        "maximum": 2297103.535062018,
+        "mean": 2216999.236012739,
+        "standard_deviation": 99429.55106009432,
+        "coefficient_of_variation_percent": 4.4848707859240315
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 213911.7985246142,
+        "median": 326100.7358728877,
+        "maximum": 370699.79548955656,
+        "mean": 303570.7766290195,
+        "standard_deviation": 65961.19210423387,
+        "coefficient_of_variation_percent": 21.728439356612423
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "durable",
+      "workload": "sequential_batch_1000",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 2360161.6606890457,
+        "median": 2380390.3537870636,
+        "maximum": 2564313.5282039805,
+        "mean": 2434955.1808933634,
+        "standard_deviation": 91842.20714651175,
+        "coefficient_of_variation_percent": 3.77182331186957
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 316102.95631338604,
+        "median": 337155.50628305046,
+        "maximum": 425800.34305371076,
+        "mean": 359686.26855004905,
+        "standard_deviation": 47533.18560516852,
+        "coefficient_of_variation_percent": 13.215179383072403
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "sequential_fill",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 211.17672858214584,
+        "median": 213.4363714869521,
+        "maximum": 224.357986115762,
+        "mean": 216.32369539495335,
+        "standard_deviation": 5.7555113907838935,
+        "coefficient_of_variation_percent": 2.660601456662322
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 211.04020381359246,
+        "median": 213.29948534992192,
+        "maximum": 224.26228212032643,
+        "mean": 216.2006570946136,
+        "standard_deviation": 5.774567043308634,
+        "coefficient_of_variation_percent": 2.670929460117955
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "random_fill",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 212.64829262385268,
+        "median": 225.65249091101174,
+        "maximum": 235.54326326830974,
+        "mean": 224.6146822677247,
+        "standard_deviation": 9.375596169051459,
+        "coefficient_of_variation_percent": 4.174079839481026
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 212.4992616051353,
+        "median": 225.54088838768504,
+        "maximum": 235.4418814912398,
+        "mean": 224.4940104946867,
+        "standard_deviation": 9.395492422848516,
+        "coefficient_of_variation_percent": 4.185186233764079
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "overwrite",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 194.696716874433,
+        "median": 209.84069259995573,
+        "maximum": 212.92717983873126,
+        "mean": 205.82152977104,
+        "standard_deviation": 7.966709791675441,
+        "coefficient_of_variation_percent": 3.8706882611055162
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 194.5526270979236,
+        "median": 209.68442158932018,
+        "maximum": 212.77045210015294,
+        "mean": 205.66916692913222,
+        "standard_deviation": 7.960904029174238,
+        "coefficient_of_variation_percent": 3.870732860953018
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "sequential_batch_100",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 20314.130776996997,
+        "median": 20670.366512274406,
+        "maximum": 23150.131918856416,
+        "mean": 21378.209736042605,
+        "standard_deviation": 1261.3503719513994,
+        "coefficient_of_variation_percent": 5.90016838418806
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 19753.24899728382,
+        "median": 19974.22650650516,
+        "maximum": 22380.23413529545,
+        "mean": 20702.569879694813,
+        "standard_deviation": 1189.7130692693522,
+        "coefficient_of_variation_percent": 5.746692686864102
+      }
+    },
+    {
+      "engine": "turbo_kv",
+      "durability": "paranoid",
+      "workload": "sequential_batch_1000",
+      "acknowledgement_ops_per_second": {
+        "samples": 3,
+        "minimum": 161676.59168813948,
+        "median": 162938.19937403218,
+        "maximum": 174468.1048027184,
+        "mean": 166360.9652882967,
+        "standard_deviation": 5755.704232498356,
+        "coefficient_of_variation_percent": 3.4597684754497293
+      },
+      "fully_settled_ops_per_second": {
+        "samples": 3,
+        "minimum": 126291.60795422435,
+        "median": 127345.00858902288,
+        "maximum": 137320.10594941012,
+        "mean": 130318.90749755246,
+        "standard_deviation": 4969.238576554035,
+        "coefficient_of_variation_percent": 3.8131370742556006
+      }
+    }
+  ]
+}

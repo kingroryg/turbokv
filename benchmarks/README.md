@@ -16,7 +16,8 @@ terminated with LF. The report hashes that manifest with `git hash-object
 retained TurboKV 0.6.0 ingest run used by the root README. Its measured source
 commit is recorded in the artifact and remains in repository history. The older
 `durability-baseline-current.json` is the retained TurboKV 0.5.0 release run
-and complete matrix.
+and complete matrix. `durability-baseline-modes-current.json` is the retained
+TurboKV 0.6.0 Fast/Durable/Paranoid run used for the three TurboKV columns.
 
 Cross-engine claims use only equivalent acknowledgement boundaries: the
 settlement phase invokes engine-specific compaction policies and is

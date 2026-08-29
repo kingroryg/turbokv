@@ -194,19 +194,18 @@ APIs; their complete field and method contracts are in the
 The benchmark used TurboKV 0.6.0, fjall 2.11.2, and redb 2.6.3 over three
 repetitions. Throughput is acknowledged keys per second; higher is better.
 
-| Workload | TurboKV Fast (no WAL) | TurboKV Recoverable (OS cache) | TurboKV Durable (sync) | fjall Buffer | redb Eventual | Recoverable / fjall |
-|---|---:|---:|---:|---:|---:|---:|
-| Sequential fill (1 key/txn) | — | 1,407,678 | — | 485,252 | 1,397 (macOS barrier/txn) | 2.901× |
-| Random fill (1 key/txn) | — | 834,137 | — | 456,924 | 1,549 (macOS barrier/txn) | 1.826× |
-| Overwrite (1 key/txn) | — | 853,083 | — | 446,733 | 1,516 (macOS barrier/txn) | 1.910× |
-| Sequential batch (100 keys/txn) | — | 2,272,259 | — | 511,600 | 80,197 | 4.441× |
-| Sequential batch (1,000 keys/txn) | — | 2,333,582 | — | 572,671 | 134,636 | 4.075× |
+| Workload | TurboKV Fast | TurboKV Durable | TurboKV Paranoid | fjall Buffer | redb Eventual |
+|---|---:|---:|---:|---:|---:|
+| Sequential fill (1 key/txn) | 2,989,537 | 1,774,574 | 213 | 485,252 | 1,397 (macOS barrier/txn) |
+| Random fill (1 key/txn) | 1,217,087 | 906,806 | 226 | 456,924 | 1,549 (macOS barrier/txn) |
+| Overwrite (1 key/txn) | 1,278,894 | 929,340 | 210 | 446,733 | 1,516 (macOS barrier/txn) |
+| Sequential batch (100 keys/txn) | 3,856,202 | 2,277,031 | 20,670 | 511,600 | 80,197 |
+| Sequential batch (1,000 keys/txn) | 3,724,635 | 2,380,390 | 162,938 | 572,671 | 134,636 |
 
-The measured TurboKV column is today's `DbOptions::durable()` preset; it is
-labelled Recoverable here because it survives a process crash but does not sync
-each acknowledgement to persistent storage. TurboKV Durable is today's
-`DbOptions::paranoid()` sync-before-acknowledgement preset. An em dash means the
-retained 200,000-key run did not measure that mode.
+Fast disables the WAL. Durable writes a recoverable WAL record without syncing
+each acknowledgement to persistent storage. Paranoid performs that sync before
+returning; its single-key throughput is therefore bounded by storage-sync
+latency, while explicit batches amortize one barrier across many keys.
 
 Protocol: 200,000 deterministic 20-byte keys, 400-byte values (84 MB logical
 input, above the 64 MiB memtable), one caller, atomic batches where shown,
@@ -218,10 +217,12 @@ redb barrier; its single-key rows are therefore architectural context rather
 than a like-for-like durability claim. Cross-engine settled timings are not
 compared.
 
-Measured on 2026-08-28 with an Apple M4 (`Mac16,1`), 32 GiB RAM, macOS 15.3.2
+Measured across 2026-08-28–29 with an Apple M4 (`Mac16,1`), 32 GiB RAM, macOS 15.3.2
 (24D81), APFS, and rustc 1.88.0. Exact raw repetitions, latency percentiles,
-dispersion, dependency versions, byte accounting, and amplification are in the
-[JSON artifact](benchmarks/results/apple-m4-macos-15.3.2/durability-baseline-ingest-current.json)
-and its [text report](benchmarks/results/apple-m4-macos-15.3.2/durability-baseline-ingest-current.txt).
+dispersion, dependency versions, byte accounting, and amplification for the
+three TurboKV columns are in the [mode JSON artifact](benchmarks/results/apple-m4-macos-15.3.2/durability-baseline-modes-current.json)
+and its [text report](benchmarks/results/apple-m4-macos-15.3.2/durability-baseline-modes-current.txt).
+The fjall and redb columns come from the matching retained
+[cross-engine artifact](benchmarks/results/apple-m4-macos-15.3.2/durability-baseline-ingest-current.json).
 The full methodology and rerun command are in
 [`benchmarks/README.md`](benchmarks/README.md).
