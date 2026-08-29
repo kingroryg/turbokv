@@ -1,0 +1,215 @@
+TurboKV durability-equivalent baseline protocol v7 (ingest)
+commit: 721cda58e130a8798fdb202b26675723791f6ada
+source manifest git hash: e1c6140c791a95802d6db0fc5176b560ac9912fa
+machine: Apple M4 (Mac16,1), 32 GiB, macOS 15.3.2 / Apple M4 / Mac16,1 / 34359738368 bytes RAM
+environment: ProductName:		macOS; ProductVersion:		15.3.2; BuildVersion:		24D81 / aarch64 / 10 CPUs / filesystem APFS / rustc 1.88.0 (6b00bc388 2025-06-23)
+dataset: 200000 keys, 20-byte keys, 400-byte values, seed 0x545552424f4b5604, 3 repetition(s)
+equivalence: durable storage; durable and paranoid classes reported separately; compression disabled where applicable; configured block cache 0 bytes; single-key batch 1; atomic batch sizes 100 and 1000; concurrency 1; LSM memtable 67108864 bytes (redb uses a copy-on-write B-tree)
+benchmark Cargo.lock fnv1a64: 395647ed150b4a81
+
+resolved dependencies (benchmark Cargo.lock):
+  allocator-api2: 0.2.21
+  bitflags: 2.13.1
+  byteorder: 1.5.0
+  bytes: 1.12.1
+  byteview: 0.6.1
+  cc: 1.4.3
+  cfg-if: 1.0.4
+  compare: 0.0.6
+  crc32fast: 1.5.0
+  crossbeam-epoch: 0.9.20
+  crossbeam-skiplist: 0.1.3
+  crossbeam-utils: 0.8.22
+  dashmap: 6.2.1
+  double-ended-peekable: 0.1.0
+  enum_dispatch: 0.3.13
+  equivalent: 1.0.2
+  errno: 0.3.14
+  fastrand: 2.5.0
+  find-msvc-tools: 0.1.11
+  fjall: 2.11.2
+  foldhash: 0.1.5
+  getrandom: 0.3.4, 0.4.3
+  guardian: 1.3.0
+  gxhash: 3.5.0
+  hashbrown: 0.14.5, 0.15.5, 0.16.1
+  hermit-abi: 0.5.2
+  interval-heap: 0.0.5
+  itoa: 1.0.18
+  jobserver: 0.1.35
+  libc: 0.2.189
+  linux-raw-sys: 0.12.1
+  lock_api: 0.4.14
+  log: 0.4.33
+  lru: 0.12.5
+  lsm-tree: 2.10.4
+  lz4_flex: 0.11.6
+  memchr: 2.8.3
+  memmap2: 0.9.11
+  num_cpus: 1.17.0
+  once_cell: 1.21.4
+  parking_lot: 0.12.5
+  parking_lot_core: 0.9.12
+  path-absolutize: 3.1.1
+  path-dedot: 3.1.1
+  pin-project-lite: 0.2.17
+  pkg-config: 0.3.34
+  proc-macro2: 1.0.107
+  quick_cache: 0.6.24
+  quote: 1.0.47
+  r-efi: 5.3.0, 6.0.0
+  redb: 2.6.3
+  redox_syscall: 0.5.18
+  rustc-hash: 2.1.3
+  rustix: 1.1.4
+  rustversion: 1.0.23
+  scopeguard: 1.2.0
+  self_cell: 1.3.0
+  serde: 1.0.228
+  serde_bytes: 0.11.19
+  serde_core: 1.0.228
+  serde_derive: 1.0.228
+  serde_json: 1.0.148
+  shlex: 2.0.1
+  smallvec: 1.15.2
+  snap: 1.1.2
+  std-semaphore: 0.1.0
+  syn: 2.0.119, 3.0.3
+  tempfile: 3.24.0
+  thiserror: 2.0.20
+  thiserror-impl: 2.0.20
+  tokio: 1.49.0
+  tokio-macros: 2.6.1
+  tracing: 0.1.44
+  tracing-attributes: 0.1.31
+  tracing-core: 0.1.36
+  turbokv: 0.6.0
+  turbokv-benchmarks: 0.1.0
+  twox-hash: 2.1.3
+  unicode-ident: 1.0.24
+  value-log: 1.9.0
+  varint-rs: 2.2.1
+  wasip2: 1.0.4+wasi-0.2.12
+  windows-link: 0.2.1
+  windows-sys: 0.61.2
+  wit-bindgen: 0.57.1
+  xxhash-rust: 0.8.18
+  zmij: 1.0.23
+  zstd: 0.13.3
+  zstd-safe: 7.2.4
+  zstd-sys: 2.0.16+zstd.1.5.7
+
+engine    mode      workload          run  ack ops/s  settled ops/s  p50 ns  p95 ns  p99 ns  max ns  disk bytes  wal bytes  flush bytes  compact r/w
+turbokv   durable   sequential_fill     1    1636662         567611     459    1084    1625 1711500   179678886   91200000     88478382 0/0
+fjall     durable   sequential_fill     1     674920         341157     792    3084    3958 65424792   120382944          -            - -/-
+redb      durable   sequential_fill     1       1487           1483  532459 1577042 2206291 246502167   205615104          -            - -/-
+fjall     durable   random_fill         1     456924         213355    1209    3250    4875 84197125   120382944          -            - -/-
+redb      durable   random_fill         1       1893           1873  405500 1129042 1940292 150375750   162775040          -            - -/-
+turbokv   durable   random_fill         1     834137         356311     875    1958    3416 9007833   179678886   91200000     88478382 0/0
+redb      durable   overwrite           1       1516           1513  555208 1277125 1719959 107093583   162775040          -            - -/-
+turbokv   durable   overwrite           1     875625         281984     916    2042    3625  526167   270878884   91200000     88478382 176956764/88478382
+fjall     durable   overwrite           1     446733         224512    1333    3500    4708 111568250   120399457          -            - -/-
+turbokv   durable   sequential_batch_100   1    2284526         399564   36958   66041  165667  507667   174350886   85872000     88478382 0/0
+fjall     durable   sequential_batch_100   1     802713         247432   42625   60708  107041 156493500   120186653          -            - -/-
+redb      durable   sequential_batch_100   1      80197          62290  969584 2837375 4891084 9400875   270020608          -            - -/-
+fjall     durable   sequential_batch_1000   1     572671         202944  427292  817667 1110750 262147333   120071454          -            - -/-
+redb      durable   sequential_batch_1000   1     134636          95725 6920500 11514792 15776416 16699292   270020608          -            - -/-
+turbokv   durable   sequential_batch_1000   1    2333582         312538  408500  581792  818791  917625   174286131   85807200     88478427 0/0
+fjall     durable   sequential_fill     2     473325         201571     875    3125    4000 185689291   120382944          -            - -/-
+redb      durable   sequential_fill     2       1397           1392  610708 1466042 2067208 79477500   205615104          -            - -/-
+turbokv   durable   sequential_fill     2    1407678         268368     459    1125    1583 5518959   179678886   91200000     88478382 0/0
+redb      durable   random_fill         2       1524           1513  548166 1318500 1893000 172878583   162775040          -            - -/-
+turbokv   durable   random_fill         2     804843         241853     917    2042    3916 7708333   179678886   91200000     88478382 0/0
+fjall     durable   random_fill         2     461527         216859    1167    3125    4625 117121833   120382944          -            - -/-
+turbokv   durable   overwrite           2     739178         167953    1000    2542    6667  405459   270878884   91200000     88478382 176956764/88478382
+fjall     durable   overwrite           2     456947         168837    1084    2708    4416 86605500   120399457          -            - -/-
+redb      durable   overwrite           2       1542           1539  542250 1267458 1649333 215684875   162775040          -            - -/-
+fjall     durable   sequential_batch_100   2     327936         192789   42625   52333   86583 295826334   120186653          -            - -/-
+redb      durable   sequential_batch_100   2      81884          63152  960709 2548916 3991542 23072458   270020608          -            - -/-
+turbokv   durable   sequential_batch_100   2    2075103         300811   38125   78375  165875  448875   174350886   85872000     88478382 0/0
+redb      durable   sequential_batch_1000   2     140468          98837 6872958 10178916 17861958 18475084   270020608          -            - -/-
+turbokv   durable   sequential_batch_1000   2    2237786         329265  402000  663250 1069917 4079750   174286131   85807200     88478427 0/0
+fjall     durable   sequential_batch_1000   2     548039         211119  429042  749125 1134083 277414667   120071454          -            - -/-
+redb      durable   sequential_fill     3       1370           1366  606250 1543667 2247292 405443709   205615104          -            - -/-
+turbokv   durable   sequential_fill     3    1302779         290404     459    1084    1583 19797709   179678886   91200000     88478382 0/0
+fjall     durable   sequential_fill     3     485252         214694     792    3125    4000 177089334   120382944          -            - -/-
+turbokv   durable   random_fill         3     919538         280429     875    1916    3542  235500   179678886   91200000     88478382 0/0
+fjall     durable   random_fill         3     435644         188266    1209    3250    4584 136351958   120382944          -            - -/-
+redb      durable   random_fill         3       1549           1536  523750 1295958 1968709 126482542   162775040          -            - -/-
+fjall     durable   overwrite           3     366154         169277    1334    3500    4833 207697833   120399457          -            - -/-
+redb      durable   overwrite           3       1440           1437  570125 1353208 2237500 163031375   162775040          -            - -/-
+turbokv   durable   overwrite           3     853083         187731     875    2000    3625 2850584   270878884   91200000     88478382 176956764/88478382
+redb      durable   sequential_batch_100   3      78883          60451  955542 3032167 5943125 10928625   270020608          -            - -/-
+turbokv   durable   sequential_batch_100   3    2272259         305777   36834   73292   89041  488791   174350886   85872000     88478382 0/0
+fjall     durable   sequential_batch_100   3     511600         187132   41666   67042  128041 299212458   120186653          -            - -/-
+turbokv   durable   sequential_batch_1000   3    2427594         318859  391375  546917  679916  777125   174286131   85807200     88478427 0/0
+fjall     durable   sequential_batch_1000   3     589055         214978  417042  744292 1092125 254633584   120071454          -            - -/-
+redb      durable   sequential_batch_1000   3     132675          94442 7056583 10918125 16631750 20810291   270020608          -            - -/-
+
+storage accounting
+engine    mode      workload          run  logical mutation bytes  logical live bytes  write amp  disk amp
+turbokv   durable   sequential_fill     1                84000000            84000000   2.139028  2.139034
+fjall     durable   sequential_fill     1                84000000            84000000          -  1.433130
+redb      durable   sequential_fill     1                84000000            84000000          -  2.447799
+fjall     durable   random_fill         1                84000000            84000000          -  1.433130
+redb      durable   random_fill         1                84000000            84000000          -  1.937798
+turbokv   durable   random_fill         1                84000000            84000000   2.139028  2.139034
+redb      durable   overwrite           1                84000000            84000000          -  1.937798
+turbokv   durable   overwrite           1                84000000            84000000   3.192342  3.224749
+fjall     durable   overwrite           1                84000000            84000000          -  1.433327
+turbokv   durable   sequential_batch_100   1                84000000            84000000   2.075600  2.075606
+fjall     durable   sequential_batch_100   1                84000000            84000000          -  1.430793
+redb      durable   sequential_batch_100   1                84000000            84000000          -  3.214531
+fjall     durable   sequential_batch_1000   1                84000000            84000000          -  1.429422
+redb      durable   sequential_batch_1000   1                84000000            84000000          -  3.214531
+turbokv   durable   sequential_batch_1000   1                84000000            84000000   2.074829  2.074835
+fjall     durable   sequential_fill     2                84000000            84000000          -  1.433130
+redb      durable   sequential_fill     2                84000000            84000000          -  2.447799
+turbokv   durable   sequential_fill     2                84000000            84000000   2.139028  2.139034
+redb      durable   random_fill         2                84000000            84000000          -  1.937798
+turbokv   durable   random_fill         2                84000000            84000000   2.139028  2.139034
+fjall     durable   random_fill         2                84000000            84000000          -  1.433130
+turbokv   durable   overwrite           2                84000000            84000000   3.192342  3.224749
+fjall     durable   overwrite           2                84000000            84000000          -  1.433327
+redb      durable   overwrite           2                84000000            84000000          -  1.937798
+fjall     durable   sequential_batch_100   2                84000000            84000000          -  1.430793
+redb      durable   sequential_batch_100   2                84000000            84000000          -  3.214531
+turbokv   durable   sequential_batch_100   2                84000000            84000000   2.075600  2.075606
+redb      durable   sequential_batch_1000   2                84000000            84000000          -  3.214531
+turbokv   durable   sequential_batch_1000   2                84000000            84000000   2.074829  2.074835
+fjall     durable   sequential_batch_1000   2                84000000            84000000          -  1.429422
+redb      durable   sequential_fill     3                84000000            84000000          -  2.447799
+turbokv   durable   sequential_fill     3                84000000            84000000   2.139028  2.139034
+fjall     durable   sequential_fill     3                84000000            84000000          -  1.433130
+turbokv   durable   random_fill         3                84000000            84000000   2.139028  2.139034
+fjall     durable   random_fill         3                84000000            84000000          -  1.433130
+redb      durable   random_fill         3                84000000            84000000          -  1.937798
+fjall     durable   overwrite           3                84000000            84000000          -  1.433327
+redb      durable   overwrite           3                84000000            84000000          -  1.937798
+turbokv   durable   overwrite           3                84000000            84000000   3.192342  3.224749
+redb      durable   sequential_batch_100   3                84000000            84000000          -  3.214531
+turbokv   durable   sequential_batch_100   3                84000000            84000000   2.075600  2.075606
+fjall     durable   sequential_batch_100   3                84000000            84000000          -  1.430793
+turbokv   durable   sequential_batch_1000   3                84000000            84000000   2.074829  2.074835
+fjall     durable   sequential_batch_1000   3                84000000            84000000          -  1.429422
+redb      durable   sequential_batch_1000   3                84000000            84000000          -  3.214531
+
+repeated-run throughput dispersion (population CV)
+engine    mode      workload          ack median  ack CV%  settled median  settled CV%
+turbokv   durable   sequential_fill      1407678     9.62          290404        36.27
+turbokv   durable   random_fill           834137     5.71          280429        16.24
+turbokv   durable   overwrite             853083     7.26          187731        23.41
+turbokv   durable   sequential_batch_100    2272259     4.34          305777        13.54
+turbokv   durable   sequential_batch_1000    2333582     3.32          318859         2.15
+fjall     durable   sequential_fill       485252    16.96          214694        24.93
+fjall     durable   random_fill           456924     2.50          213355         6.18
+fjall     durable   overwrite             446733     9.59          169277        13.94
+fjall     durable   sequential_batch_100     511600    35.71          192789        13.00
+fjall     durable   sequential_batch_1000     572671     2.96          211119         2.39
+redb      durable   sequential_fill         1397     3.55            1392         3.55
+redb      durable   random_fill             1549    10.17            1536        10.02
+redb      durable   overwrite               1516     2.89            1513         2.90
+redb      durable   sequential_batch_100      80197     1.53           62290         1.82
+redb      durable   sequential_batch_1000     134636     2.43           95725         1.92
+
+Null byte counters mean unavailable, never estimated. Setup is excluded from each timed workload. Durable and paranoid rows are different durability classes and must not be compared with each other. These are baseline observations, not performance claims.

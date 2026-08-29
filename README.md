@@ -106,31 +106,32 @@ shutdown contract.
 
 ## Benchmarks
 
-The retained benchmark used TurboKV 0.5.0, fjall 2.11.2, and redb 2.6.3. It
-measured durable mode (`DbOptions::durable()` for TurboKV) over three
-repetitions. The table reports median single-key acknowledgement throughput;
+The benchmark used TurboKV 0.6.0, fjall 2.11.2, and redb 2.6.3 in Durable
+mode over three repetitions. Throughput is acknowledged keys per second;
 higher is better.
 
 | Workload | Mode | TurboKV ops/s | fjall ops/s | redb ops/s | TurboKV / fjall |
 |---|---|---:|---:|---:|---:|
-| Sequential fill | Durable | 653,814 | 651,383 | 1,559 | 1.004× |
-| Random fill | Durable | 852,667 | 423,708 | 1,935 | 2.012× |
-| Overwrite | Durable | 791,618 | 454,874 | 1,795 | 1.740× |
+| Sequential fill (1 key/txn) | Durable | 1,407,678 | 485,252 | 1,397 (macOS barrier/txn) | 2.901× |
+| Random fill (1 key/txn) | Durable | 834,137 | 456,924 | 1,549 (macOS barrier/txn) | 1.826× |
+| Overwrite (1 key/txn) | Durable | 853,083 | 446,733 | 1,516 (macOS barrier/txn) | 1.910× |
+| Sequential batch (100 keys/txn) | Durable | 2,272,259 | 511,600 | 80,197 | 4.441× |
+| Sequential batch (1,000 keys/txn) | Durable | 2,333,582 | 572,671 | 134,636 | 4.075× |
 
 Protocol: 200,000 deterministic 20-byte keys, 400-byte values (84 MB logical
-input, above the 64 MiB memtable), one caller, one-entry transactions,
-compression and block cache disabled, and an uncleared OS page cache. Each
-engine returns only after reaching its documented process-crash recovery
-boundary. Cross-engine settled timings are not compared.
-
-These results predate the 0.6.0 release and are not measurements of the current
-commit.
+input, above the 64 MiB memtable), one caller, atomic batches where shown,
+compression and block cache disabled, and an uncleared OS page cache. redb
+2.6.3's `Durability::Eventual` performs a macOS `F_BARRIERFSYNC` for every
+transaction, while the TurboKV and fjall Durable modes stop at their
+process-crash-recoverable OS-cache boundaries. Batching amortizes that fixed
+redb barrier; its single-key rows are therefore architectural context rather
+than a like-for-like durability claim. Cross-engine settled timings are not
+compared.
 
 Measured on 2026-08-28 with an Apple M4 (`Mac16,1`), 32 GiB RAM, macOS 15.3.2
-(24D81), APFS, and rustc 1.88.0. Sequential-fill dispersion was high, so treat
-the near-tie as noise rather than a stable advantage. Exact raw repetitions,
-latency percentiles, dispersion, dependency versions, byte accounting, and
-amplification are in the [JSON artifact](benchmarks/results/apple-m4-macos-15.3.2/durability-baseline-current.json)
-and its [text report](benchmarks/results/apple-m4-macos-15.3.2/durability-baseline-current.txt).
+(24D81), APFS, and rustc 1.88.0. Exact raw repetitions, latency percentiles,
+dispersion, dependency versions, byte accounting, and amplification are in the
+[JSON artifact](benchmarks/results/apple-m4-macos-15.3.2/durability-baseline-ingest-current.json)
+and its [text report](benchmarks/results/apple-m4-macos-15.3.2/durability-baseline-ingest-current.txt).
 The full methodology and rerun command are in
 [`benchmarks/README.md`](benchmarks/README.md).
