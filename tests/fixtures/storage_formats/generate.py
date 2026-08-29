@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parent
 MANIFEST_MAGIC = b"HNSHMNFT"
 WAL_MAGIC = b"TURBOKV\0"
 SST_MAGIC = b"HANSHIRO"
+CURSOR_CRC64_POLYNOMIAL = 0x42F0E1EBA9EA3693
+V5_COMMIT_TAG = b"\xA5\x5A"
 
 
 def u8(value: int) -> bytes:
@@ -30,6 +32,19 @@ def u64(value: int) -> bytes:
 
 def crc32(data: bytes) -> int:
     return binascii.crc32(data) & 0xFFFFFFFF
+
+
+def cursor_crc64(version: int, segment_sequence: int, acknowledged_end: int) -> int:
+    crc = 0xFFFFFFFFFFFFFFFF
+    for byte in u32(version) + u64(segment_sequence) + u64(acknowledged_end):
+        crc ^= byte << 56
+        for _ in range(8):
+            crc = (
+                ((crc << 1) ^ CURSOR_CRC64_POLYNOMIAL)
+                if crc & (1 << 63)
+                else (crc << 1)
+            ) & 0xFFFFFFFFFFFFFFFF
+    return crc ^ 0xFFFFFFFFFFFFFFFF
 
 
 def manifest_entry(version: int, path: bytes, table_size: int) -> bytes:
@@ -65,14 +80,20 @@ def wal_payload(key: bytes, value: bytes | None) -> tuple[int, bytes]:
 def wal_record(
     version: int, sequence: int, entry_type: int, payload: bytes
 ) -> bytes:
-    header = (
+    timestamp = 1_700_000_000_000 + sequence
+    framing = (
         u32(len(payload))
         + u64(sequence)
-        + u64(1_700_000_000_000 + sequence)
+        + u64(timestamp)
         + u8(entry_type)
         + u8(0)
-        + u32(crc32(payload))
-        + bytes(6)
+    )
+    checksum_input = framing + payload if version == 5 else payload
+    reserved = bytes(4) + V5_COMMIT_TAG if version == 5 else bytes(6)
+    header = (
+        framing
+        + u32(crc32(checksum_input))
+        + reserved
     )
     extension = bytes(96) if version in (1, 2) else b""
     return header + extension + payload
@@ -81,7 +102,7 @@ def wal_record(
 def wal(version: int) -> bytes:
     first_key = b"\x00k\xff"
     deleted_key = b"\xffdeleted\x00"
-    if version == 4:
+    if version in (4, 5):
         padded_value = bytearray((index * 29) & 0xFF for index in range(124))
         padded_value[0] = 0x00
         padded_value[-1] = 0xFF
@@ -118,7 +139,7 @@ def wal(version: int) -> bytes:
         last_sequence = 1
 
     magic = b"HANSHIRO" if version == 1 else WAL_MAGIC
-    header = (
+    header_prefix = (
         magic
         + u32(version)
         + u64(1_700_000_000)
@@ -126,8 +147,14 @@ def wal(version: int) -> bytes:
         + u64(last_sequence)
         + u64(logical_count)
         + u32(0)
-        + bytes(16)
     )
+    if version == 5:
+        acknowledged_end = 64 + len(records)
+        header = header_prefix + u64(acknowledged_end) + u64(
+            cursor_crc64(version, 0, acknowledged_end)
+        )
+    else:
+        header = header_prefix + bytes(16)
     return header + records
 
 
@@ -214,15 +241,19 @@ locked database directory before validation and migration.
 
 Supported migration fixtures:
 - manifest v1 placeholder + v1 CRC32, v2, and current v3;
-- WAL v1 and v2 legacy 96-byte extensions, v3, and current v4 batches;
+- WAL v1 and v2 legacy 96-byte extensions, v3, v4 batches, and current v5;
 - SSTable v1 placeholder + v1 CRC32, v2, and current v3.
 
 The fixtures contain 0x00/0xff keys and values, an empty value, tombstones in
-formats that can represent them, a v4 atomic batch, exact 64-byte uncompressed
+formats that can represent them, v4/v5 atomic batches, exact 64-byte uncompressed
 SSTable block data, and exact 256/512-byte legacy WAL segment boundaries. Tests
-exercise all 4 manifest x 4 WAL x 4 SSTable combinations through Db, configure
+exercise all 4 manifest x 5 WAL x 4 SSTable combinations through Db, configure
 the writer's block maximum to that 64-byte spelling, and configure the WAL
-maximum to the exact v4 fixture length before proving the next append rotates.
+maximum to the exact v5 fixture length before proving the next append rotates.
+
+WAL v5 migration is one-way for older TurboKV binaries: once a v5 segment is
+created, v1-v4 readers reject it. Back up the database before upgrading if a
+downgrade may be required; downgrade only from a pre-v5 backup.
 
 Normal tests never regenerate these files. Run `python3
 tests/fixtures/storage_formats/generate.py --verify` to verify bytes and hashes.
@@ -253,6 +284,7 @@ def artifacts() -> dict[str, bytes]:
         "wal_v2.wal": wal(2),
         "wal_v3.wal": wal(3),
         "wal_v4.wal": wal(4),
+        "wal_v5.wal": wal(5),
         "sst_v1_release_zero_crc.sst": sst_v1_zero,
         "sst_v1_crc.sst": sstable(1),
         "sst_v2.sst": sst_v2,

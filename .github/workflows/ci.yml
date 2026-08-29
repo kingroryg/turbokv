@@ -1,0 +1,114 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # GxHash's persisted Bloom mapping requires hardware AES. CI builds and runs
+  # on the same host. Use the documented architecture minima explicitly so a
+  # newer compiler cannot silently omit the required target-feature cfgs.
+  RUSTFLAGS: -C target-feature=+aes,+sse2
+
+jobs:
+  quality:
+    name: Format, lint, test, docs, and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Check every root target and feature
+        env:
+          RUSTFLAGS: ${{ env.RUSTFLAGS }} -D warnings
+        run: cargo +stable check --all-targets --all-features
+      - name: Run Clippy with warnings denied
+        run: cargo +stable clippy --all-targets --all-features -- -D warnings
+      - name: Run unit, integration, property, compatibility, crash, and example tests
+        run: cargo +stable test --all-targets --all-features
+      - name: Execute every example
+        run: cargo +stable test --examples --all-features
+      - name: Run doctests with warnings denied
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable test --doc --all-features
+      - name: Build documentation with warnings denied
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc --no-deps --all-features
+      - name: Verify the published package
+        run: cargo +stable package
+
+  msrv:
+    name: Rust 1.85 minimum version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Check every root target and feature on the MSRV
+        env:
+          RUSTFLAGS: ${{ env.RUSTFLAGS }} -D warnings
+        run: cargo +1.85.0 check --all-targets --all-features
+
+  platform-builds:
+    name: ${{ matrix.os }} platform build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            rustflags: -C target-feature=+aes,+neon
+          - os: windows-latest
+            rustflags: -C target-feature=+aes,+sse2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Check every root target and feature
+        env:
+          RUSTFLAGS: ${{ env.RUSTFLAGS }} -D warnings
+        run: cargo +stable check --all-targets --all-features
+      - name: Run platform tests
+        run: cargo +stable test --all-features
+
+  release-soundness:
+    name: Explicit release-scale stress suites
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run repeated storage stress
+        run: >-
+          cargo +stable test --release --lib
+          storage::engine::tests::repeated_seeded_storage_stress
+          -- --ignored --exact --nocapture
+      - name: Run repeated whole-database soundness stress
+        run: >-
+          cargo +stable test --release --test database_soundness
+          repeated_seeded_database_soundness_stress
+          -- --ignored --exact --nocapture
+      - name: Run heavy arbitrary compression stress
+        run: >-
+          cargo +stable test --release --lib
+          storage::sstable::compression::tests::heavy_arbitrary_compression_roundtrip
+          -- --ignored --exact --nocapture

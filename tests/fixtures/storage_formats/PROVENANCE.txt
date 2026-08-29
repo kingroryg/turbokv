@@ -20,15 +20,19 @@ locked database directory before validation and migration.
 
 Supported migration fixtures:
 - manifest v1 placeholder + v1 CRC32, v2, and current v3;
-- WAL v1 and v2 legacy 96-byte extensions, v3, and current v4 batches;
+- WAL v1 and v2 legacy 96-byte extensions, v3, v4 batches, and current v5;
 - SSTable v1 placeholder + v1 CRC32, v2, and current v3.
 
 The fixtures contain 0x00/0xff keys and values, an empty value, tombstones in
-formats that can represent them, a v4 atomic batch, exact 64-byte uncompressed
+formats that can represent them, v4/v5 atomic batches, exact 64-byte uncompressed
 SSTable block data, and exact 256/512-byte legacy WAL segment boundaries. Tests
-exercise all 4 manifest x 4 WAL x 4 SSTable combinations through Db, configure
+exercise all 4 manifest x 5 WAL x 4 SSTable combinations through Db, configure
 the writer's block maximum to that 64-byte spelling, and configure the WAL
-maximum to the exact v4 fixture length before proving the next append rotates.
+maximum to the exact v5 fixture length before proving the next append rotates.
+
+WAL v5 migration is one-way for older TurboKV binaries: once a v5 segment is
+created, v1-v4 readers reject it. Back up the database before upgrading if a
+downgrade may be required; downgrade only from a pre-v5 backup.
 
 Normal tests never regenerate these files. Run `python3
 tests/fixtures/storage_formats/generate.py --verify` to verify bytes and hashes.

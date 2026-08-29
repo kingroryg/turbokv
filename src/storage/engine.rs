@@ -214,9 +214,10 @@ impl StorageConfig {
 
     /// Creates the process-crash-oriented WAL preset rooted at `data_dir`.
     ///
-    /// Each mutation reaches an ordinary file write and the operating-system
-    /// page cache before acknowledgement; no per-write `sync_all` is requested.
-    /// Recent writes are therefore not promised across OS or power failure.
+    /// Each mutation reaches the operating-system page cache through a
+    /// physically reserved shared WAL mapping where supported, with ordered
+    /// file writes as the compatibility fallback. No per-write `sync_all` is
+    /// requested, so recent writes are not promised across OS or power failure.
     pub fn durable(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
@@ -777,11 +778,12 @@ impl Engine {
 
     /// Copy and publish one key-value mutation at the configured durability boundary.
     ///
-    /// No-WAL inserts use a per-thread buffer. Unsynced WAL mode performs a
-    /// blocking file write to the OS page cache, while synced mode allocates an
-    /// owned WAL payload and awaits ordered group commit. The future can also
-    /// await backpressure and mutation barriers. Errors or cancellation after a
-    /// WAL append have an indeterminate outcome; inspect or reopen before retry.
+    /// No-WAL inserts use a per-thread buffer. Unsynced WAL mode publishes to a
+    /// reserved shared mapping where supported and otherwise performs ordered
+    /// file writes to the OS page cache. Synced mode allocates an owned WAL
+    /// payload and awaits ordered group commit. The future can also await
+    /// backpressure and mutation barriers. Errors or cancellation after a WAL
+    /// append have an indeterminate outcome; inspect or reopen before retry.
     pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.maybe_stall_writes().await;
         let _mutation = self.mutation_barrier.read().await;
@@ -1275,7 +1277,7 @@ impl Engine {
     /// Every `_since_open` counter resets when the engine is reopened.
     pub fn physical_stats(&self) -> PhysicalStats {
         let stall_counters = self.write_stalls.snapshot();
-        let memtable_stats = self.memtable_manager.stats();
+        let memtable_stats = self.memtable_manager.counter_stats();
         let buffered_versions = memtable_stats.buffered_versions;
         let active_versions = memtable_stats.active.entry_count as u64;
         let immutable_versions = memtable_stats
@@ -2198,7 +2200,7 @@ impl VersionedValue {
 fn retain_newest(current: &mut Option<VersionedValue>, candidate: VersionedValue) {
     if current
         .as_ref()
-        .map_or(true, |entry| candidate.is_newer_than(entry))
+        .is_none_or(|entry| candidate.is_newer_than(entry))
     {
         *current = Some(candidate);
     }
@@ -2382,7 +2384,7 @@ fn cleanup_unreferenced_sstables(
                     continue;
                 }
             };
-            if !path.extension().is_some_and(|extension| extension == "sst") {
+            if path.extension().is_none_or(|extension| extension != "sst") {
                 continue;
             }
             let canonical_path = match std::fs::canonicalize(&path) {
@@ -3757,7 +3759,7 @@ mod tests {
                 entry
                     .path()
                     .extension()
-                    .map_or(true, |extension| extension != "sst")
+                    .is_none_or(|extension| extension != "sst")
             }));
         for key in 0..128 {
             assert_eq!(
@@ -6463,7 +6465,8 @@ mod tests {
         assert!(pending.retry_pending);
         let failure = pending.unresolved_failure.unwrap();
         assert_eq!(failure.origin, MaintenanceOrigin::Recovery);
-        assert!(failure.message.contains(&orphan.display().to_string()));
+        let orphan_name = orphan.file_name().unwrap().to_string_lossy();
+        assert!(failure.message.contains(orphan_name.as_ref()));
         let error = reopened.shutdown_with_status().await.unwrap_err();
         assert!(matches!(
             error,

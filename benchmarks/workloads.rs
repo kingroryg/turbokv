@@ -4,10 +4,19 @@ use crate::protocol::{
     KEY_BYTES,
 };
 use serde::Serialize;
+use std::env;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+const CRASH_CHILD_ENGINE: &str = "TURBOKV_BENCH_CRASH_ENGINE";
+const CRASH_CHILD_DURABILITY: &str = "TURBOKV_BENCH_CRASH_DURABILITY";
+const CRASH_CHILD_PATH: &str = "TURBOKV_BENCH_CRASH_PATH";
+const CRASH_CHILD_CYCLE: &str = "TURBOKV_BENCH_CRASH_CYCLE";
+const CRASH_CHILD_EXIT_CODE: i32 = 86;
+const RECOVERY_VALUE: &[u8] = b"acknowledged-before-exit";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -263,12 +272,17 @@ pub async fn run(
             database.drop_without_settlement();
             let mut elapsed = Duration::ZERO;
             let mut samples = Vec::with_capacity(config.recovery_cycles as usize);
-            for _ in 0..config.recovery_cycles {
+            for cycle in 0..config.recovery_cycles {
+                run_crash_writer(engine, durability, temporary.path(), cycle)?;
                 let operation = Instant::now();
                 database.reopen().await?;
                 let duration = operation.elapsed();
-                if database.live_keys().await? != config.keys {
-                    return Err("WAL recovery did not restore every acknowledged key".into());
+                let marker = recovery_marker(cycle);
+                if database.get(&marker).await?.as_deref() != Some(RECOVERY_VALUE) {
+                    return Err("recovery did not restore the crash-writer marker".into());
+                }
+                if database.live_keys().await? != config.keys + u64::from(cycle) + 1 {
+                    return Err("recovery did not restore every acknowledged key".into());
                 }
                 elapsed += duration;
                 samples.push(nanos(duration));
@@ -332,6 +346,55 @@ pub async fn run(
     ))
 }
 
+pub async fn run_crash_child_if_requested() -> Result<(), DynError> {
+    let Some(engine) = env::var_os(CRASH_CHILD_ENGINE) else {
+        return Ok(());
+    };
+    let engine = match engine.to_str() {
+        Some("turbokv") => EngineName::TurboKv,
+        Some("fjall") => EngineName::Fjall,
+        Some("redb") => EngineName::Redb,
+        _ => return Err("invalid crash-child engine".into()),
+    };
+    let durability = match env::var(CRASH_CHILD_DURABILITY)?.as_str() {
+        "durable" => Durability::Durable,
+        "paranoid" => Durability::Paranoid,
+        _ => return Err("invalid crash-child durability".into()),
+    };
+    let cycle = env::var(CRASH_CHILD_CYCLE)?.parse::<u32>()?;
+    let path = env::var_os(CRASH_CHILD_PATH).ok_or("missing crash-child path")?;
+    let database = Database::open_after_handoff(engine, durability, Path::new(&path)).await?;
+    database
+        .put(&recovery_marker(cycle), RECOVERY_VALUE)
+        .await?;
+    std::process::exit(CRASH_CHILD_EXIT_CODE);
+}
+
+fn run_crash_writer(
+    engine: EngineName,
+    durability: Durability,
+    path: &Path,
+    cycle: u32,
+) -> Result<(), DynError> {
+    let status = Command::new(env::current_exe()?)
+        .env(CRASH_CHILD_ENGINE, engine.as_str())
+        .env(CRASH_CHILD_DURABILITY, durability.as_str())
+        .env(CRASH_CHILD_PATH, path)
+        .env(CRASH_CHILD_CYCLE, cycle.to_string())
+        .status()?;
+    if status.code() != Some(CRASH_CHILD_EXIT_CODE) {
+        return Err(format!("crash writer exited with {status}").into());
+    }
+    Ok(())
+}
+
+fn recovery_marker(cycle: u32) -> Vec<u8> {
+    let mut marker = b"recovery-marker-".to_vec();
+    marker.extend_from_slice(&cycle.to_be_bytes());
+    debug_assert_eq!(marker.len(), KEY_BYTES);
+    marker
+}
+
 async fn run_fill(
     database: &Database,
     keys: &[Vec<u8>],
@@ -385,7 +448,7 @@ fn make_measurement(
     let mut samples = outcome.samples;
     samples.sort_unstable();
     let total = outcome.acknowledgement + outcome.settlement;
-    let logical_live_bytes = logical_bytes(config, config.keys);
+    let logical_live_bytes = logical_live_bytes(workload, config);
     Measurement {
         engine,
         durability,
@@ -431,6 +494,15 @@ fn make_measurement(
 
 const fn logical_bytes(config: &WorkloadConfig, operations: u64) -> u64 {
     operations * (KEY_BYTES + config.value_bytes) as u64
+}
+
+pub(crate) const fn logical_live_bytes(workload: Workload, config: &WorkloadConfig) -> u64 {
+    let base = logical_bytes(config, config.keys);
+    if matches!(workload, Workload::Recovery) {
+        base + config.recovery_cycles as u64 * (KEY_BYTES + RECOVERY_VALUE.len()) as u64
+    } else {
+        base
+    }
 }
 
 fn rate(operations: u64, elapsed: Duration) -> f64 {

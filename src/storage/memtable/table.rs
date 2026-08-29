@@ -12,7 +12,7 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
@@ -136,21 +136,27 @@ impl MemTable {
         value: &[u8],
         sequence: u64,
     ) -> Result<()> {
-        self.prepare_mutation(sequence)?;
-        self.apply_insert(key, value, sequence);
+        let timestamp = self.prepare_mutation(sequence)?;
+        self.apply_insert(key, value, sequence, timestamp);
         Ok(())
     }
 
     /// Apply a batch insert after the manager has made the active table stable.
-    pub(crate) fn insert_batch_entry_prelocked(&self, key: &[u8], value: &[u8], sequence: u64) {
+    pub(crate) fn insert_batch_entry_prelocked(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        sequence: u64,
+        timestamp: Instant,
+    ) {
         self.observe_sequence(sequence);
-        self.apply_insert(key, value, sequence);
+        self.apply_insert(key, value, sequence, timestamp);
     }
 
-    fn apply_insert(&self, key: &[u8], value: &[u8], sequence: u64) {
+    fn apply_insert(&self, key: &[u8], value: &[u8], sequence: u64, timestamp: Instant) {
         let entry_size = estimated_memtable_entry_size(key, Some(value));
 
-        let entry = MemTableEntry::new(value.to_vec(), sequence);
+        let entry = MemTableEntry::new_at(value.to_vec(), sequence, timestamp);
         let MutationResult::Applied(previous) = self.replace_if_not_newer(key, entry) else {
             return;
         };
@@ -191,19 +197,24 @@ impl MemTable {
 
     /// Apply a tombstone while the table's same-key mutation lock is held.
     pub(crate) fn delete_with_sequence_prelocked(&self, key: &[u8], sequence: u64) -> Result<()> {
-        self.prepare_mutation(sequence)?;
-        self.apply_delete(key, sequence);
+        let timestamp = self.prepare_mutation(sequence)?;
+        self.apply_delete(key, sequence, timestamp);
         Ok(())
     }
 
     /// Apply a batch tombstone after the manager has made the active table stable.
-    pub(crate) fn delete_batch_entry_prelocked(&self, key: &[u8], sequence: u64) {
+    pub(crate) fn delete_batch_entry_prelocked(
+        &self,
+        key: &[u8],
+        sequence: u64,
+        timestamp: Instant,
+    ) {
         self.observe_sequence(sequence);
-        self.apply_delete(key, sequence);
+        self.apply_delete(key, sequence, timestamp);
     }
 
-    fn apply_delete(&self, key: &[u8], sequence: u64) {
-        let entry = MemTableEntry::tombstone(sequence);
+    fn apply_delete(&self, key: &[u8], sequence: u64, timestamp: Instant) {
+        let entry = MemTableEntry::tombstone_at(sequence, timestamp);
         let MutationResult::Applied(previous) = self.replace_if_not_newer(key, entry) else {
             return;
         };
@@ -368,9 +379,13 @@ impl MemTable {
 
     /// Check if the memtable should be flushed
     pub fn should_flush(&self) -> bool {
+        self.should_flush_at(Instant::now())
+    }
+
+    fn should_flush_at(&self, now: Instant) -> bool {
         let size = self.size_bytes.load(Ordering::Relaxed);
         let count = self.entry_count.load(Ordering::Relaxed);
-        let age = self.created_at.elapsed();
+        let age = now.saturating_duration_since(self.created_at);
 
         size >= self.config.max_size
             || count >= self.config.max_entries
@@ -436,41 +451,63 @@ impl MemTable {
             .fetch_max(sequence.saturating_add(1), Ordering::Relaxed);
     }
 
-    fn prepare_mutation(&self, sequence: u64) -> Result<()> {
+    fn prepare_mutation(&self, sequence: u64) -> Result<Instant> {
         if self.read_only.load(Ordering::Acquire) {
             return Err(MemTableError::ReadOnly);
         }
-        if self.should_flush() {
+        let now = Instant::now();
+        if self.should_flush_at(now) {
             return Err(MemTableError::Full);
         }
 
         self.observe_sequence(sequence);
-        Ok(())
+        Ok(now)
     }
 
-    /// Get statistics for this memtable
+    /// Samples this table's counters and exact current-entry age bounds.
+    ///
+    /// Computing the age bounds visits the table's physical entries. Engine
+    /// monitoring uses its counters-only sampler so physical gauges remain
+    /// constant-time with respect to the number of keys.
     pub fn stats(&self) -> MemTableStats {
         let now = Instant::now();
 
-        let (oldest, newest) = if let Some(first) = self.data.front() {
-            let oldest = Some(now - first.value().timestamp);
-            let newest = if let Some(last) = self.data.back() {
-                Some(now - last.value().timestamp)
-            } else {
-                oldest
-            };
-            (oldest, newest)
-        } else {
-            (None, None)
-        };
+        let timestamps = self.data.iter().fold(None, |bounds, entry| {
+            let timestamp = entry.value().timestamp;
+            Some(bounds.map_or(
+                (timestamp, timestamp),
+                |(oldest, newest): (Instant, Instant)| {
+                    (oldest.min(timestamp), newest.max(timestamp))
+                },
+            ))
+        });
+        let (oldest, newest) = timestamps.map_or((None, None), |(oldest, newest)| {
+            (
+                Some(now.saturating_duration_since(oldest)),
+                Some(now.saturating_duration_since(newest)),
+            )
+        });
 
+        self.stats_with_ages(oldest, newest)
+    }
+
+    fn stats_with_ages(
+        &self,
+        oldest_entry_age: Option<Duration>,
+        newest_entry_age: Option<Duration>,
+    ) -> MemTableStats {
         MemTableStats {
             entry_count: self.entry_count.load(Ordering::Relaxed),
             size_bytes: self.size_bytes.load(Ordering::Relaxed),
-            oldest_entry_age: oldest,
-            newest_entry_age: newest,
+            oldest_entry_age,
+            newest_entry_age,
             tombstone_count: self.tombstone_count.load(Ordering::Relaxed),
         }
+    }
+
+    /// Samples only constant-time counters, omitting entry age bounds.
+    pub(crate) fn counter_stats(&self) -> MemTableStats {
+        self.stats_with_ages(None, None)
     }
 
     /// Get the current sequence number
@@ -561,6 +598,36 @@ mod tests {
         assert_eq!(table.stats().entry_count, 1);
         assert_eq!(table.stats().tombstone_count, 1);
         assert_eq!(table.stats().size_bytes, b"key".len() + 32);
+    }
+
+    #[test]
+    fn entry_age_statistics_follow_timestamps_instead_of_key_order() {
+        let table = MemTable::new(test_config());
+        let now = Instant::now();
+        table.apply_insert(
+            b"z-oldest",
+            b"value",
+            0,
+            now.checked_sub(std::time::Duration::from_secs(30)).unwrap(),
+        );
+        table.apply_insert(
+            b"a-newest",
+            b"value",
+            1,
+            now.checked_sub(std::time::Duration::from_secs(10)).unwrap(),
+        );
+
+        let stats = table.stats();
+        let oldest = stats.oldest_entry_age.unwrap();
+        let newest = stats.newest_entry_age.unwrap();
+        assert!(oldest >= std::time::Duration::from_secs(30));
+        assert!(newest >= std::time::Duration::from_secs(10));
+        assert!(oldest > newest);
+
+        let counters = table.counter_stats();
+        assert_eq!(counters.entry_count, 2);
+        assert_eq!(counters.oldest_entry_age, None);
+        assert_eq!(counters.newest_entry_age, None);
     }
 
     #[test]

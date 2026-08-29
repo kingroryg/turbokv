@@ -17,8 +17,8 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -110,14 +110,13 @@ impl Manifest {
 
     /// Synchronously read, allocate, checksum, and decode a manifest file.
     pub fn load(path: &Path) -> Result<Self> {
-        // Read entire file into memory for checksum verification
-        let file = File::open(path).map_err(|e| Error::Io {
-            message: format!("Failed to open manifest: {:?}", path),
+        // Read the complete file and close its handle before validation. The
+        // short handle lifetime lets a concurrent atomic replacement proceed
+        // on Windows while this immutable snapshot is being decoded.
+        let file_data = read_manifest_snapshot(path).map_err(|e| Error::Io {
+            message: format!("Failed to read manifest: {:?}", path),
             source: e,
         })?;
-        let mut reader = BufReader::new(file);
-        let mut file_data = Vec::new();
-        reader.read_to_end(&mut file_data)?;
 
         if file_data.len() < 12 {
             return Err(manifest_corruption("file is shorter than its header"));
@@ -225,6 +224,10 @@ impl Manifest {
     /// synced, atomically renamed, and followed by a directory sync where the
     /// platform exposes one. Failure can occur after the rename; callers that
     /// need to distinguish that outcome must reload and compare the manifest.
+    /// This low-level method does not acquire `.turbokv.lock`; direct callers
+    /// must exclusively own `data_dir` and must not invoke it in a live
+    /// [`Db`](crate::Db) or [`Engine`](crate::storage::engine::Engine)
+    /// directory.
     pub fn save(&self, data_dir: &Path) -> Result<()> {
         let manifest_path = data_dir.join("MANIFEST");
         let temp_path = data_dir.join("MANIFEST.tmp");
@@ -414,6 +417,29 @@ impl Manifest {
     }
 }
 
+#[cfg(not(windows))]
+fn read_manifest_snapshot(path: &Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path)
+}
+
+#[cfg(windows)]
+fn read_manifest_snapshot(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn manifest_corruption(message: &str) -> Error {
     Error::Internal {
         message: format!("Manifest corruption: {message}"),
@@ -480,7 +506,9 @@ pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> std::io::Resu
 #[cfg(windows)]
 pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use std::time::Duration;
 
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
@@ -491,26 +519,40 @@ pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> std::io::Resu
         .encode_wide()
         .chain(Some(0))
         .collect();
-    // SAFETY: both vectors are valid, NUL-terminated UTF-16 paths and remain
-    // alive for the duration of the system call.
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+    const MAX_SHARING_RETRIES: usize = 100;
+    for attempt in 0..=MAX_SHARING_RETRIES {
+        // SAFETY: both vectors are valid, NUL-terminated UTF-16 paths and
+        // remain alive for the duration of the system call.
+        let result = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result != 0 {
+            return Ok(());
+        }
+
+        let error = std::io::Error::last_os_error();
+        let retryable = matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_ACCESS_DENIED as i32
+                    || code == ERROR_SHARING_VIOLATION as i32
+        );
+        if !retryable || attempt == MAX_SHARING_RETRIES {
+            return Err(error);
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
+    unreachable!("bounded replacement loop always returns")
 }
 
 /// Persist a directory entry update where the platform exposes directory fsync.
 #[cfg(unix)]
 pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
-    File::open(path)?.sync_all()
+    std::fs::File::open(path)?.sync_all()
 }
 
 /// Rust has no portable directory-sync operation on these targets. Atomic

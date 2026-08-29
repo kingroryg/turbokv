@@ -1,20 +1,22 @@
 # TurboKV Development Container
 # Used for CI testing and development
 
-FROM rust:1.80-slim
+FROM rust:1.85-slim
+
+# The persisted Bloom mapping uses gxhash's hardware AES implementation. The
+# resulting native-code image must run on this CPU model or a feature superset.
+ENV RUSTFLAGS="-C target-cpu=native"
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
-    libssl-dev \
-    libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app directory
 WORKDIR /usr/src/turbokv
 
 # Copy manifests first for caching
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 
 # Create dummy source for dependency caching
 RUN mkdir -p src && \

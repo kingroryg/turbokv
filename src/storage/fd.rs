@@ -312,7 +312,7 @@ fn get_fd_limit() -> u64 {
     // Fallback to getrlimit
     unsafe {
         let mut rlim: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) == 0 {
             return rlim.rlim_cur as u64;
         }
     }
@@ -343,7 +343,7 @@ fn estimate_open_fds() -> u64 {
     unsafe {
         let _pid = libc::getpid();
         let mut rusage: libc::rusage = std::mem::zeroed();
-        if libc::getrusage(libc::RUSAGE_SELF, &mut rusage) == 0 {
+        if libc::getrusage(libc::RUSAGE_SELF, &raw mut rusage) == 0 {
             // This doesn't give FD count directly, but we can track internally
         }
     }

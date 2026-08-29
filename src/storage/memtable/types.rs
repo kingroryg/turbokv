@@ -34,20 +34,32 @@ impl MemTableEntry {
     /// Create a new entry with a value
     #[inline]
     pub fn new(value: Vec<u8>, sequence: u64) -> Self {
+        Self::new_at(value, sequence, Instant::now())
+    }
+
+    /// Creates a value entry with a timestamp already sampled by its caller.
+    #[inline]
+    pub(crate) fn new_at(value: Vec<u8>, sequence: u64, timestamp: Instant) -> Self {
         Self {
             value: Some(value),
             sequence,
-            timestamp: Instant::now(),
+            timestamp,
         }
     }
 
     /// Create a tombstone entry (marks key as deleted)
     #[inline]
     pub fn tombstone(sequence: u64) -> Self {
+        Self::tombstone_at(sequence, Instant::now())
+    }
+
+    /// Creates a tombstone with a timestamp already sampled by its caller.
+    #[inline]
+    pub(crate) fn tombstone_at(sequence: u64, timestamp: Instant) -> Self {
         Self {
             value: None,
             sequence,
-            timestamp: Instant::now(),
+            timestamp,
         }
     }
 

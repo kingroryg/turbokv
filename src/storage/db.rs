@@ -311,9 +311,13 @@ impl Db {
     /// an empty value is a stored value, not a deletion.
     ///
     /// The key and value are copied before returning. Fast mode stages inserts
-    /// in a per-thread buffer; durable mode performs a blocking file write into
-    /// the OS page cache; paranoid mode additionally awaits a shared sync group.
-    /// The future may also wait behind write backpressure and ordering barriers.
+    /// in a per-thread buffer. Durable mode publishes a checksummed record
+    /// through a physically reserved shared WAL mapping when the filesystem
+    /// supports it, and otherwise uses ordered file writes; both reach the OS
+    /// page cache. Paranoid mode additionally awaits a shared sync group. The
+    /// future may also wait behind write backpressure and ordering barriers.
+    /// With WAL enabled, the four-byte key length plus key and value must fit in
+    /// the WAL format's `u32` payload length.
     ///
     /// # Errors and cancellation
     ///
@@ -332,8 +336,10 @@ impl Db {
     /// is made visible in the memtable. If a key occurs more than once, its last
     /// value in the iterator is visible after success. This call first copies
     /// every key and value into one allocation-backed input vector and then
-    /// allocates WAL batch metadata. Concurrent readers are not promised one
-    /// atomic visibility transition; use [`Self::write_batch`] for that contract.
+    /// allocates WAL batch metadata. With WAL enabled, the complete encoded
+    /// batch must fit in the format's `u32` payload length. Concurrent readers
+    /// are not promised one atomic visibility transition; use
+    /// [`Self::write_batch`] for that contract.
     /// Errors and cancellation can leave the complete WAL record recoverable
     /// even when the call did not acknowledge; verify before retrying.
     pub async fn insert_many<I, K, V>(&self, entries: I) -> Result<()>
@@ -509,6 +515,8 @@ impl Db {
     /// only a valid prefix. If the same key occurs more than once, its last
     /// operation wins. `WriteBatch` already owns copies of all inputs; this call
     /// additionally allocates operation references and WAL encoding metadata.
+    /// With WAL enabled, the complete encoded batch must fit in the format's
+    /// `u32` payload length.
     /// It can wait on backpressure, batch ordering, and a paranoid sync group.
     /// Cancellation before publication can leave the complete batch recoverable
     /// after reopen, but never publishes a visible prefix.

@@ -12,13 +12,18 @@ pub const WAL_VERSION_V1: u32 = 1;
 pub const WAL_VERSION_V2: u32 = 2;
 /// Stable identifier for entries after removal of the legacy extension.
 pub const WAL_VERSION_V3: u32 = 3;
-/// Stable identifier written by this release. Version 4 adds atomic batch
-/// records; opening a validated v1-v3 WAL starts a new v4 segment and retains
-/// the old segments for replay until their checkpoint permits reclamation.
-pub const WAL_VERSION: u32 = 4;
+/// Stable identifier for the atomic-batch WAL layout.
+pub const WAL_VERSION_V4: u32 = 4;
+/// Stable identifier written by this release.
+///
+/// Version 5 adds a last-published record tag, a checksum covering record
+/// framing metadata, and an acknowledged logical-end lower bound. Opening a
+/// validated v1-v4 WAL starts a new v5 segment and retains older segments for
+/// replay until their checkpoint permits reclamation.
+pub const WAL_VERSION: u32 = 5;
 /// Encoded segment-header size in bytes.
 pub const WAL_HEADER_SIZE: usize = 64;
-/// Encoded v3/v4 record-header size in bytes.
+/// Encoded v3-v5 record-header size in bytes.
 pub const ENTRY_HEADER_SIZE: usize = 32;
 /// Largest supported paranoid group-commit collection window.
 pub const MAX_GROUP_COMMIT_DELAY_US: u64 = 60_000_000;
@@ -30,8 +35,18 @@ pub(crate) const ENTRY_FLAGS_OFFSET: usize = 21;
 pub(crate) const ENTRY_CRC_OFFSET: u64 = 22;
 pub(crate) const ENTRY_RESERVED_START: usize = 26;
 pub(crate) const ENTRY_RESERVED_SIZE: usize = ENTRY_HEADER_SIZE - ENTRY_RESERVED_START;
+pub(crate) const WAL_ACKNOWLEDGED_END_OFFSET: u64 = 48;
+pub(crate) const WAL_ACKNOWLEDGED_END_CRC_OFFSET: u64 = 56;
+pub(crate) const V5_COMMIT_TAG: [u8; 2] = [0xa5, 0x5a];
+pub(crate) const V5_COMMIT_TAG_OFFSET: usize = ENTRY_HEADER_SIZE - V5_COMMIT_TAG.len();
 const BATCH_HEADER_SIZE: usize = 4;
 const BATCH_OPERATION_HEADER_SIZE: usize = 9;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SingleRecordLengths {
+    pub key: u32,
+    pub payload: u32,
+}
 
 #[derive(Debug, Error)]
 /// Errors produced while validating, reading, writing, syncing, or reclaiming WALs.
@@ -50,7 +65,10 @@ pub enum WalError {
     #[error("Invalid WAL format: {0}")]
     InvalidFormat(String),
 
-    /// A record payload does not match its stored CRC32.
+    /// A record does not match its stored CRC32.
+    ///
+    /// Versions 1 through 4 cover the payload; version 5 covers the framing
+    /// fields and payload together.
     #[error("CRC mismatch: data corrupted")]
     CrcMismatch,
 
@@ -253,9 +271,10 @@ impl AsRef<WalEntry> for WalEntry {
 #[derive(Debug, Clone)]
 /// Low-level WAL rotation and acknowledgement configuration.
 ///
-/// `sync_on_write = false` acknowledges after a direct file write reaches the
-/// operating-system page cache. `true` routes callers through ordered group
-/// commit and acknowledges only after `File::sync_all` succeeds.
+/// `sync_on_write = false` acknowledges after a committed record reaches the
+/// operating-system page cache through a physically reserved shared mapping or
+/// ordered-write fallback. `true` routes callers through ordered group commit
+/// and acknowledges only after `File::sync_all` succeeds.
 pub struct WalConfig {
     /// Maximum file size before rotation (bytes)
     pub max_file_size: u64,
@@ -299,8 +318,10 @@ impl WalConfig {
 
     /// Configure process-crash-oriented WAL acknowledgement without per-write sync.
     ///
-    /// Success means the record was written into the operating-system page
-    /// cache. It does not promise recent acknowledgements survive power loss.
+    /// Success means the committed record reached the operating-system page
+    /// cache. Supported local filesystems use bounded physical reservation and
+    /// a shared mapping; unsupported allocation APIs retain ordered file writes.
+    /// It does not promise recent acknowledgements survive power loss.
     pub fn durable() -> Self {
         Self {
             sync_on_write: false,
@@ -344,22 +365,59 @@ impl WalConfig {
 }
 
 #[inline]
-/// Allocate the v3/v4 payload for one put record.
+/// Allocate the version-independent payload for one put record.
+///
+/// # Panics
+///
+/// Panics when the key and value cannot fit in one WAL record. Database and
+/// WAL append APIs report that condition as [`WalError::InvalidFormat`] before
+/// allocating a sequence; this low-level encoder is intended for validated
+/// format tooling and fixtures.
 pub fn encode_kv(key: &[u8], value: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + key.len() + value.len());
-    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    let lengths = checked_single_record_lengths(key.len(), value.len())
+        .expect("put payload exceeds the WAL record limit");
+    let mut buf = Vec::with_capacity(lengths.payload as usize);
+    buf.extend_from_slice(&lengths.key.to_le_bytes());
     buf.extend_from_slice(key);
     buf.extend_from_slice(value);
     buf
 }
 
 #[inline]
-/// Allocate the v3/v4 payload for one delete record.
+/// Allocate the version-independent payload for one delete record.
+///
+/// # Panics
+///
+/// Panics when the key cannot fit in one WAL record. Database and WAL append
+/// APIs report that condition as [`WalError::InvalidFormat`] before allocating
+/// a sequence; this low-level encoder is intended for validated format tooling
+/// and fixtures.
 pub fn encode_delete(key: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + key.len());
-    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    let lengths = checked_single_record_lengths(key.len(), 0)
+        .expect("delete payload exceeds the WAL record limit");
+    let mut buf = Vec::with_capacity(lengths.payload as usize);
+    buf.extend_from_slice(&lengths.key.to_le_bytes());
     buf.extend_from_slice(key);
     buf
+}
+
+pub(crate) fn checked_single_record_lengths(
+    key_length: usize,
+    value_length: usize,
+) -> Result<SingleRecordLengths> {
+    let payload_length = 4_usize
+        .checked_add(key_length)
+        .and_then(|length| length.checked_add(value_length))
+        .ok_or_else(|| WalError::InvalidFormat("WAL record payload size overflows".to_string()))?;
+    let key = u32::try_from(key_length)
+        .map_err(|_| WalError::InvalidFormat("WAL record key is too large".to_string()))?;
+    let payload = checked_record_payload_length(payload_length)?;
+    Ok(SingleRecordLengths { key, payload })
+}
+
+pub(crate) fn checked_record_payload_length(payload_length: usize) -> Result<u32> {
+    u32::try_from(payload_length)
+        .map_err(|_| WalError::InvalidFormat("WAL record payload is too large".to_string()))
 }
 
 /// Encode a logical write batch into one checksummed WAL record payload.
@@ -463,4 +521,31 @@ fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(
         bytes.try_into().expect("four-byte batch field"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_record_format_limits_are_checked_without_allocating_payloads() {
+        let maximum_payload = usize::try_from(u32::MAX).unwrap();
+
+        let largest_value = checked_single_record_lengths(0, maximum_payload - 4).unwrap();
+        assert_eq!(largest_value.key, 0);
+        assert_eq!(largest_value.payload, u32::MAX);
+
+        let largest_key = checked_single_record_lengths(maximum_payload - 4, 0).unwrap();
+        assert_eq!(largest_key.key, u32::MAX - 4);
+        assert_eq!(largest_key.payload, u32::MAX);
+
+        assert!(matches!(
+            checked_single_record_lengths(maximum_payload - 3, 0),
+            Err(WalError::InvalidFormat(message)) if message.contains("payload is too large")
+        ));
+        assert!(matches!(
+            checked_single_record_lengths(usize::MAX, 1),
+            Err(WalError::InvalidFormat(message)) if message.contains("overflows")
+        ));
+    }
 }

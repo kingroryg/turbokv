@@ -4,7 +4,7 @@ mod protocol;
 use protocol::{
     benchmark_source_manifest, deterministic_value, distribution, ensure_release_reproducible,
     fnv1a64, locked_package_versions, percentile, random_keys, sequential_keys,
-    AcknowledgementPolicy, Cli, Durability, Profile, WorkloadConfig, KEY_BYTES, MEMTABLE_BYTES,
+    AcknowledgementBoundary, Cli, Durability, Profile, WorkloadConfig, KEY_BYTES, MEMTABLE_BYTES,
     SEED,
 };
 
@@ -43,38 +43,55 @@ fn release_requires_explicit_confirmation_and_machine_name() {
     ])
     .unwrap();
     assert_eq!(cli.profile, Profile::Release);
+
+    let paranoid = Cli::parse([
+        "--profile".into(),
+        "paranoid".into(),
+        "--confirm-release".into(),
+        "--machine".into(),
+        "Apple M4 reference".into(),
+    ])
+    .unwrap();
+    assert_eq!(paranoid.profile, Profile::Paranoid);
 }
 
 #[test]
-fn durability_classes_select_distinct_acknowledgement_policies() {
+fn release_is_production_scale_durable_and_paranoid_is_explicitly_bounded() {
+    let release = Profile::Release.defaults();
+    let release_logical_bytes = release.keys * (KEY_BYTES + release.value_bytes) as u64;
+    assert!(release_logical_bytes > MEMTABLE_BYTES as u64);
+    assert_eq!(Profile::Release.durabilities(), [Durability::Durable]);
+
+    let paranoid = Profile::Paranoid.defaults();
+    let paranoid_logical_bytes = paranoid.keys * (KEY_BYTES + paranoid.value_bytes) as u64;
+    assert!(paranoid_logical_bytes < MEMTABLE_BYTES as u64);
+    assert_eq!(Profile::Paranoid.durabilities(), [Durability::Paranoid]);
+}
+
+#[test]
+fn durability_classes_select_distinct_acknowledgement_boundaries() {
     assert_eq!(Durability::ALL, [Durability::Durable, Durability::Paranoid]);
     assert_eq!(Durability::Durable.as_str(), "durable");
     assert_eq!(
-        Durability::Durable.acknowledgement_policy(),
-        AcknowledgementPolicy::WalInOsCache
+        Durability::Durable.acknowledgement_boundary(),
+        AcknowledgementBoundary::ProcessCrashRecoverable
     );
     assert_eq!(
-        Durability::Paranoid.acknowledgement_policy(),
-        AcknowledgementPolicy::WalFsync
+        Durability::Paranoid.acknowledgement_boundary(),
+        AcknowledgementBoundary::PowerLossDurable
     );
 }
 
 #[test]
-fn measured_adapter_dispatch_is_allocation_free() {
-    let adapter = include_str!("engine.rs");
-    assert!(adapter.contains("enum State"));
-    assert!(!adapter.contains("async_trait"));
-    assert!(!adapter.contains("Box<dyn Backend"));
-}
-
-#[test]
-fn rocks_adapter_adds_full_barriers_at_acknowledgement_and_settlement() {
-    let adapter = include_str!("engine.rs");
-    assert!(adapter.contains("write_options.set_sync(false)"));
-    assert!(adapter.contains("state.db.flush_wal(false)"));
-    assert!(adapter.contains("sync_active_wal_with_full_barrier"));
-    assert!(adapter.contains("state.full_sync_database_files()?"));
-    assert!(adapter.contains("File::open(&self.path)?.sync_all()?"));
+fn benchmark_dependencies_are_rust_native() {
+    let manifest = include_str!("Cargo.toml");
+    let documentation = include_str!("README.md");
+    assert!(manifest.contains("turbokv = { path = \"..\", version = \"=0.6.0\" }"));
+    assert!(manifest.contains("fjall = \"=2.11.2\""));
+    assert!(manifest.contains("redb = \"=2.6.3\""));
+    assert!(!manifest.to_ascii_lowercase().contains("rocksdb"));
+    assert!(documentation.contains("TurboKV 0.6.0, fjall 2.11.2, and redb 2.6.3"));
+    assert!(documentation.contains("retained TurboKV 0.5.0 release run"));
 }
 
 #[test]
@@ -101,6 +118,8 @@ fn release_requires_a_clean_source_tree() {
     assert!(ensure_release_reproducible(Profile::Quick, true).is_ok());
     assert!(ensure_release_reproducible(Profile::Release, false).is_ok());
     assert!(ensure_release_reproducible(Profile::Release, true).is_err());
+    assert!(ensure_release_reproducible(Profile::Paranoid, false).is_ok());
+    assert!(ensure_release_reproducible(Profile::Paranoid, true).is_err());
 }
 
 #[test]

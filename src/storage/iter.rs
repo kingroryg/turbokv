@@ -507,7 +507,7 @@ impl ScanBounds {
                 info.max_key.as_slice() >= prefix.as_slice()
                     && upper
                         .as_ref()
-                        .map_or(true, |upper| info.min_key.as_slice() < upper.as_slice())
+                        .is_none_or(|upper| info.min_key.as_slice() < upper.as_slice())
             }
         }
     }

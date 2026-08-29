@@ -1,9 +1,9 @@
 [package]
 name = "turbokv"
-version = "0.5.0"
+version = "0.6.0"
 authors = ["kingroryg"]
 edition = "2021"
-rust-version = "1.80.0"
+rust-version = "1.85.0"
 license = "Apache-2.0"
 repository = "https://github.com/kingroryg/turbokv"
 homepage = "https://github.com/kingroryg/turbokv"
@@ -53,7 +53,7 @@ gxhash = "3"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = "=3.24.0"
 proptest = "=1.5.0"
 rand = "0.8"
 tokio = { version = "1.40", features = ["full", "test-util"] }

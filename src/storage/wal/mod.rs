@@ -2,37 +2,44 @@
 //!
 //! ## Architecture
 //! ```text
-//! durable: caller ──> sequence + record ──> File write ──> OS page cache ──> ack
+//! durable: caller ──> v5 body ──> mmap commit tag + cursor ──> OS page cache ──> ack
+//! fallback: unsupported reserve/mmap ──> direct body + tag-last writes ──> ack
 //! paranoid writers ──> bounded FIFO ──> ordered records ──> shared sync_all ──> ack
-//! rotation: full segment ──> sync header/file ──> new active segment + dir sync
+//! rotation: flush mapped view ──> truncate capacity ──> sync file ──> new segment
 //! recovery: sorted segments ──> checksum/sequence validation ──> repair active tail
 //! ```
 //!
-//! ## File Format (v4)
+//! ## File Format (v5)
 //!
-//! - Header: 64 bytes (magic, version, timestamps, sequence range)
-//! - Entries: Header (32B) + Payload (variable)
+//! - Header: 64 bytes, including a checksummed acknowledged-end lower bound.
+//! - Entries: 32-byte header + payload, with a full-record CRC and tag published last.
+//! - Versions 1 through 4 remain readable; new writes always start/use a v5 segment.
+//! - A single-record payload, including its four-byte key length, must fit in
+//!   `u32`; append APIs reject larger inputs before allocating a sequence.
 //!
 //! ## Allocation-Reusing Write Path
 //!
-//! Durable single-record encoding reuses a thread-local buffer. Records larger
-//! than its retained capacity can grow that buffer; paranoid submissions own a
-//! queued payload and response channel until their shared barrier completes.
+//! Durable single-record encoding reuses a thread-local buffer and grows one
+//! physically reserved mapping in bounded chunks. Records larger than the
+//! retained buffer can grow it; paranoid submissions own a queued payload and
+//! response channel until their shared barrier completes.
 
 mod file;
 mod iterator;
+mod reservation;
 mod types;
 
 pub use iterator::WalEntryIterator;
 pub use types::{
     encode_delete, encode_kv, EntryType, Result, WalConfig, WalEntry, WalError,
     MAX_GROUP_COMMIT_DELAY_US, WAL_VERSION, WAL_VERSION_V1, WAL_VERSION_V2, WAL_VERSION_V3,
+    WAL_VERSION_V4,
 };
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom, Write};
+use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -42,14 +49,19 @@ use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
+#[cfg(test)]
 use crate::core::crypto::crc32_checksum;
 use crate::storage::{directory_lock::DirectoryLock, manifest::sync_directory, InProgressGuard};
 use file::{
     create_file, entry_size, finalize_header, inspect_segment, open_recovered_file,
     preflight_active_segment, read_and_validate_header, read_entry_versioned,
-    synchronize_segment_header, wal_sequence_from_path, write_entries_batch, write_entry, WalFile,
+    synchronize_segment_header, temporary_wal_sequence_from_path, v5_record_crc_fields,
+    wal_sequence_from_path, write_entry, WalFile,
 };
-use types::{encode_batch, ENTRY_HEADER_SIZE, ENTRY_RESERVED_SIZE, WAL_HEADER_SIZE};
+use types::{
+    checked_single_record_lengths, encode_batch, SingleRecordLengths, ENTRY_HEADER_SIZE,
+    ENTRY_RESERVED_SIZE, V5_COMMIT_TAG, V5_COMMIT_TAG_OFFSET, WAL_HEADER_SIZE,
+};
 
 // Thread-local buffer reused by direct durable WAL writes.
 thread_local! {
@@ -345,10 +357,10 @@ impl WriteAheadLog {
                 source: Some(e),
             })?;
 
-        let (wal_file, initial_sequence, batch_ranges) =
+        let (wal_file, initial_sequence, batch_ranges, retained_valid) =
             Self::open_or_create(&wal_dir, &config, preflight)?;
         sync_wal_directory(&wal_dir)?;
-        let byte_accounting = Arc::new(WalByteAccounting::new(retained_wal_bytes(&wal_dir)?));
+        let byte_accounting = Arc::new(WalByteAccounting::new(retained_valid));
         let current_file = Arc::new(RwLock::new(wal_file));
         let queue_capacity = config.max_batch_size.saturating_mul(2).clamp(1, 1 << 20);
         let (write_tx, write_rx) = mpsc::channel::<GroupCommitCommand>(queue_capacity);
@@ -409,10 +421,14 @@ impl WriteAheadLog {
     /// file I/O on the calling runtime thread; success reaches the OS page cache.
     /// Synced mode allocates an owned payload, waits for the bounded group-commit
     /// queue and `File::sync_all`, and may share that barrier with other callers.
+    /// The four-byte key length plus key and value must fit in one `u32`-sized
+    /// record payload; larger inputs return [`WalError::InvalidFormat`] without
+    /// consuming a sequence.
     /// Cancelling after a synced request is queued does not cancel its physical
     /// append, so the outcome must be treated as indeterminate and recovered by
     /// sequence/content inspection.
     pub async fn append(&self, key: &[u8], value: &[u8]) -> Result<u64> {
+        let lengths = checked_single_record_lengths(key.len(), value.len())?;
         if self.config.sync_on_write {
             let appended = self
                 .enqueue_paranoid(PendingWalRecord {
@@ -424,7 +440,7 @@ impl WriteAheadLog {
             Ok(appended.sequences[0])
         } else {
             // Non-sync mode (durable): reuse the thread-local encode buffer.
-            self.append_zero_alloc(key, value, EntryType::Data)
+            self.append_zero_alloc(key, value, EntryType::Data, lengths)
         }
     }
 
@@ -433,66 +449,63 @@ impl WriteAheadLog {
     /// This is the fast path for durable mode (WAL without fsync). Inputs that
     /// exceed retained capacity can grow the buffer; later calls reuse it.
     #[inline]
-    fn append_zero_alloc(&self, key: &[u8], value: &[u8], entry_type: EntryType) -> Result<u64> {
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+    fn append_zero_alloc(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        entry_type: EntryType,
+        lengths: SingleRecordLengths,
+    ) -> Result<u64> {
+        let sequence = reserve_sequence_range(&self.sequence, 1)?;
         let timestamp = super::cached_time::now_ms();
 
         WAL_ENCODE_BUFFER.with(|buf_cell| {
             let mut buf = buf_cell.borrow_mut();
             buf.clear();
 
-            // Calculate data length: key_len(4) + key + value
-            let data_len = 4 + key.len() + value.len();
+            let data_len = lengths.payload as usize;
             let total_len = ENTRY_HEADER_SIZE + data_len;
-
-            // Ensure buffer capacity
             let cap = buf.capacity();
             if cap < total_len {
                 buf.reserve(total_len - cap);
             }
 
-            // Build entry directly in buffer
-
-            // 1. Data length (u32) - offset 0
-            buf.extend_from_slice(&(data_len as u32).to_le_bytes());
-            // 2. Sequence (u64) - offset 4
+            buf.extend_from_slice(&lengths.payload.to_le_bytes());
             buf.extend_from_slice(&sequence.to_le_bytes());
-            // 3. Timestamp (u64) - offset 12
             buf.extend_from_slice(&timestamp.to_le_bytes());
-            // 4. Entry type (u8) - offset 20
             buf.push(entry_type as u8);
-            // 5. Flags (u8) - offset 21
             buf.push(0);
-            // 6. CRC placeholder (u32) - offset 22, will fill after encoding data
             let crc_offset = buf.len();
-            buf.extend_from_slice(&[0u8; 4]);
-            // 7. Reserved (6 bytes) - offset 26
+            buf.extend_from_slice(&[0_u8; 4]);
             buf.extend_from_slice(&[0_u8; ENTRY_RESERVED_SIZE]);
 
-            // 8. Encode key-value data
-            let data_start = buf.len();
-            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&lengths.key.to_le_bytes());
             buf.extend_from_slice(key);
             buf.extend_from_slice(value);
-
-            // 9. Compute CRC over data portion and fill in
-            let crc = crc32_checksum(&buf[data_start..]);
+            let crc = v5_record_crc_fields(
+                lengths.payload,
+                sequence,
+                timestamp,
+                entry_type,
+                0,
+                &buf[ENTRY_HEADER_SIZE..],
+            );
             buf[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
+            buf[V5_COMMIT_TAG_OFFSET..ENTRY_HEADER_SIZE].copy_from_slice(&V5_COMMIT_TAG);
 
-            // Check rotation and write
             let entry_bytes = buf.len() as u64;
-            // Single write to file
             let mut file = self.current_file.write();
             if file.should_rotate(entry_bytes, self.config.max_file_size) {
-                finalize_header(&mut file)?;
-                let new_seq = file.next_segment_sequence()?;
-                *file = create_file(&self.wal_dir, new_seq, &self.config)?;
-                self.byte_accounting.record_segment_created();
-                info!("Rotated WAL file, new sequence: {}", new_seq);
+                rotate_segment(
+                    &mut file,
+                    &self.wal_dir,
+                    &self.config,
+                    &self.byte_accounting,
+                )?;
             }
-            file.file.write_all(&buf)?;
+            file.write_current_record(&buf, self.config.max_file_size)?;
             self.byte_accounting.record_append(entry_bytes);
-            file.record_append(entry_bytes, 1, sequence, sequence);
+            file.record_append(entry_bytes, 1, sequence, sequence)?;
 
             Ok(sequence)
         })
@@ -501,8 +514,10 @@ impl WriteAheadLog {
     /// Append a tombstone record and return its engine sequence.
     ///
     /// Durability, blocking, allocation, and cancellation behavior matches
-    /// [`Self::append`].
+    /// [`Self::append`]. The four-byte key length plus key must fit in one
+    /// `u32`-sized record payload.
     pub async fn append_delete(&self, key: &[u8]) -> Result<u64> {
+        let lengths = checked_single_record_lengths(key.len(), 0)?;
         if self.config.sync_on_write {
             let appended = self
                 .enqueue_paranoid(PendingWalRecord {
@@ -514,64 +529,8 @@ impl WriteAheadLog {
             Ok(appended.sequences[0])
         } else {
             // Non-sync mode: reuse the thread-local encode buffer.
-            self.append_delete_zero_alloc(key)
+            self.append_zero_alloc(key, &[], EntryType::Delete, lengths)
         }
-    }
-
-    /// Allocation-reusing delete append.
-    #[inline]
-    fn append_delete_zero_alloc(&self, key: &[u8]) -> Result<u64> {
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let timestamp = super::cached_time::now_ms();
-
-        WAL_ENCODE_BUFFER.with(|buf_cell| {
-            let mut buf = buf_cell.borrow_mut();
-            buf.clear();
-
-            // Data length: key_len(4) + key (no value for delete)
-            let data_len = 4 + key.len();
-            let total_len = ENTRY_HEADER_SIZE + data_len;
-
-            let cap = buf.capacity();
-            if cap < total_len {
-                buf.reserve(total_len - cap);
-            }
-
-            // Build entry header
-            buf.extend_from_slice(&(data_len as u32).to_le_bytes());
-            buf.extend_from_slice(&sequence.to_le_bytes());
-            buf.extend_from_slice(&timestamp.to_le_bytes());
-            buf.push(EntryType::Delete as u8);
-            buf.push(0); // flags
-            let crc_offset = buf.len();
-            buf.extend_from_slice(&[0u8; 4]); // CRC placeholder
-            buf.extend_from_slice(&[0_u8; ENTRY_RESERVED_SIZE]);
-
-            // Encode key only (no value for delete)
-            let data_start = buf.len();
-            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            buf.extend_from_slice(key);
-
-            // Compute CRC
-            let crc = crc32_checksum(&buf[data_start..]);
-            buf[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
-
-            // Check rotation and write
-            let entry_bytes = buf.len() as u64;
-            let mut file = self.current_file.write();
-            if file.should_rotate(entry_bytes, self.config.max_file_size) {
-                finalize_header(&mut file)?;
-                let new_seq = file.next_segment_sequence()?;
-                *file = create_file(&self.wal_dir, new_seq, &self.config)?;
-                self.byte_accounting.record_segment_created();
-                info!("Rotated WAL file, new sequence: {}", new_seq);
-            }
-            file.file.write_all(&buf)?;
-            self.byte_accounting.record_append(entry_bytes);
-            file.record_append(entry_bytes, 1, sequence, sequence);
-
-            Ok(sequence)
-        })
     }
 
     /// Append multiple key-value pairs as one checksummed physical record.
@@ -610,7 +569,7 @@ impl WriteAheadLog {
         }
 
         let batch = self.encode_entries_batch(entries)?;
-        self.write_encoded_batch(&batch).await?;
+        self.write_encoded_batch(&batch)?;
         self.batch_ranges
             .write()
             .insert(batch.first_sequence, batch.last_sequence);
@@ -654,17 +613,26 @@ impl WriteAheadLog {
 
         self.flush().await?;
 
-        let current_path = self.current_file.read().path.clone();
-        let wal_files = self.list_wal_files().await?;
+        let (current_path, current_end, wal_files) = {
+            let current = self.current_file.read();
+            let wal_files = discover_wal_files_sync(&self.wal_dir)?;
+            (current.path.clone(), current.size, wal_files)
+        };
 
         for (_, path) in &wal_files {
             if *path == current_path {
                 continue;
             }
-            self.read_entries_from_file(path, start_sequence, &mut entries, &mut seen)?;
+            self.read_entries_from_file(path, None, start_sequence, &mut entries, &mut seen)?;
         }
 
-        self.read_entries_from_file(&current_path, start_sequence, &mut entries, &mut seen)?;
+        self.read_entries_from_file(
+            &current_path,
+            Some(current_end),
+            start_sequence,
+            &mut entries,
+            &mut seen,
+        )?;
         entries.sort_by_key(|e| e.sequence);
 
         Ok(entries)
@@ -683,11 +651,16 @@ impl WriteAheadLog {
     pub async fn iter_entries_from(&self, start_sequence: u64) -> Result<WalEntryIterator> {
         self.flush().await?;
 
-        let wal_files = self.list_wal_files().await?;
+        let (current_path, current_end, paths) = {
+            let current = self.current_file.read();
+            let paths = discover_wal_files_sync(&self.wal_dir)?
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect();
+            (current.path.clone(), current.size, paths)
+        };
 
-        let paths: Vec<PathBuf> = wal_files.into_iter().map(|(_, path)| path).collect();
-
-        WalEntryIterator::new(paths, start_sequence)
+        WalEntryIterator::new_with_active_end(paths, start_sequence, current_path, current_end)
     }
 
     /// Delete inactive segments whose last logical sequence is below the bound.
@@ -719,7 +692,7 @@ impl WriteAheadLog {
             let metadata = inspect_segment(path, false)?;
             if metadata
                 .last_sequence
-                .map_or(true, |last| last < up_to_sequence)
+                .is_none_or(|last| last < up_to_sequence)
             {
                 eligible.push((path, metadata.valid_end));
             }
@@ -865,18 +838,22 @@ impl WriteAheadLog {
         &self,
         entries: &[(&[u8], Option<&[u8]>)],
     ) -> Result<EncodedBatchRecord> {
-        let start_sequence = self
-            .sequence
-            .fetch_add(entries.len() as u64, Ordering::SeqCst);
+        let operation_count = u64::try_from(entries.len()).map_err(|_| {
+            WalError::InvalidFormat(
+                "batch operation count does not fit a sequence range".to_string(),
+            )
+        })?;
+        let data = Bytes::from(encode_batch(entries)?);
+        let start_sequence = reserve_sequence_range(&self.sequence, operation_count)?;
         let last_sequence = start_sequence
-            .checked_add(entries.len() as u64 - 1)
+            .checked_add(operation_count - 1)
             .ok_or_else(|| WalError::InvalidFormat("batch sequence range overflows".to_string()))?;
         let sequences = (start_sequence..=last_sequence).collect();
         let entry = WalEntry {
             sequence: start_sequence,
             timestamp: super::cached_time::now_ms(),
             entry_type: EntryType::Batch,
-            data: Bytes::from(encode_batch(entries)?),
+            data,
         };
         let mut encoded = Vec::with_capacity(entry_size(&entry));
         write_entry(&mut encoded, &entry)?;
@@ -888,33 +865,33 @@ impl WriteAheadLog {
         })
     }
 
-    async fn write_encoded_batch(&self, batch: &EncodedBatchRecord) -> Result<()> {
+    fn write_encoded_batch(&self, batch: &EncodedBatchRecord) -> Result<()> {
         let total_batch_size = batch.encoded.len() as u64;
         let needs_rotation = {
             let f = self.current_file.read();
             f.should_rotate(total_batch_size, self.config.max_file_size)
         };
         if needs_rotation {
-            self.rotate().await?;
+            self.rotate()?;
         }
 
         let mut f = self.current_file.write();
-        f.file.write_all(&batch.encoded)?;
+        f.write_current_record(&batch.encoded, self.config.max_file_size)?;
         self.byte_accounting.record_append(total_batch_size);
         f.record_append(
             total_batch_size,
             batch.sequences.len() as u64,
             batch.first_sequence,
             batch.last_sequence,
-        );
+        )?;
 
         if self.config.sync_on_write {
-            f.file.sync_all()?;
+            finalize_header(&mut f)?;
         }
         Ok(())
     }
 
-    async fn rotate(&self) -> Result<()> {
+    fn rotate(&self) -> Result<()> {
         rotate_sync(
             &self.current_file,
             &self.wal_dir,
@@ -927,7 +904,26 @@ impl WriteAheadLog {
         wal_dir: &Path,
         config: &WalConfig,
         mut preflight: WalDirectoryPreflight,
-    ) -> Result<(WalFile, u64, BTreeMap<u64, u64>)> {
+    ) -> Result<(WalFile, u64, BTreeMap<u64, u64>, u64)> {
+        for temporary_path in preflight.temporary_segments.drain(..) {
+            match std::fs::remove_file(&temporary_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let retained_valid = preflight
+            .segments
+            .iter()
+            .try_fold(0_u64, |total, segment| {
+                total
+                    .checked_add(segment.metadata.valid_end)
+                    .ok_or_else(|| {
+                        WalError::InvalidFormat(
+                            "retained logical WAL byte count overflows".to_string(),
+                        )
+                    })
+            })?;
         if let Some(latest) = preflight.segments.pop() {
             let mut next_sequence = 0;
             let mut batch_ranges = BTreeMap::new();
@@ -941,15 +937,23 @@ impl WriteAheadLog {
             next_sequence = next_sequence.max(latest_next_sequence);
             batch_ranges.extend(latest.metadata.batch_ranges.iter().copied());
 
-            // Older segments remain readable, but current writes use v4. Start
-            // a new segment rather than adding v4 batch records to an old one.
+            // Older segments remain readable, but current writes use v5. Start
+            // a new segment rather than appending v5 records to an old layout.
             if !latest.metadata.format.is_current() {
                 finalize_header(&mut file)?;
                 let new_sequence = next_sequence.max(latest.filename_sequence.saturating_add(1));
+                let retained_with_new = retained_valid
+                    .checked_add(WAL_HEADER_SIZE as u64)
+                    .ok_or_else(|| {
+                        WalError::InvalidFormat(
+                            "retained logical WAL byte count overflows".to_string(),
+                        )
+                    })?;
                 return Ok((
                     create_file(wal_dir, new_sequence, config)?,
                     new_sequence,
                     batch_ranges,
+                    retained_with_new,
                 ));
             }
 
@@ -959,9 +963,18 @@ impl WriteAheadLog {
                 finalize_header(&mut file)?;
             }
 
-            Ok((file, next_sequence, batch_ranges))
+            if !config.sync_on_write {
+                file.enable_mapped_writes(config.max_file_size)?;
+            }
+
+            Ok((file, next_sequence, batch_ranges, retained_valid))
         } else {
-            Ok((create_file(wal_dir, 0, config)?, 0, BTreeMap::new()))
+            Ok((
+                create_file(wal_dir, 0, config)?,
+                0,
+                BTreeMap::new(),
+                WAL_HEADER_SIZE as u64,
+            ))
         }
     }
 
@@ -972,18 +985,26 @@ impl WriteAheadLog {
     fn read_entries_from_file(
         &self,
         path: &Path,
+        logical_end: Option<u64>,
         start_sequence: u64,
         entries: &mut Vec<WalEntry>,
         seen: &mut HashSet<u64>,
     ) -> Result<()> {
+        let file_end = match logical_end {
+            Some(end) => end,
+            None => inspect_segment(path, false)?.valid_end,
+        };
         let file = File::open(path)?;
-        let file_end = file.metadata()?.len();
         let mut reader = BufReader::new(file);
         let (format, _) = read_and_validate_header(&mut reader)?;
         reader.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
 
         loop {
-            let remaining = file_end.saturating_sub(reader.stream_position()?);
+            let position = reader.stream_position()?;
+            if position >= file_end {
+                break;
+            }
+            let remaining = file_end - position;
             match read_entry_versioned(&mut reader, format, remaining) {
                 Ok(entry) => {
                     for entry in entry.into_logical_entries()? {
@@ -1012,12 +1033,19 @@ struct PreflightSegment {
 pub(crate) struct WalDirectoryPreflight {
     wal_dir: PathBuf,
     segments: Vec<PreflightSegment>,
+    temporary_segments: Vec<PathBuf>,
 }
 
 /// Validate every retained segment without rewriting headers, truncating a
-/// recoverable active tail, creating a v4 segment, or syncing the directory.
+/// recoverable active tail, creating a v5 segment, or syncing the directory.
 pub(crate) async fn preflight_directory(wal_dir: &Path) -> Result<WalDirectoryPreflight> {
-    let wal_files = discover_wal_files(wal_dir).await?;
+    let paths = discover_wal_paths(wal_dir).await?;
+    let temporary_segments = paths
+        .iter()
+        .filter(|path| temporary_wal_sequence_from_path(path).is_some())
+        .cloned()
+        .collect();
+    let wal_files = sequenced_wal_files(paths);
     let mut segments = Vec::with_capacity(wal_files.len());
     let last_index = wal_files.len().checked_sub(1);
     for (index, (filename_sequence, path)) in wal_files.into_iter().enumerate() {
@@ -1035,26 +1063,50 @@ pub(crate) async fn preflight_directory(wal_dir: &Path) -> Result<WalDirectoryPr
     Ok(WalDirectoryPreflight {
         wal_dir: wal_dir.to_path_buf(),
         segments,
+        temporary_segments,
     })
 }
 
 async fn discover_wal_files(wal_dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    Ok(sequenced_wal_files(discover_wal_paths(wal_dir).await?))
+}
+
+async fn discover_wal_paths(wal_dir: &Path) -> Result<Vec<PathBuf>> {
     if !wal_dir.exists() {
         return Ok(Vec::new());
     }
 
     let mut entries = tokio::fs::read_dir(wal_dir).await?;
-    let mut wal_files = Vec::new();
+    let mut paths = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
         if entry.file_type().await?.is_file() {
-            if let Some(sequence) = wal_sequence_from_path(&path) {
-                wal_files.push((sequence, path));
-            }
+            paths.push(entry.path());
         }
     }
+    Ok(paths)
+}
+
+fn discover_wal_files_sync(wal_dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    if !wal_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(wal_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            paths.push(entry.path());
+        }
+    }
+    Ok(sequenced_wal_files(paths))
+}
+
+fn sequenced_wal_files(paths: impl IntoIterator<Item = PathBuf>) -> Vec<(u64, PathBuf)> {
+    let mut wal_files: Vec<_> = paths
+        .into_iter()
+        .filter_map(|path| wal_sequence_from_path(&path).map(|sequence| (sequence, path)))
+        .collect();
     wal_files.sort_by_key(|(sequence, _)| *sequence);
-    Ok(wal_files)
+    wal_files
 }
 
 // ========================================
@@ -1096,11 +1148,15 @@ fn reserve_group_sequences(sequence: &AtomicU64, group: &[WriteRequest]) -> Resu
             .checked_add(request.record.operation_count)
             .ok_or_else(|| WalError::InvalidFormat("group sequence range overflows".to_string()))
     })?;
+    reserve_sequence_range(sequence, operation_count)
+}
+
+fn reserve_sequence_range(sequence: &AtomicU64, operation_count: u64) -> Result<u64> {
     sequence
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
             current.checked_add(operation_count)
         })
-        .map_err(|_| WalError::InvalidFormat("group sequence range overflows".to_string()))
+        .map_err(|_| WalError::InvalidFormat("WAL sequence range overflows".to_string()))
 }
 
 fn prepare_group(group: Vec<WriteRequest>, start_sequence: u64) -> Vec<PreparedWriteRequest> {
@@ -1181,7 +1237,7 @@ fn write_group_sync(
     while start < group.len() {
         let first_size = entry_size(&group[start].entry) as u64;
         if f.should_rotate(first_size, config.max_file_size) {
-            rotate_group_segment(&mut f, wal_dir, config, byte_accounting)?;
+            rotate_segment(&mut f, wal_dir, config, byte_accounting)?;
             rotated = true;
         }
 
@@ -1203,7 +1259,7 @@ fn write_group_sync(
         write_group_chunk(&mut f, &group[start..end], chunk_bytes, byte_accounting)?;
         start = end;
         if start < group.len() {
-            rotate_group_segment(&mut f, wal_dir, config, byte_accounting)?;
+            rotate_segment(&mut f, wal_dir, config, byte_accounting)?;
             rotated = true;
         }
     }
@@ -1236,7 +1292,7 @@ fn write_group_chunk(
     byte_accounting: &WalByteAccounting,
 ) -> Result<()> {
     let entries: Vec<&WalEntry> = group.iter().map(|request| &request.entry).collect();
-    write_entries_batch(&mut file.file, &entries)?;
+    file.write_current_entries_direct(&entries)?;
     byte_accounting.record_append(encoded_bytes);
 
     let first = group
@@ -1258,11 +1314,11 @@ fn write_group_chunk(
         operation_count,
         first.entry.sequence,
         last_sequence,
-    );
+    )?;
     Ok(())
 }
 
-fn rotate_group_segment(
+fn rotate_segment(
     file: &mut WalFile,
     wal_dir: &Path,
     config: &WalConfig,
@@ -1321,19 +1377,7 @@ fn rotate_sync(
     byte_accounting: &WalByteAccounting,
 ) -> Result<()> {
     let mut current = current_file.write();
-    rotate_group_segment(&mut current, wal_dir, config, byte_accounting)
-}
-
-fn retained_wal_bytes(wal_dir: &Path) -> Result<u64> {
-    std::fs::read_dir(wal_dir)?.try_fold(0_u64, |total, entry| {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type()?.is_file() && wal_sequence_from_path(&path).is_some() {
-            Ok(total.saturating_add(entry.metadata()?.len()))
-        } else {
-            Ok(total)
-        }
-    })
+    rotate_segment(&mut current, wal_dir, config, byte_accounting)
 }
 
 #[cfg(test)]
@@ -2044,6 +2088,25 @@ mod tests {
         assert_eq!(reopened.read_from(0).await.unwrap().len(), MAXIMUM);
     }
 
+    #[tokio::test]
+    async fn durable_single_append_rejects_sequence_exhaustion_without_writing() {
+        let directory = TempDir::new().unwrap();
+        let wal = WriteAheadLog::new(directory.path(), WalConfig::durable())
+            .await
+            .unwrap();
+        wal.sequence.store(u64::MAX, Ordering::SeqCst);
+        let size_before = wal.current_size();
+
+        let error = wal.append(b"key", b"value").await.unwrap_err();
+        assert!(matches!(
+            error,
+            WalError::InvalidFormat(message) if message.contains("sequence range overflows")
+        ));
+        assert_eq!(wal.current_sequence(), u64::MAX);
+        assert_eq!(wal.current_size(), size_before);
+        assert!(wal.read_from(0).await.unwrap().is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn later_segment_failure_keeps_the_whole_group_frontier_indeterminate() {
         const CALLERS: usize = 3;
@@ -2225,6 +2288,26 @@ mod tests {
             assert!(directory.path().join(alias).is_file());
         }
         assert!(directory.path().join("00000000000000000998.wal").is_dir());
+    }
+
+    #[tokio::test]
+    async fn open_removes_only_canonical_uninstalled_segment_temps() {
+        let directory = TempDir::new().unwrap();
+        let stale_temporary = directory.path().join("00000000000000000042.wal.tmp");
+        let unrelated = directory.path().join("42.wal.tmp");
+        std::fs::write(&stale_temporary, b"partial header").unwrap();
+        std::fs::write(&unrelated, b"caller-owned").unwrap();
+
+        let wal = WriteAheadLog::new(directory.path(), WalConfig::durable())
+            .await
+            .unwrap();
+
+        assert!(!stale_temporary.exists());
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"caller-owned");
+        assert_eq!(
+            wal_sequence_from_path(&wal.current_file.read().path),
+            Some(0)
+        );
     }
 
     #[tokio::test]
@@ -2509,7 +2592,7 @@ mod tests {
     }
 
     #[test]
-    fn iterator_is_fused_after_reporting_corruption() {
+    fn iterator_construction_rejects_validated_segment_corruption() {
         let directory = TempDir::new().unwrap();
         let config = WalConfig::durable();
         let mut wal_file = create_file(directory.path(), 0, &config).unwrap();
@@ -2520,14 +2603,19 @@ mod tests {
             data: Bytes::from(encode_kv(b"key", b"value")),
         };
         write_entry(&mut wal_file.file, &entry).unwrap();
-        wal_file.file.write_all(&[1, 0, 0, 0, 1]).unwrap();
+        wal_file
+            .file
+            .seek(SeekFrom::Start(
+                WAL_HEADER_SIZE as u64 + types::ENTRY_CRC_OFFSET,
+            ))
+            .unwrap();
+        let crc_byte = wal_file.file.read_u8().unwrap();
+        wal_file.file.seek(SeekFrom::Current(-1)).unwrap();
+        wal_file.file.write_all(&[crc_byte ^ 1]).unwrap();
         let path = wal_file.path.clone();
         drop(wal_file);
 
-        let mut iterator = WalEntryIterator::new(vec![path], 0).unwrap();
-        assert_eq!(iterator.next().unwrap().unwrap().sequence, 0);
-        assert!(iterator.next().unwrap().is_err());
-        assert!(iterator.next().is_none());
+        assert!(WalEntryIterator::new(vec![path], 0).is_err());
     }
 
     #[tokio::test]
@@ -2572,20 +2660,19 @@ mod tests {
                 .unwrap();
 
             assert!(wal.read_from(0).await.is_err());
-            let mut iterator = wal.iter_entries().await.unwrap();
-            assert_eq!(iterator.next().unwrap().unwrap().sequence, 0);
-            assert!(iterator.next().unwrap().is_err());
-            assert!(iterator.next().is_none());
+            assert!(wal.iter_entries().await.is_err());
         }
     }
 
     #[tokio::test]
-    async fn legacy_active_segment_rotates_to_v4_before_append() {
+    async fn legacy_active_segment_rotates_to_v5_before_append() {
         let directory = TempDir::new().unwrap();
         let config = WalConfig::paranoid();
         let mut legacy = create_file(directory.path(), 0, &config).unwrap();
         legacy.file.seek(SeekFrom::Start(8)).unwrap();
         legacy.file.write_u32::<LittleEndian>(2).unwrap();
+        legacy.file.seek(SeekFrom::Start(48)).unwrap();
+        legacy.file.write_all(&[0_u8; 16]).unwrap();
         legacy
             .file
             .seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))
@@ -2623,5 +2710,122 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 1]
         );
+    }
+
+    #[tokio::test]
+    async fn every_released_wal_version_migrates_to_v5_without_rewriting_old_records() {
+        for version in [
+            WAL_VERSION_V1,
+            WAL_VERSION_V2,
+            WAL_VERSION_V3,
+            WAL_VERSION_V4,
+        ] {
+            let directory = TempDir::new().unwrap();
+            let config = WalConfig::paranoid();
+            let mut old = create_file(directory.path(), 0, &config).unwrap();
+            old.file.seek(SeekFrom::Start(8)).unwrap();
+            old.file.write_u32::<LittleEndian>(version).unwrap();
+            old.file.seek(SeekFrom::Start(48)).unwrap();
+            old.file.write_all(&[0_u8; 16]).unwrap();
+            old.file
+                .seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))
+                .unwrap();
+            let payload = encode_kv(b"old", b"value");
+            old.file
+                .write_u32::<LittleEndian>(payload.len() as u32)
+                .unwrap();
+            old.file.write_u64::<LittleEndian>(0).unwrap();
+            old.file.write_u64::<LittleEndian>(0).unwrap();
+            old.file.write_u8(EntryType::Data as u8).unwrap();
+            old.file.write_u8(0).unwrap();
+            old.file
+                .write_u32::<LittleEndian>(crc32_checksum(&payload))
+                .unwrap();
+            old.file.write_all(&[0_u8; ENTRY_RESERVED_SIZE]).unwrap();
+            if matches!(version, WAL_VERSION_V1 | WAL_VERSION_V2) {
+                old.file
+                    .write_all(&[0_u8; LEGACY_ENTRY_EXTENSION_SIZE])
+                    .unwrap();
+            }
+            old.file.write_all(&payload).unwrap();
+            let old_path = old.path.clone();
+            drop(old);
+
+            let wal = WriteAheadLog::new(directory.path(), config.clone())
+                .await
+                .unwrap_or_else(|error| panic!("v{version} migration: {error}"));
+            assert_eq!(wal_paths(directory.path()).len(), 2, "v{version}");
+            assert_eq!(wal.append(b"new", b"value").await.unwrap(), 1);
+            let entries = wal.read_from(0).await.unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.sequence)
+                    .collect::<Vec<_>>(),
+                [0, 1],
+                "v{version}"
+            );
+
+            let mut old_header = File::open(&old_path).unwrap();
+            old_header.seek(SeekFrom::Start(8)).unwrap();
+            assert_eq!(old_header.read_u32::<LittleEndian>().unwrap(), version);
+            let current_path = wal.current_file.read().path.clone();
+            let mut current_header = File::open(current_path).unwrap();
+            current_header.seek(SeekFrom::Start(8)).unwrap();
+            assert_eq!(
+                current_header.read_u32::<LittleEndian>().unwrap(),
+                WAL_VERSION
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn active_mapped_capacity_is_hidden_from_iterators_and_flushed_before_sync() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: 1024 * 1024,
+            ..WalConfig::durable()
+        };
+        let wal = WriteAheadLog::new(directory.path(), config.clone())
+            .await
+            .unwrap();
+        wal.append(b"key", b"value").await.unwrap();
+        let path = wal.current_file.read().path.clone();
+        assert_eq!(path.metadata().unwrap().len(), config.max_file_size);
+
+        let mut iterator = WalEntryIterator::new_with_active_end(
+            vec![path.clone()],
+            0,
+            path.clone(),
+            wal.current_size(),
+        )
+        .unwrap();
+        assert_eq!(iterator.next().unwrap().unwrap().sequence, 0);
+        assert!(iterator.next().is_none());
+
+        wal.flush().await.unwrap();
+        assert_eq!(path.metadata().unwrap().len(), wal.current_size());
+        drop(wal);
+
+        let reopened = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        assert_eq!(reopened.read_from(0).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn iterator_snapshot_remains_bounded_when_a_later_append_remaps_the_active_file() {
+        let directory = TempDir::new().unwrap();
+        let config = WalConfig {
+            max_file_size: 1024 * 1024,
+            ..WalConfig::durable()
+        };
+        let wal = WriteAheadLog::new(directory.path(), config).await.unwrap();
+        wal.append(b"first", b"value").await.unwrap();
+        let mut snapshot = wal.iter_entries().await.unwrap();
+
+        wal.append(b"second", b"value").await.unwrap();
+        assert_eq!(snapshot.next().unwrap().unwrap().sequence, 0);
+        assert!(snapshot.next().is_none());
+
+        assert_eq!(wal.read_from(0).await.unwrap().len(), 2);
     }
 }

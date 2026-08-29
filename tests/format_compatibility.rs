@@ -12,6 +12,7 @@ use turbokv::storage::sstable::{
 };
 use turbokv::storage::wal::{
     WalConfig, WriteAheadLog, WAL_VERSION, WAL_VERSION_V1, WAL_VERSION_V2, WAL_VERSION_V3,
+    WAL_VERSION_V4,
 };
 use turbokv::{Db, DbOptions};
 
@@ -181,8 +182,14 @@ fn stable_format_identifiers_do_not_drift() {
         (1, 2, 3)
     );
     assert_eq!(
-        (WAL_VERSION_V1, WAL_VERSION_V2, WAL_VERSION_V3, WAL_VERSION),
-        (1, 2, 3, 4)
+        (
+            WAL_VERSION_V1,
+            WAL_VERSION_V2,
+            WAL_VERSION_V3,
+            WAL_VERSION_V4,
+            WAL_VERSION,
+        ),
+        (1, 2, 3, 4, 5)
     );
     assert_eq!(
         (SSTABLE_VERSION_V1, SSTABLE_VERSION_V2, SSTABLE_VERSION),
@@ -361,9 +368,13 @@ async fn every_wal_fixture_reads_through_the_public_api() {
         ("wal_v2.wal", 512, 2),
         ("wal_v3.wal", 256, 2),
         ("wal_v4.wal", 269, 3),
+        ("wal_v5.wal", 269, 3),
     ] {
         let original = fs::read(fixture(name)).unwrap();
         assert_eq!(original.len(), expected_size, "{name}");
+        if name == "wal_v5.wal" {
+            assert_eq!(crc32fast::hash(&original), 0x5d93_d7a6);
+        }
         let directory = TempDir::new().unwrap();
         copy_fixture(name, &directory.path().join(WAL_NAME));
 
@@ -376,7 +387,7 @@ async fn every_wal_fixture_reads_through_the_public_api() {
         assert!(entries[0].decode_value().unwrap().contains(&0xff), "{name}");
         assert_eq!(entries[1].decode_key(), Some(DELETED_KEY), "{name}");
         assert!(entries[1].decode_value().is_none(), "{name}");
-        if name == "wal_v4.wal" {
+        if matches!(name, "wal_v4.wal" | "wal_v5.wal") {
             assert_eq!(entries[2].decode_key(), Some(&b"empty\x00"[..]));
             assert_eq!(entries[2].decode_value(), Some(&[][..]));
         }
@@ -430,7 +441,7 @@ fn configured_max_block_boundary_round_trips_through_public_apis() {
 async fn configured_max_segment_boundary_rotates_after_current_fixture() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join(WAL_NAME);
-    copy_fixture("wal_v4.wal", &path);
+    copy_fixture("wal_v5.wal", &path);
     let original = fs::read(&path).unwrap();
     let wal = WriteAheadLog::new(
         directory.path(),
@@ -461,7 +472,13 @@ async fn every_manifest_wal_sstable_combination_upgrades_reopens_and_is_idempote
         ("manifest-v2", MANIFEST_VERSION_V2, false),
         ("manifest-v3", MANIFEST_VERSION, false),
     ];
-    let wals = ["wal_v1.wal", "wal_v2.wal", "wal_v3.wal", "wal_v4.wal"];
+    let wals = [
+        "wal_v1.wal",
+        "wal_v2.wal",
+        "wal_v3.wal",
+        "wal_v4.wal",
+        "wal_v5.wal",
+    ];
     let sstables = [
         ("sst_v1_release_zero_crc.sst", SSTABLE_VERSION_V1),
         ("sst_v1_crc.sst", SSTABLE_VERSION_V1),
@@ -571,7 +588,7 @@ async fn an_absent_lock_file_is_the_only_unsupported_open_side_effect() {
 
 #[tokio::test]
 async fn unsupported_wal_fails_before_header_repair_or_directory_creation() {
-    let directory = assemble_wal_database("manifest_v3.bin", "wal_v4.wal");
+    let directory = assemble_wal_database("manifest_v3.bin", "wal_v5.wal");
     let path = directory.path().join("wal").join(WAL_NAME);
     let mut bytes = fs::read(&path).unwrap();
     bytes[8..12].copy_from_slice(&(WAL_VERSION + 1).to_le_bytes());
@@ -583,7 +600,7 @@ async fn unsupported_wal_fails_before_header_repair_or_directory_creation() {
         .await
         .err()
         .expect("future WAL must fail even when WAL writes are disabled");
-    assert!(error.to_string().contains("Unsupported WAL version: 5"));
+    assert!(error.to_string().contains("Unsupported WAL version: 6"));
     assert_eq!(snapshot(directory.path()), expected);
     assert!(!directory.path().join("sstables").exists());
 }
@@ -751,6 +768,7 @@ async fn every_sstable_component_corruption_is_deterministic_and_nonmutating() {
         create_manifest_for_sstable(directory.path(), &table);
         fs::write(directory.path().join(".turbokv.lock"), b"lock-sentinel").unwrap();
         let expected = snapshot(directory.path());
+        let relative_table = Path::new("sstables").join("L0").join("corrupt.sst");
         let mut first_message = None;
 
         for _ in 0..2 {
@@ -771,7 +789,7 @@ async fn every_sstable_component_corruption_is_deterministic_and_nonmutating() {
                 "{component}: {message}"
             );
             assert!(
-                message.contains(&table.display().to_string()),
+                message.contains(&relative_table.display().to_string()),
                 "{component}: affected file missing from {message}"
             );
             if let Some(first_message) = &first_message {
@@ -809,7 +827,7 @@ async fn interior_wal_corruption_is_precise_repeatable_and_nonmutating() {
 async fn active_wal_physical_tail_is_recovered_only_after_read_only_classification() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join(WAL_NAME);
-    copy_fixture("wal_v4.wal", &path);
+    copy_fixture("wal_v5.wal", &path);
     let valid_bytes = fs::read(&path).unwrap();
     let mut damaged = valid_bytes.clone();
     damaged.extend_from_slice(&[0xff, 0x00, 0x7f]);
@@ -818,8 +836,12 @@ async fn active_wal_physical_tail_is_recovered_only_after_read_only_classificati
     let wal = WriteAheadLog::new(directory.path(), WalConfig::durable())
         .await
         .unwrap();
-    assert_eq!(fs::read(&path).unwrap(), valid_bytes);
+    let mapped_bytes = fs::read(&path).unwrap();
+    assert_eq!(&mapped_bytes[..valid_bytes.len()], valid_bytes);
+    assert_eq!(wal.current_size(), valid_bytes.len() as u64);
     assert_eq!(wal.read_from(0).await.unwrap().len(), 3);
+    wal.flush().await.unwrap();
+    assert_eq!(fs::read(&path).unwrap(), valid_bytes);
 }
 
 #[tokio::test]
