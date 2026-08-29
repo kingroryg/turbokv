@@ -5,13 +5,18 @@ use serde_json::Value;
 
 const README: &str = include_str!("../README.md");
 const BENCHMARK_README: &str = include_str!("README.md");
-const ARTIFACT: &str =
+const HISTORICAL_ARTIFACT: &str =
     include_str!("results/apple-m4-macos-15.3.2/durability-baseline-current.json");
+const INGEST_ARTIFACT: &str =
+    include_str!("results/apple-m4-macos-15.3.2/durability-baseline-ingest-current.json");
+const INGEST_TIMESTAMPED_ARTIFACT: &str = include_str!(
+    "results/apple-m4-macos-15.3.2/durability-baseline-ingest-release-1787966746.json"
+);
 const REQUIRED_DURABLE_INGEST: [&str; 3] = ["sequential_fill", "random_fill", "overwrite"];
 
 #[test]
 fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
-    let report = report();
+    let report = ingest_report();
     let headings = README
         .lines()
         .filter(|line| line.starts_with("## "))
@@ -26,10 +31,28 @@ fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
         ]
     );
 
-    for (workload, label) in [
-        ("sequential_fill", "Sequential fill"),
-        ("random_fill", "Random fill"),
-        ("overwrite", "Overwrite"),
+    for (workload, label, redb_note) in [
+        (
+            "sequential_fill",
+            "Sequential fill (1 key/txn)",
+            " (macOS barrier/txn)",
+        ),
+        (
+            "random_fill",
+            "Random fill (1 key/txn)",
+            " (macOS barrier/txn)",
+        ),
+        ("overwrite", "Overwrite (1 key/txn)", " (macOS barrier/txn)"),
+        (
+            "sequential_batch_100",
+            "Sequential batch (100 keys/txn)",
+            "",
+        ),
+        (
+            "sequential_batch_1000",
+            "Sequential batch (1,000 keys/txn)",
+            "",
+        ),
     ] {
         let turbo = median(
             &report,
@@ -42,7 +65,7 @@ fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
         let ratio = turbo / fjall;
         assert!(ratio.is_finite() && ratio > 0.0, "invalid {workload} ratio");
         let row = format!(
-            "| {label} | Durable | {} | {} | {} | {ratio:.3}× |",
+            "| {label} | Durable | {} | {} | {}{redb_note} | {ratio:.3}× |",
             grouped_integer(turbo),
             grouped_integer(fjall),
             grouped_integer(redb),
@@ -56,15 +79,58 @@ fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
     assert!(REQUIRED_DURABLE_INGEST
         .iter()
         .all(|workload| acknowledgement_ratio(&report, workload) > 1.0));
-    assert!(README.contains("Cross-engine settled timings are not compared"));
-    assert!(README.contains("Sequential-fill dispersion was high"));
-    assert!(README.contains("The retained benchmark used TurboKV 0.5.0"));
-    assert!(README.contains("These results predate the 0.6.0 release"));
+    assert!(README.contains("Cross-engine settled timings are not"));
+    assert!(README.contains("compared."));
+    assert!(README.contains("2.6.3's `Durability::Eventual` performs a macOS"));
+    assert!(README.contains("Batching amortizes that fixed"));
+    assert_eq!(INGEST_ARTIFACT, INGEST_TIMESTAMPED_ARTIFACT);
+}
+
+#[test]
+fn retained_ingest_evidence_matches_the_documented_protocol() {
+    let report = ingest_report();
+    let environment = &report["environment"];
+    let protocol = &report["protocol"];
+    let common = &protocol["common"];
+
+    assert_eq!(report["schema_version"], 7);
+    assert_eq!(report["profile"], "ingest");
+    assert_eq!(environment["git_dirty"], false);
+    assert_eq!(
+        environment["git_commit"],
+        "721cda58e130a8798fdb202b26675723791f6ada"
+    );
+    assert_eq!(
+        environment["source_manifest_git_hash"],
+        "e1c6140c791a95802d6db0fc5176b560ac9912fa"
+    );
+    assert_eq!(common["single_key_batch_size"], 1);
+    assert_eq!(
+        common["atomic_batch_sizes"],
+        serde_json::json!([100, 1_000])
+    );
+    assert_eq!(report["results"].as_array().unwrap().len(), 45);
+    assert_eq!(report["summaries"].as_array().unwrap().len(), 15);
+    assert_eq!(
+        protocol["workloads"],
+        serde_json::json!([
+            "sequential_fill",
+            "random_fill",
+            "overwrite",
+            "sequential_batch_100",
+            "sequential_batch_1000"
+        ])
+    );
+    assert!(report["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|measurement| measurement["durability"] == "durable"));
 }
 
 #[test]
 fn retained_release_evidence_matches_the_documented_protocol() {
-    let report = report();
+    let report = historical_report();
     let environment = &report["environment"];
     let protocol = &report["protocol"];
     let common = &protocol["common"];
@@ -172,8 +238,12 @@ fn grouped_integer(value: f64) -> String {
     grouped
 }
 
-fn report() -> Value {
-    serde_json::from_str(ARTIFACT).expect("retained current artifact must be JSON")
+fn historical_report() -> Value {
+    serde_json::from_str(HISTORICAL_ARTIFACT).expect("retained release artifact must be JSON")
+}
+
+fn ingest_report() -> Value {
+    serde_json::from_str(INGEST_ARTIFACT).expect("retained ingest artifact must be JSON")
 }
 
 fn acknowledgement_ratio(report: &Value, workload: &str) -> f64 {

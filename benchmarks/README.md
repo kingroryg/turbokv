@@ -12,18 +12,17 @@ the bytewise path-sorted `mode type blob_oid<TAB>path` output shape from
 terminated with LF. The report hashes that manifest with `git hash-object
 --stdin` and names the repository's SHA-1 object format.
 
-`results/apple-m4-macos-15.3.2/durability-baseline-current.json` is the latest
-retained TurboKV 0.5.0 release run, not an assertion that the measured source equals the
-checked-out revision. The root README labels it historical and derives its
-exact table rows from the artifact. Because no single primary workload was
-designated before measurement, the retained release check requires TurboKV to
-exceed fjall on all three durable single-key ingest shapes: sequential fill,
-random fill, and overwrite. It intentionally forbids a fixed-multiple headline
-because random-fill throughput and repeated-run dispersion are sensitive enough
-that such a floor was not repeatable. Cross-engine claims use only equivalent
-acknowledgement boundaries: the settlement phase invokes engine-specific
-compaction policies and is intentionally not compared between engines. A fresh
-run is required before describing results as current-source evidence.
+`results/apple-m4-macos-15.3.2/durability-baseline-ingest-current.json` is the
+retained TurboKV 0.6.0 ingest run used by the root README. Its measured source
+commit is recorded in the artifact and remains in repository history. The older
+`durability-baseline-current.json` is the retained TurboKV 0.5.0 release run
+and complete matrix.
+
+Cross-engine claims use only equivalent acknowledgement boundaries: the
+settlement phase invokes engine-specific compaction policies and is
+intentionally not compared between engines. redb is reported as architectural
+context because its macOS Eventual commit crosses a barrier that the other
+Durable adapters do not.
 
 ## Running it
 
@@ -162,6 +161,8 @@ excluded from measured time.
 | `sequential_fill` | all ordered writes returned at the selected durability boundary | forced flush and compaction fixed point / each write |
 | `random_fill` | all seeded-permutation writes returned at the selected durability boundary | forced flush and compaction fixed point / each write |
 | `overwrite` | all overwrites of a settled dataset returned at the selected durability boundary | forced flush and compaction fixed point / each overwrite |
+| `sequential_batch_100` | all ordered 100-key atomic batches returned at the selected durability boundary | forced flush and compaction fixed point / each batch commit |
+| `sequential_batch_1000` | all ordered 1,000-key atomic batches returned at the selected durability boundary | forced flush and compaction fixed point / each batch commit |
 | `random_read` | all seeded-order point reads returned | same boundary / each read |
 | `sequential_scan` | configured complete ordered scans returned | same boundary / each full scan call |
 | `mixed` | deterministic alternating 50% reads and 50% overwrites returned at the selected durability boundary | forced flush and compaction fixed point / each operation |
