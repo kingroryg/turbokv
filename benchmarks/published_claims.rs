@@ -65,7 +65,7 @@ fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
         let ratio = turbo / fjall;
         assert!(ratio.is_finite() && ratio > 0.0, "invalid {workload} ratio");
         let row = format!(
-            "| {label} | Durable | {} | {} | {}{redb_note} | {ratio:.3}× |",
+            "| {label} | — | {} | — | {} | {}{redb_note} | {ratio:.3}× |",
             grouped_integer(turbo),
             grouped_integer(fjall),
             grouped_integer(redb),
@@ -83,6 +83,10 @@ fn readme_reports_the_predeclared_durable_ingest_gate_from_retained_evidence() {
     assert!(README.contains("compared."));
     assert!(README.contains("2.6.3's `Durability::Eventual` performs a macOS"));
     assert!(README.contains("Batching amortizes that fixed"));
+    assert!(README.contains("TurboKV Fast (no WAL)"));
+    assert!(README.contains("TurboKV Recoverable (OS cache)"));
+    assert!(README.contains("TurboKV Durable (sync)"));
+    assert!(README.contains("An em dash means the"));
     assert_eq!(INGEST_ARTIFACT, INGEST_TIMESTAMPED_ARTIFACT);
 }
 

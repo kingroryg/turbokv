@@ -191,23 +191,28 @@ APIs; their complete field and method contracts are in the
 
 ## Benchmarks
 
-The benchmark used TurboKV 0.6.0, fjall 2.11.2, and redb 2.6.3 in Durable
-mode over three repetitions. Throughput is acknowledged keys per second;
-higher is better.
+The benchmark used TurboKV 0.6.0, fjall 2.11.2, and redb 2.6.3 over three
+repetitions. Throughput is acknowledged keys per second; higher is better.
 
-| Workload | Mode | TurboKV ops/s | fjall ops/s | redb ops/s | TurboKV / fjall |
-|---|---|---:|---:|---:|---:|
-| Sequential fill (1 key/txn) | Durable | 1,407,678 | 485,252 | 1,397 (macOS barrier/txn) | 2.901× |
-| Random fill (1 key/txn) | Durable | 834,137 | 456,924 | 1,549 (macOS barrier/txn) | 1.826× |
-| Overwrite (1 key/txn) | Durable | 853,083 | 446,733 | 1,516 (macOS barrier/txn) | 1.910× |
-| Sequential batch (100 keys/txn) | Durable | 2,272,259 | 511,600 | 80,197 | 4.441× |
-| Sequential batch (1,000 keys/txn) | Durable | 2,333,582 | 572,671 | 134,636 | 4.075× |
+| Workload | TurboKV Fast (no WAL) | TurboKV Recoverable (OS cache) | TurboKV Durable (sync) | fjall Buffer | redb Eventual | Recoverable / fjall |
+|---|---:|---:|---:|---:|---:|---:|
+| Sequential fill (1 key/txn) | — | 1,407,678 | — | 485,252 | 1,397 (macOS barrier/txn) | 2.901× |
+| Random fill (1 key/txn) | — | 834,137 | — | 456,924 | 1,549 (macOS barrier/txn) | 1.826× |
+| Overwrite (1 key/txn) | — | 853,083 | — | 446,733 | 1,516 (macOS barrier/txn) | 1.910× |
+| Sequential batch (100 keys/txn) | — | 2,272,259 | — | 511,600 | 80,197 | 4.441× |
+| Sequential batch (1,000 keys/txn) | — | 2,333,582 | — | 572,671 | 134,636 | 4.075× |
+
+The measured TurboKV column is today's `DbOptions::durable()` preset; it is
+labelled Recoverable here because it survives a process crash but does not sync
+each acknowledgement to persistent storage. TurboKV Durable is today's
+`DbOptions::paranoid()` sync-before-acknowledgement preset. An em dash means the
+retained 200,000-key run did not measure that mode.
 
 Protocol: 200,000 deterministic 20-byte keys, 400-byte values (84 MB logical
 input, above the 64 MiB memtable), one caller, atomic batches where shown,
 compression and block cache disabled, and an uncleared OS page cache. redb
 2.6.3's `Durability::Eventual` performs a macOS `F_BARRIERFSYNC` for every
-transaction, while the TurboKV and fjall Durable modes stop at their
+transaction, while the TurboKV Recoverable and fjall Buffer modes stop at their
 process-crash-recoverable OS-cache boundaries. Batching amortizes that fixed
 redb barrier; its single-key rows are therefore architectural context rather
 than a like-for-like durability claim. Cross-engine settled timings are not
